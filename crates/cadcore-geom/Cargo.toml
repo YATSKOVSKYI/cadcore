@@ -1,13 +1,13 @@
 [package]
-name         = "cadcore-geom"
+name             = "cadcore-geom"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
 repository.workspace = true
 homepage.workspace   = true
-license-file         = "../../LICENSE"
+license.workspace    = true
 rust-version.workspace = true
-description  = "Analytic geometry primitives for the cadcore CAD kernel — curves, surfaces (Plane, Cylinder, Torus, Sphere)"
+description  = "Analytic geometry primitives for the cadcore CAD kernel - curves, surfaces (Plane, Cylinder, Torus, Sphere)"
 keywords     = ["cad", "geometry", "brep", "surface", "curve"]
 categories   = ["science", "mathematics"]
 

@@ -1,15 +1,15 @@
 [package]
-name         = "cadcore-math"
+name             = "cadcore-math"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
 repository.workspace = true
 homepage.workspace   = true
-license-file         = "../../LICENSE"
+license.workspace    = true
 rust-version.workspace = true
-description  = "Fundamental math primitives for the cadcore CAD kernel — Point3, Vec3, Mat3, Frame3"
+description  = "Fundamental math primitives for the cadcore CAD kernel - Point3, Vec3, Mat3, Frame3"
 keywords     = ["cad", "geometry", "math", "3d", "linear-algebra"]
 categories   = ["mathematics", "science"]
 
 [dependencies]
-# zero external dependencies — intentional
+# zero external dependencies - intentional

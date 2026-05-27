@@ -1,13 +1,13 @@
 [package]
-name         = "cadcore-step"
+name             = "cadcore-step"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
 repository.workspace = true
 homepage.workspace   = true
-license-file         = "../../LICENSE"
+license.workspace    = true
 rust-version.workspace = true
-description  = "Pure-Rust STEP AP203 writer for the cadcore CAD kernel — exact analytic surface entities, no OCCT dependency"
+description  = "Pure-Rust STEP AP203 writer for the cadcore CAD kernel - exact analytic surface entities, no OCCT dependency"
 keywords     = ["cad", "step", "ap203", "brep", "export"]
 categories   = ["science", "encoding"]
 

@@ -1,13 +1,13 @@
 [package]
-name         = "cadcore-topo"
+name             = "cadcore-topo"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
 repository.workspace = true
 homepage.workspace   = true
-license-file         = "../../LICENSE"
+license.workspace    = true
 rust-version.workspace = true
-description  = "Arena-based B-Rep topology for the cadcore CAD kernel — Solid, Shell, Face, Edge, Vertex with typed IDs"
+description  = "Arena-based B-Rep topology for the cadcore CAD kernel - Solid, Shell, Face, Edge, Vertex with typed IDs"
 keywords     = ["cad", "brep", "topology", "geometry", "3d"]
 categories   = ["science", "data-structures"]
 
