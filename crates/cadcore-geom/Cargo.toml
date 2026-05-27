@@ -7,6 +7,7 @@ repository.workspace = true
 homepage.workspace   = true
 license.workspace    = true
 rust-version.workspace = true
+readme       = "README.md"
 description  = "Analytic geometry primitives for the cadcore CAD kernel - curves, surfaces (Plane, Cylinder, Torus, Sphere)"
 keywords     = ["cad", "geometry", "brep", "surface", "curve"]
 categories   = ["science", "mathematics"]

@@ -7,6 +7,7 @@ repository.workspace = true
 homepage.workspace   = true
 license.workspace    = true
 rust-version.workspace = true
+readme       = "README.md"
 description  = "Fundamental math primitives for the cadcore CAD kernel - Point3, Vec3, Mat3, Frame3"
 keywords     = ["cad", "geometry", "math", "3d", "linear-algebra"]
 categories   = ["mathematics", "science"]

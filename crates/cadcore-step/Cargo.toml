@@ -7,6 +7,7 @@ repository.workspace = true
 homepage.workspace   = true
 license.workspace    = true
 rust-version.workspace = true
+readme       = "README.md"
 description  = "Pure-Rust STEP AP203 writer for the cadcore CAD kernel - exact analytic surface entities, no OCCT dependency"
 keywords     = ["cad", "step", "ap203", "brep", "export"]
 categories   = ["science", "encoding"]

@@ -7,6 +7,7 @@ repository.workspace = true
 homepage.workspace   = true
 license.workspace    = true
 rust-version.workspace = true
+readme       = "README.md"
 description  = "Pure-Rust CAD geometry kernel - B-Rep topology, analytic surfaces, O(N) filament sweep, STEP AP203 export. No OCCT, no C++."
 keywords     = ["cad", "brep", "step", "geometry", "3d-printing"]
 categories   = ["science", "graphics"]

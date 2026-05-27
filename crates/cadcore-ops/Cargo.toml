@@ -7,6 +7,7 @@ repository.workspace = true
 homepage.workspace   = true
 license.workspace    = true
 rust-version.workspace = true
+readme       = "README.md"
 description  = "Geometric operations for the cadcore CAD kernel - O(N) filament sweep, analytic B-Rep construction without Boolean ops"
 keywords     = ["cad", "brep", "sweep", "geometry", "3d"]
 categories   = ["science"]
