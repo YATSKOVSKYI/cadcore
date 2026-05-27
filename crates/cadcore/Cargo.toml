@@ -9,7 +9,7 @@ license-file         = "../../LICENSE"
 rust-version.workspace = true
 description  = "Pure-Rust CAD geometry kernel — B-Rep topology, analytic surfaces, O(N) filament sweep, STEP AP203 export. No OCCT, no C++."
 keywords     = ["cad", "brep", "step", "geometry", "3d-printing"]
-categories   = ["science", "rendering::geometry"]
+categories   = ["science", "graphics"]
 
 [dependencies]
 cadcore-math = { path = "../cadcore-math", version = "0.1" }
