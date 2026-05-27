@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members  = [
+    "crates/cadcore-math",
+    "crates/cadcore-geom",
+    "crates/cadcore-topo",
+    "crates/cadcore-ops",
+    "crates/cadcore-step",
+    "crates/cadcore",
+]
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["cadcore contributors"]
+repository  = "https://github.com/your-org/cadcore"
+license     = "MIT OR Apache-2.0"
+rust-version = "1.78"
+
+# ── Shared profile tweaks ─────────────────────────────────────────────────────
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1   # enough for number-crunchy math without being painful

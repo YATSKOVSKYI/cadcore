@@ -1,0 +1,10 @@
+[package]
+name    = "cadcore-ops"
+version.workspace = true
+edition.workspace = true
+description = "Geometric operations (sweep, fillet, etc.) for the cadcore CAD kernel"
+
+[dependencies]
+cadcore-math = { path = "../cadcore-math" }
+cadcore-geom = { path = "../cadcore-geom" }
+cadcore-topo = { path = "../cadcore-topo" }

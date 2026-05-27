@@ -1,0 +1,8 @@
+[package]
+name    = "cadcore-geom"
+version.workspace = true
+edition.workspace = true
+description = "Analytic geometry primitives (curves, surfaces) for the cadcore CAD kernel"
+
+[dependencies]
+cadcore-math = { path = "../cadcore-math" }

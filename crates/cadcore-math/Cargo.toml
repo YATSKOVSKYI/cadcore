@@ -1,0 +1,8 @@
+[package]
+name    = "cadcore-math"
+version.workspace = true
+edition.workspace = true
+description = "Fundamental math primitives for the cadcore CAD kernel"
+
+[dependencies]
+# zero external dependencies — intentional

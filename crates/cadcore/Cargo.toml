@@ -1,0 +1,14 @@
+[package]
+name    = "cadcore"
+version.workspace = true
+edition.workspace = true
+description = "Pure-Rust CAD geometry kernel — a complete B-Rep library with STEP export"
+keywords    = ["cad", "brep", "step", "geometry", "3d"]
+categories  = ["science", "rendering::geometry"]
+
+[dependencies]
+cadcore-math = { path = "../cadcore-math" }
+cadcore-geom = { path = "../cadcore-geom" }
+cadcore-topo = { path = "../cadcore-topo" }
+cadcore-ops  = { path = "../cadcore-ops"  }
+cadcore-step = { path = "../cadcore-step" }

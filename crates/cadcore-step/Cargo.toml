@@ -1,0 +1,13 @@
+[package]
+name    = "cadcore-step"
+version.workspace = true
+edition.workspace = true
+description = "Pure-Rust STEP AP203 writer for the cadcore CAD kernel"
+
+[dependencies]
+cadcore-math = { path = "../cadcore-math" }
+cadcore-geom = { path = "../cadcore-geom" }
+cadcore-topo = { path = "../cadcore-topo" }
+
+[dev-dependencies]
+cadcore-ops  = { path = "../cadcore-ops" }

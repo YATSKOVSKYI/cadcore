@@ -1,0 +1,10 @@
+[package]
+name    = "cadcore-topo"
+version.workspace = true
+edition.workspace = true
+description = "Arena-based B-Rep topology for the cadcore CAD kernel"
+
+[dependencies]
+cadcore-math = { path = "../cadcore-math" }
+cadcore-geom = { path = "../cadcore-geom" }
+slotmap      = "1"
