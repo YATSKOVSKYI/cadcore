@@ -1,10 +1,17 @@
 [package]
-name    = "cadcore-topo"
-version.workspace = true
-edition.workspace = true
-description = "Arena-based B-Rep topology for the cadcore CAD kernel"
+name         = "cadcore-topo"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+license-file         = "../../LICENSE"
+rust-version.workspace = true
+description  = "Arena-based B-Rep topology for the cadcore CAD kernel — Solid, Shell, Face, Edge, Vertex with typed IDs"
+keywords     = ["cad", "brep", "topology", "geometry", "3d"]
+categories   = ["science", "data-structures"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math" }
-cadcore-geom = { path = "../cadcore-geom" }
+cadcore-math = { path = "../cadcore-math", version = "0.1" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.1" }
 slotmap      = "1"

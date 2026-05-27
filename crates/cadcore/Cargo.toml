@@ -1,14 +1,19 @@
 [package]
-name    = "cadcore"
-version.workspace = true
-edition.workspace = true
-description = "Pure-Rust CAD geometry kernel — a complete B-Rep library with STEP export"
-keywords    = ["cad", "brep", "step", "geometry", "3d"]
-categories  = ["science", "rendering::geometry"]
+name         = "cadcore"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+license-file         = "../../LICENSE"
+rust-version.workspace = true
+description  = "Pure-Rust CAD geometry kernel — B-Rep topology, analytic surfaces, O(N) filament sweep, STEP AP203 export. No OCCT, no C++."
+keywords     = ["cad", "brep", "step", "geometry", "3d-printing"]
+categories   = ["science", "rendering::geometry"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math" }
-cadcore-geom = { path = "../cadcore-geom" }
-cadcore-topo = { path = "../cadcore-topo" }
-cadcore-ops  = { path = "../cadcore-ops"  }
-cadcore-step = { path = "../cadcore-step" }
+cadcore-math = { path = "../cadcore-math", version = "0.1" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.1" }
+cadcore-topo = { path = "../cadcore-topo", version = "0.1" }
+cadcore-ops  = { path = "../cadcore-ops",  version = "0.1" }
+cadcore-step = { path = "../cadcore-step", version = "0.1" }

@@ -1,8 +1,15 @@
 [package]
-name    = "cadcore-geom"
-version.workspace = true
-edition.workspace = true
-description = "Analytic geometry primitives (curves, surfaces) for the cadcore CAD kernel"
+name         = "cadcore-geom"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+license-file         = "../../LICENSE"
+rust-version.workspace = true
+description  = "Analytic geometry primitives for the cadcore CAD kernel — curves, surfaces (Plane, Cylinder, Torus, Sphere)"
+keywords     = ["cad", "geometry", "brep", "surface", "curve"]
+categories   = ["science", "mathematics"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math" }
+cadcore-math = { path = "../cadcore-math", version = "0.1" }

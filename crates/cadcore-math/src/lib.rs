@@ -1,12 +1,44 @@
 //! # cadcore-math
 //!
-//! Fundamental numeric primitives for the cadcore CAD kernel.
+//! Fundamental numeric primitives for the **cadcore** CAD kernel.
 //!
-//! **Design rules**
-//! * Zero external dependencies — everything is `std` + const-generic arithmetic.
+//! This crate has **zero external dependencies** — everything is built on
+//! `std` and const-generic arithmetic.
+//!
+//! ## Design rules
+//!
 //! * All lengths are in **millimetres** unless noted otherwise.
-//! * Angles are in **radians** unless noted otherwise.
-//! * No global state; every function is pure or takes explicit parameters.
+//! * All angles are in **radians** unless noted otherwise.
+//! * [`Point3`] and [`Vec3`] are distinct types — the compiler will not let
+//!   you confuse a location with a direction.
+//! * Every function is pure; no global mutable state.
+//!
+//! ## Types at a glance
+//!
+//! | Type | Description |
+//! |---|---|
+//! | [`Point3`] | A location in 3-D space |
+//! | [`Vec3`] | A free vector (direction + magnitude) |
+//! | [`UnitVec3`] | A `Vec3` guaranteed to have length 1 |
+//! | [`Mat3`] | Column-major 3×3 matrix (rotations, linear maps) |
+//! | [`Frame3`] | Right-handed orthonormal frame (origin + 3 axes) |
+//! | [`Transform3`] | Rigid-body transform: rotation + translation |
+//! | [`Interval`] | Closed real interval `[lo, hi]` |
+//!
+//! ## Quick example
+//!
+//! ```rust
+//! use cadcore_math::{Point3, Vec3, UnitVec3, Frame3};
+//!
+//! let origin = Point3::new(1.0, 2.0, 3.0);
+//! let dir    = UnitVec3::try_from_vec(Vec3::new(0.0, 0.0, 1.0)).unwrap();
+//! let frame  = Frame3::from_origin_z(origin, dir);
+//!
+//! let world_pt = Point3::new(4.0, 5.0, 6.0);
+//! let local_pt = frame.to_local_point(world_pt);
+//! let back     = frame.to_world_point(local_pt);
+//! assert!((world_pt - back).length() < 1e-10);
+//! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]

@@ -1,10 +1,17 @@
 [package]
-name    = "cadcore-ops"
-version.workspace = true
-edition.workspace = true
-description = "Geometric operations (sweep, fillet, etc.) for the cadcore CAD kernel"
+name         = "cadcore-ops"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+license-file         = "../../LICENSE"
+rust-version.workspace = true
+description  = "Geometric operations for the cadcore CAD kernel — O(N) filament sweep, analytic B-Rep construction without Boolean ops"
+keywords     = ["cad", "brep", "sweep", "geometry", "3d"]
+categories   = ["science"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math" }
-cadcore-geom = { path = "../cadcore-geom" }
-cadcore-topo = { path = "../cadcore-topo" }
+cadcore-math = { path = "../cadcore-math", version = "0.1" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.1" }
+cadcore-topo = { path = "../cadcore-topo", version = "0.1" }

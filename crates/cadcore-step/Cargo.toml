@@ -1,13 +1,20 @@
 [package]
-name    = "cadcore-step"
-version.workspace = true
-edition.workspace = true
-description = "Pure-Rust STEP AP203 writer for the cadcore CAD kernel"
+name         = "cadcore-step"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+license-file         = "../../LICENSE"
+rust-version.workspace = true
+description  = "Pure-Rust STEP AP203 writer for the cadcore CAD kernel — exact analytic surface entities, no OCCT dependency"
+keywords     = ["cad", "step", "ap203", "brep", "export"]
+categories   = ["science", "encoding"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math" }
-cadcore-geom = { path = "../cadcore-geom" }
-cadcore-topo = { path = "../cadcore-topo" }
+cadcore-math = { path = "../cadcore-math", version = "0.1" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.1" }
+cadcore-topo = { path = "../cadcore-topo", version = "0.1" }
 
 [dev-dependencies]
-cadcore-ops  = { path = "../cadcore-ops" }
+cadcore-ops  = { path = "../cadcore-ops", version = "0.1" }
