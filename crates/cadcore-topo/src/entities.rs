@@ -5,6 +5,53 @@ use cadcore_math::Point3;
 
 use crate::ids::*;
 
+// ── FaceExtent ────────────────────────────────────────────────────────────────
+
+/// Geometric extent of a face — data *not* captured by the infinite carrier surface.
+///
+/// The STEP writer uses this to generate proper `FACE_OUTER_BOUND` /
+/// `FACE_BOUND` loops for each `ADVANCED_FACE`.  Without extent info the face
+/// bounds list would be empty `()`, which is rejected by most CAD importers.
+#[derive(Clone, Debug)]
+pub enum FaceExtent {
+    /// No extent info available (placeholder — face will have empty bounds).
+    None,
+    /// Finite cylinder extending from z = 0 to z = `length` along the carrier
+    /// cylinder's axis. The carrier surface's frame origin is at z = 0.
+    /// The start/end curves bound the face in STEP. At polyline corners these
+    /// are oblique miter ellipses, not perpendicular circles.
+    Cylinder {
+        /// Length along the cylinder axis (mm).
+        length: f64,
+        /// Boundary at z = 0.
+        start: FaceBoundary,
+        /// Boundary at z = `length`.
+        end: FaceBoundary,
+    },
+    /// Planar disk at the carrier plane's origin with the given radius.
+    Disk {
+        /// Disk radius (mm).
+        radius: f64,
+    },
+    /// Torus fillet arc: the boundary consists of two minor circles — one at
+    /// each end of the arc span.
+    TorusFillet {
+        /// Minor circle bounding the arc at the incoming-cylinder junction.
+        start_circle: Circle3,
+        /// Minor circle bounding the arc at the outgoing-cylinder junction.
+        end_circle: Circle3,
+    },
+}
+
+/// Closed curve used as a face boundary.
+#[derive(Clone, Debug)]
+pub enum FaceBoundary {
+    /// Full circle boundary.
+    Circle(Circle3),
+    /// Full ellipse boundary, typically a cylinder/miter-plane intersection.
+    Ellipse(Ellipse3),
+}
+
 // ── Vertex ───────────────────────────────────────────────────────────────────
 
 /// A point in 3-D space — the lowest-level topological entity.
@@ -129,6 +176,8 @@ pub struct Face {
     pub inner_loops: Vec<LoopId>,
     /// The shell this face belongs to.
     pub shell: ShellId,
+    /// Geometric extent — used by the STEP writer to emit proper face bounds.
+    pub extent: FaceExtent,
 }
 
 // ── Shell ─────────────────────────────────────────────────────────────────────

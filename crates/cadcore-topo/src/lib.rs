@@ -23,12 +23,13 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-mod ids;
-mod entities;
 mod brep;
+mod entities;
+mod ids;
 
-pub use ids::{CoEdgeId, EdgeId, FaceId, LoopId, ShellId, SolidId, VertexId};
-pub use entities::{
-    CoEdge, CoEdgeSense, Edge, EdgeGeom, Face, FaceGeom, FaceNormal, Loop, Shell, Solid, Vertex,
-};
 pub use brep::BRep;
+pub use entities::{
+    CoEdge, CoEdgeSense, Edge, EdgeGeom, Face, FaceBoundary, FaceExtent, FaceGeom, FaceNormal,
+    Loop, Shell, Solid, Vertex,
+};
+pub use ids::{CoEdgeId, EdgeId, FaceId, LoopId, ShellId, SolidId, VertexId};
