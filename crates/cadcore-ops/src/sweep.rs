@@ -363,6 +363,196 @@ pub fn sweep_circle_along_rounded_polyline(
     sweep_circle_along_path(brep, &path, profile_radius, opts)
 }
 
+/// A half-space plane used for clipping polylines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipPlane {
+    /// Origin point on the plane.
+    pub origin: Point3,
+    /// Normal of the plane pointing *into* the kept half-space.
+    pub normal: UnitVec3,
+}
+
+/// Clip a polyline by a set of planes.
+pub fn clip_polyline(points: &[Point3], planes: &[ClipPlane]) -> Vec<Vec<Point3>> {
+    let mut current_set = vec![points.to_vec()];
+    for plane in planes {
+        let mut next_set = Vec::new();
+        for poly in current_set {
+            let clipped = clip_polyline_by_plane(&poly, plane);
+            next_set.extend(clipped);
+        }
+        current_set = next_set;
+    }
+    current_set
+}
+
+fn clip_polyline_by_plane(points: &[Point3], plane: &ClipPlane) -> Vec<Vec<Point3>> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut current_poly = Vec::new();
+
+    let d = |p: Point3| -> f64 {
+        plane.normal.dot_vec(p - plane.origin)
+    };
+
+    let mut prev_pt = points[0];
+    let mut prev_d = d(prev_pt);
+
+    if prev_d >= -1e-7 {
+        current_poly.push(prev_pt);
+    }
+
+    for &pt in points.iter().skip(1) {
+        let cur_d = d(pt);
+        if prev_d >= -1e-7 && cur_d >= -1e-7 {
+            current_poly.push(pt);
+        } else if prev_d >= -1e-7 && cur_d < -1e-7 {
+            let t = prev_d / (prev_d - cur_d);
+            let intersect = prev_pt + (pt - prev_pt) * t;
+            current_poly.push(intersect);
+            if current_poly.len() >= 2 {
+                result.push(current_poly);
+            }
+            current_poly = Vec::new();
+        } else if prev_d < -1e-7 && cur_d >= -1e-7 {
+            let t = prev_d / (prev_d - cur_d);
+            let intersect = prev_pt + (pt - prev_pt) * t;
+            current_poly.push(intersect);
+            current_poly.push(pt);
+        }
+        prev_pt = pt;
+        prev_d = cur_d;
+    }
+
+    if current_poly.len() >= 2 {
+        result.push(current_poly);
+    }
+    result
+}
+
+/// Sweep a circle of radius `radius` along the polyline defined by `waypoints`,
+/// applying custom planar/oblique end caps at start and end.
+pub fn sweep_circle_along_polyline_with_caps(
+    brep: &mut BRep,
+    waypoints: &[Point3],
+    radius: f64,
+    opts: &SweepOptions,
+    start_cut_normal: Option<UnitVec3>,
+    end_cut_normal: Option<UnitVec3>,
+) -> Result<SolidId, SweepError> {
+    if waypoints.len() < 2 {
+        return Err(SweepError::TooFewWaypoints);
+    }
+    if radius <= 0.0 {
+        return Err(SweepError::InvalidRadius(radius));
+    }
+    if opts.fillet_corners {
+        let corner_radius = opts.effective_solid_corner_radius(radius)?;
+        let centerline_radius = solid_corner_centerline_radius(radius, corner_radius)?;
+        let rounded_opts = SweepOptions {
+            fillet_corners: false,
+            corner_fillet_radius: 0.0,
+            name: opts.name.clone(),
+        };
+        let path = rounded_path_from_polyline(waypoints, centerline_radius)?;
+        return sweep_circle_along_path_with_caps(
+            brep,
+            &path,
+            radius,
+            &rounded_opts,
+            start_cut_normal,
+            end_cut_normal,
+        );
+    }
+
+    // Pre-compute segment directions.
+    let n = waypoints.len();
+    let mut dirs: Vec<UnitVec3> = Vec::with_capacity(n - 1);
+    for i in 0..n - 1 {
+        let d = waypoints[i + 1] - waypoints[i];
+        match UnitVec3::try_from_vec(d) {
+            Some(u) => dirs.push(u),
+            None => return Err(SweepError::CoincidentWaypoints(i)),
+        }
+    }
+
+    let mut face_ids = Vec::new();
+
+    // ── Start cap ────────────────────────────────────────────────────────────
+    let start_bound = {
+        if let Some(n) = start_cut_normal {
+            boundary_for_plane_cut(waypoints[0], dirs[0], n, radius)
+        } else {
+            FaceBoundary::Circle(Circle3::new(waypoints[0], dirs[0], radius))
+        }
+    };
+    let start_extent = if start_cut_normal.is_some() {
+        FaceExtent::PlanarBoundary { boundary: start_bound.clone() }
+    } else {
+        FaceExtent::Disk { radius }
+    };
+    let start_normal = start_cut_normal.map(|n| -n).unwrap_or(-dirs[0]);
+    let _cap_start_id = build_end_cap(brep, waypoints[0], start_normal, start_extent, &mut face_ids);
+
+    // ── Cylinder + connector loop ─────────────────────────────────────────────
+    for i in 0..n - 1 {
+        let p0 = waypoints[i];
+        let p1 = waypoints[i + 1];
+        let dir = dirs[i];
+        let length = (p1 - p0).length();
+        let start_bound = if i == 0 {
+            start_bound.clone()
+        } else {
+            miter_boundary(p0, dirs[i - 1], dir, dir, radius)
+        };
+        let end_bound = if i + 1 == n - 1 {
+            if let Some(n) = end_cut_normal {
+                boundary_for_plane_cut(p1, dir, n, radius)
+            } else {
+                FaceBoundary::Circle(Circle3::new(p1, dir, radius))
+            }
+        } else {
+            miter_boundary(p1, dir, dirs[i + 1], dir, radius)
+        };
+
+        // --- Cylinder face for segment i ---
+        let cyl = CylSurf::new(p0, dir, radius);
+        let cyl_loop_id = build_placeholder_loop(brep);
+        let cyl_face_id = brep.add_face(Face {
+            geom: FaceGeom::Cylinder(cyl),
+            normal: FaceNormal::Same,
+            outer_loop: cyl_loop_id,
+            inner_loops: vec![],
+            shell: cadcore_topo::ShellId::default(),
+            extent: FaceExtent::Cylinder {
+                length,
+                start: start_bound,
+                end: end_bound,
+            },
+        });
+        face_ids.push(cyl_face_id);
+    }
+
+    // ── End cap ───────────────────────────────────────────────────────────────
+    let last = n - 1;
+    let end_bound = if let Some(n) = end_cut_normal {
+        boundary_for_plane_cut(waypoints[last], dirs[last - 1], n, radius)
+    } else {
+        FaceBoundary::Circle(Circle3::new(waypoints[last], dirs[last - 1], radius))
+    };
+    let end_extent = if end_cut_normal.is_some() {
+        FaceExtent::PlanarBoundary { boundary: end_bound }
+    } else {
+        FaceExtent::Disk { radius }
+    };
+    let end_normal = end_cut_normal.map(|n| -n).unwrap_or(dirs[last - 1]);
+    let _cap_end_id = build_end_cap(brep, waypoints[last], end_normal, end_extent, &mut face_ids);
+
+    assemble_solid(brep, face_ids, opts.name.clone())
+}
+
 /// Sweep a circle of radius `radius` along the polyline defined by `waypoints`.
 ///
 /// Returns the id of the newly inserted solid within `brep`.
@@ -379,133 +569,18 @@ pub fn sweep_circle_along_polyline(
     radius: f64,
     opts: &SweepOptions,
 ) -> Result<SolidId, SweepError> {
-    if waypoints.len() < 2 {
-        return Err(SweepError::TooFewWaypoints);
-    }
-    if radius <= 0.0 {
-        return Err(SweepError::InvalidRadius(radius));
-    }
-    if opts.fillet_corners {
-        let corner_radius = opts.effective_solid_corner_radius(radius)?;
-        let centerline_radius = solid_corner_centerline_radius(radius, corner_radius)?;
-        let rounded_opts = SweepOptions {
-            fillet_corners: false,
-            corner_fillet_radius: 0.0,
-            name: opts.name.clone(),
-        };
-        return sweep_circle_along_rounded_polyline(
-            brep,
-            waypoints,
-            radius,
-            centerline_radius,
-            &rounded_opts,
-        );
-    }
-
-    // Pre-compute segment directions.
-    let n = waypoints.len();
-    let mut dirs: Vec<UnitVec3> = Vec::with_capacity(n - 1);
-    for i in 0..n - 1 {
-        let d = waypoints[i + 1] - waypoints[i];
-        match UnitVec3::try_from_vec(d) {
-            Some(u) => dirs.push(u),
-            None => return Err(SweepError::CoincidentWaypoints(i)),
-        }
-    }
-
-    // Pre-allocate face ids for shell construction.
-    let mut face_ids = Vec::new();
-
-    // ── Start cap ────────────────────────────────────────────────────────────
-    let _cap_start_id = build_end_cap(brep, waypoints[0], -dirs[0], radius, &mut face_ids);
-
-    // ── Cylinder + connector loop ─────────────────────────────────────────────
-    // For each segment i we build: cylinder face for segment i, then (if not last)
-    // a connector at waypoints[i+1].
-    for i in 0..n - 1 {
-        let p0 = waypoints[i];
-        let p1 = waypoints[i + 1];
-        let dir = dirs[i];
-        let length = (p1 - p0).length();
-        let start_bound = if i == 0 {
-            FaceBoundary::Circle(Circle3::new(p0, dir, radius))
-        } else {
-            miter_boundary(p0, dirs[i - 1], dir, dir, radius)
-        };
-        let end_bound = if i + 1 == n - 1 {
-            FaceBoundary::Circle(Circle3::new(p1, dir, radius))
-        } else {
-            miter_boundary(p1, dir, dirs[i + 1], dir, radius)
-        };
-
-        // --- Cylinder face for segment i ---
-        let cyl = CylSurf::new(p0, dir, radius);
-        let cyl_loop_id = build_placeholder_loop(brep);
-        let cyl_face_id = brep.add_face(Face {
-            geom: FaceGeom::Cylinder(cyl),
-            normal: FaceNormal::Same,
-            outer_loop: cyl_loop_id,
-            inner_loops: vec![],
-            shell: cadcore_topo::ShellId::default(), // patched later
-            extent: FaceExtent::Cylinder {
-                length,
-                start: start_bound,
-                end: end_bound,
-            },
-        });
-        face_ids.push(cyl_face_id);
-
-        // In a miter join the cylinder segments share the elliptic edge. The
-        // STEP writer handles the shared edge — no extra face is needed.
-    }
-
-    // ── End cap ───────────────────────────────────────────────────────────────
-    let last = n - 1;
-    let _cap_end_id = build_end_cap(brep, waypoints[last], dirs[last - 1], radius, &mut face_ids);
-
-    // ── Assemble shell + solid ────────────────────────────────────────────────
-    let shell_id = brep.add_shell(Shell {
-        faces: face_ids.clone(),
-        is_outer: true,
-        solid: cadcore_topo::SolidId::default(), // patched below
-    });
-
-    // Patch shell back-ref into faces
-    for &fid in &face_ids {
-        if let Some(f) = brep.faces.get_mut(fid) {
-            f.shell = shell_id;
-        }
-    }
-
-    let solid_id = brep.add_solid(Solid {
-        shells: vec![shell_id],
-        name: opts.name.clone(),
-    });
-
-    // Patch solid back-ref into shell
-    if let Some(sh) = brep.shells.get_mut(shell_id) {
-        sh.solid = solid_id;
-    }
-
-    Ok(solid_id)
+    sweep_circle_along_polyline_with_caps(brep, waypoints, radius, opts, None, None)
 }
 
-/// Sweep a circle of radius `radius` along an analytic path.
-///
-/// Straight segments become cylindrical faces. Circular arc segments become
-/// toroidal faces following the exact centre-line radius. This is the preferred
-/// API for rounded scaffold corners because it avoids approximating an arc with
-/// many short straight cylinders.
-///
-/// # Errors
-///
-/// Returns `Err` if the path is empty, contains invalid geometry, or adjacent
-/// segments are not position-continuous.
-pub fn sweep_circle_along_path(
+/// Sweep a circle of radius `radius` along an analytic path,
+/// applying custom planar/oblique end caps at start and end.
+pub fn sweep_circle_along_path_with_caps(
     brep: &mut BRep,
     segments: &[SweepPathSegment],
     radius: f64,
     opts: &SweepOptions,
+    start_cut_normal: Option<UnitVec3>,
+    end_cut_normal: Option<UnitVec3>,
 ) -> Result<SolidId, SweepError> {
     if segments.is_empty() {
         return Err(SweepError::TooFewWaypoints);
@@ -531,17 +606,33 @@ pub fn sweep_circle_along_path(
     }
 
     let mut face_ids = Vec::new();
+
+    // ── Start cap boundary and extent ────────────────────────────────────────
+    let start_bound = {
+        if let Some(n) = start_cut_normal {
+            boundary_for_plane_cut(infos[0].start, infos[0].start_tangent, n, radius)
+        } else {
+            FaceBoundary::Circle(Circle3::new(infos[0].start, infos[0].start_tangent, radius))
+        }
+    };
+    let start_extent = if start_cut_normal.is_some() {
+        FaceExtent::PlanarBoundary { boundary: start_bound.clone() }
+    } else {
+        FaceExtent::Disk { radius }
+    };
+    let start_normal = start_cut_normal.map(|n| -n).unwrap_or(-infos[0].start_tangent);
     let _cap_start_id = build_end_cap(
         brep,
         infos[0].start,
-        -infos[0].start_tangent,
-        radius,
+        start_normal,
+        start_extent,
         &mut face_ids,
     );
 
+    // ── Cylinder / torus faces ───────────────────────────────────────────────
     for (idx, info) in infos.iter().enumerate() {
         let start_bound = if idx == 0 {
-            FaceBoundary::Circle(Circle3::new(info.start, info.start_tangent, radius))
+            start_bound.clone()
         } else {
             join_boundary(
                 info.start,
@@ -552,7 +643,11 @@ pub fn sweep_circle_along_path(
             )
         };
         let end_bound = if idx + 1 == infos.len() {
-            FaceBoundary::Circle(Circle3::new(info.end, info.end_tangent, radius))
+            if let Some(n) = end_cut_normal {
+                boundary_for_plane_cut(info.end, info.end_tangent, n, radius)
+            } else {
+                FaceBoundary::Circle(Circle3::new(info.end, info.end_tangent, radius))
+            }
         } else {
             join_boundary(
                 info.end,
@@ -602,16 +697,185 @@ pub fn sweep_circle_along_path(
                 face_ids.push(face_id);
             }
         }
-
-        // Explicit path sweeps expect rounded corners to be represented as
-        // analytic arc segments. Adding a separate connector here would leave
-        // the adjacent cylinder faces untrimmed and produce non-manifold STEP.
     }
 
+    // ── End cap ──────────────────────────────────────────────────────────────
     let last = infos.last().expect("non-empty path");
-    let _cap_end_id = build_end_cap(brep, last.end, last.end_tangent, radius, &mut face_ids);
+    let end_bound = if let Some(n) = end_cut_normal {
+        boundary_for_plane_cut(last.end, last.end_tangent, n, radius)
+    } else {
+        FaceBoundary::Circle(Circle3::new(last.end, last.end_tangent, radius))
+    };
+    let end_extent = if end_cut_normal.is_some() {
+        FaceExtent::PlanarBoundary { boundary: end_bound }
+    } else {
+        FaceExtent::Disk { radius }
+    };
+    let end_normal = end_cut_normal.map(|n| -n).unwrap_or(last.end_tangent);
+    let _cap_end_id = build_end_cap(
+        brep,
+        last.end,
+        end_normal,
+        end_extent,
+        &mut face_ids,
+    );
 
     assemble_solid(brep, face_ids, opts.name.clone())
+}
+
+/// Sweep a circle of radius `radius` along an analytic path.
+pub fn sweep_circle_along_path(
+    brep: &mut BRep,
+    segments: &[SweepPathSegment],
+    radius: f64,
+    opts: &SweepOptions,
+) -> Result<SolidId, SweepError> {
+    sweep_circle_along_path_with_caps(brep, segments, radius, opts, None, None)
+}
+
+/// Construct a solid box (plate/block) in the `BRep` using polygonal faces.
+pub fn build_solid_box(
+    brep: &mut BRep,
+    xmin: f64,
+    xmax: f64,
+    ymin: f64,
+    ymax: f64,
+    zmin: f64,
+    zmax: f64,
+    name: Option<String>,
+) -> Result<SolidId, SweepError> {
+    let mut face_ids = Vec::new();
+
+    let mut add_poly_face = |pts: Vec<Point3>, normal: UnitVec3| {
+        let plane = Plane3::from_origin_normal(pts[0], normal);
+        let loop_id = build_placeholder_loop(brep);
+        let fid = brep.add_face(Face {
+            geom: FaceGeom::Plane(plane),
+            normal: FaceNormal::Same,
+            outer_loop: loop_id,
+            inner_loops: vec![],
+            shell: cadcore_topo::ShellId::default(),
+            extent: FaceExtent::Polygon { points: pts },
+        });
+        face_ids.push(fid);
+    };
+
+    // Face 1 (Z max, normal [0, 0, 1])
+    add_poly_face(
+        vec![
+            Point3::new(xmin, ymin, zmax),
+            Point3::new(xmax, ymin, zmax),
+            Point3::new(xmax, ymax, zmax),
+            Point3::new(xmin, ymax, zmax),
+        ],
+        UnitVec3::Z,
+    );
+
+    // Face 2 (Z min, normal [0, 0, -1])
+    add_poly_face(
+        vec![
+            Point3::new(xmin, ymax, zmin),
+            Point3::new(xmax, ymax, zmin),
+            Point3::new(xmax, ymin, zmin),
+            Point3::new(xmin, ymin, zmin),
+        ],
+        -UnitVec3::Z,
+    );
+
+    // Face 3 (Y max, normal [0, 1, 0])
+    add_poly_face(
+        vec![
+            Point3::new(xmin, ymax, zmax),
+            Point3::new(xmax, ymax, zmax),
+            Point3::new(xmax, ymax, zmin),
+            Point3::new(xmin, ymax, zmin),
+        ],
+        UnitVec3::Y,
+    );
+
+    // Face 4 (Y min, normal [0, -1, 0])
+    add_poly_face(
+        vec![
+            Point3::new(xmin, ymin, zmin),
+            Point3::new(xmax, ymin, zmin),
+            Point3::new(xmax, ymin, zmax),
+            Point3::new(xmin, ymin, zmax),
+        ],
+        -UnitVec3::Y,
+    );
+
+    // Face 5 (X max, normal [1, 0, 0])
+    add_poly_face(
+        vec![
+            Point3::new(xmax, ymin, zmin),
+            Point3::new(xmax, ymax, zmin),
+            Point3::new(xmax, ymax, zmax),
+            Point3::new(xmax, ymin, zmax),
+        ],
+        UnitVec3::X,
+    );
+
+    // Face 6 (X min, normal [-1, 0, 0])
+    add_poly_face(
+        vec![
+            Point3::new(xmin, ymin, zmax),
+            Point3::new(xmin, ymax, zmax),
+            Point3::new(xmin, ymax, zmin),
+            Point3::new(xmin, ymin, zmin),
+        ],
+        -UnitVec3::X,
+    );
+
+    let shell_id = brep.add_shell(Shell {
+        faces: face_ids.clone(),
+        is_outer: true,
+        solid: cadcore_topo::SolidId::default(),
+    });
+
+    for &fid in &face_ids {
+        if let Some(f) = brep.faces.get_mut(fid) {
+            f.shell = shell_id;
+        }
+    }
+
+    let solid_id = brep.add_solid(Solid {
+        shells: vec![shell_id],
+        name,
+    });
+
+    if let Some(sh) = brep.shells.get_mut(shell_id) {
+        sh.solid = solid_id;
+    }
+
+    Ok(solid_id)
+}
+
+fn build_end_cap(
+    brep: &mut BRep,
+    centre: Point3,
+    normal: UnitVec3,
+    extent: FaceExtent,
+    face_ids: &mut Vec<cadcore_topo::FaceId>,
+) -> cadcore_topo::FaceId {
+    let plane = Plane3::from_origin_normal(centre, normal);
+    let loop_id = build_placeholder_loop(brep);
+    let fid = brep.add_face(Face {
+        geom: FaceGeom::Plane(plane),
+        normal: FaceNormal::Same,
+        outer_loop: loop_id,
+        inner_loops: vec![],
+        shell: cadcore_topo::ShellId::default(),
+        extent,
+    });
+    face_ids.push(fid);
+    fid
+}
+
+fn build_placeholder_loop(brep: &mut BRep) -> cadcore_topo::LoopId {
+    brep.add_loop(cadcore_topo::Loop {
+        start: cadcore_topo::CoEdgeId::default(),
+        face: cadcore_topo::FaceId::default(),
+    })
 }
 
 /// Errors that [`sweep_circle_along_polyline`] can return.
@@ -656,43 +920,6 @@ impl std::fmt::Display for SweepError {
 
 impl std::error::Error for SweepError {}
 
-// ── Internal helpers ─────────────────────────────────────────────────────────
-
-/// Build an end-cap (planar disk) face at `centre` with normal `normal`.
-///
-/// The outward normal of the start cap points *away from* the solid (−dir),
-/// and the end cap outward normal is +dir.
-fn build_end_cap(
-    brep: &mut BRep,
-    centre: Point3,
-    normal: UnitVec3,
-    radius: f64,
-    face_ids: &mut Vec<cadcore_topo::FaceId>,
-) -> cadcore_topo::FaceId {
-    let plane = Plane3::from_origin_normal(centre, normal);
-    let loop_id = build_placeholder_loop(brep);
-    let fid = brep.add_face(Face {
-        geom: FaceGeom::Plane(plane),
-        normal: FaceNormal::Same,
-        outer_loop: loop_id,
-        inner_loops: vec![],
-        shell: cadcore_topo::ShellId::default(),
-        extent: FaceExtent::Disk { radius },
-    });
-    face_ids.push(fid);
-    fid
-}
-
-/// Insert a placeholder empty loop (patched with real co-edges later by the
-/// STEP writer or a topology validator).
-fn build_placeholder_loop(brep: &mut BRep) -> cadcore_topo::LoopId {
-    // We insert a Loop with a sentinel co-edge id (the default key).
-    // The STEP writer's boundary-stitching pass fills in real co-edges.
-    brep.add_loop(cadcore_topo::Loop {
-        start: cadcore_topo::CoEdgeId::default(),
-        face: cadcore_topo::FaceId::default(),
-    })
-}
 
 #[derive(Clone, Copy, Debug)]
 enum SegmentKind {

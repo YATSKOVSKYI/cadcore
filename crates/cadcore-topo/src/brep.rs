@@ -129,6 +129,28 @@ impl BRep {
             solids:   self.solids.len(),
         }
     }
+
+    /// Merge all solids in the B-Rep into a single solid.
+    pub fn fuse_solids(&mut self) {
+        if self.solids.is_empty() {
+            return;
+        }
+        let mut all_shells = Vec::new();
+        for (_, solid) in self.solids.drain() {
+            all_shells.extend(solid.shells);
+        }
+        let merged_solid = Solid {
+            shells: all_shells,
+            name: Some("fused_solid".to_string()),
+        };
+        let solid_id = self.add_solid(merged_solid);
+        let shells = self.solids.get(solid_id).unwrap().shells.clone();
+        for shell_id in shells {
+            if let Some(shell) = self.shells.get_mut(shell_id) {
+                shell.solid = solid_id;
+            }
+        }
+    }
 }
 
 /// Summary statistics about a [`BRep`].

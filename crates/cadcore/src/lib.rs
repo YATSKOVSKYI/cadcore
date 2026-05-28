@@ -73,6 +73,8 @@ pub use cadcore_ops::{
     analytic_path_from_polyline_samples, rounded_path_from_polyline,
     sharp_path_from_polyline_samples, sweep_circle_along_path, sweep_circle_along_polyline,
     sweep_circle_along_rounded_polyline, PathApproxOptions, SweepOptions, SweepPathSegment,
+    ClipPlane, clip_polyline, sweep_circle_along_path_with_caps,
+    sweep_circle_along_polyline_with_caps, build_solid_box,
 };
 pub use cadcore_step::brep_to_step;
 pub use cadcore_topo::BRep;

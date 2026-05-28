@@ -41,6 +41,16 @@ pub enum FaceExtent {
         /// Minor circle bounding the arc at the outgoing-cylinder junction.
         end_circle: Circle3,
     },
+    /// Planar boundary described by a FaceBoundary (Circle or Ellipse).
+    PlanarBoundary {
+        /// The boundary curve.
+        boundary: FaceBoundary,
+    },
+    /// Flat polygonal face defined by its vertices (useful for box/plate solids).
+    Polygon {
+        /// The polygon vertices in counter-clockwise order.
+        points: Vec<Point3>,
+    },
 }
 
 /// Closed curve used as a face boundary.

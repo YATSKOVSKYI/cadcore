@@ -327,6 +327,94 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
             Ok(vec![outer, inner])
         }
 
+        // ── Planar boundary: single circle or ellipse bound ─────────────────────
+        FaceExtent::PlanarBoundary { boundary } => {
+            let plane = match &face.geom {
+                FaceGeom::Plane(p) => p,
+                _ => return Ok(vec![]),
+            };
+            let outer = emit_boundary(ctx, boundary, plane.frame.x, true, true)?;
+            Ok(vec![outer])
+        }
+
+        // ── Polygonal flat face: EDGE_LOOP of straight lines ─────────────────────
+        FaceExtent::Polygon { points } => {
+            if points.len() < 3 {
+                return Ok(vec![]);
+            }
+            let _plane = match &face.geom {
+                FaceGeom::Plane(p) => p,
+                _ => return Ok(vec![]),
+            };
+
+            // Emit vertices
+            let mut vtx_ids = Vec::with_capacity(points.len());
+            for &pt in points {
+                let vp_id = emit_point(ctx, pt, "v")?;
+                let vtx_id = ctx.next_id();
+                writeln!(ctx.out, "#{vtx_id} = VERTEX_POINT('',#{vp_id});")?;
+                vtx_ids.push(vtx_id);
+            }
+
+            // Emit edges
+            let mut oe_ids = Vec::with_capacity(points.len());
+            let n = points.len();
+            for i in 0..n {
+                let p_start = points[i];
+                let p_end = points[(i + 1) % n];
+                let dir_vec = p_end - p_start;
+                let len = dir_vec.length();
+                if len < 1e-7 {
+                    continue;
+                }
+                let dir = match UnitVec3::try_from_vec(dir_vec) {
+                    Some(u) => u,
+                    None => continue,
+                };
+
+                // Line placement
+                let lp_id = emit_point(ctx, p_start, "lp")?;
+                let ld_id = emit_unit_direction(ctx, dir, "ld")?;
+                let line_id = ctx.next_id();
+                writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
+
+                let v_start = vtx_ids[i];
+                let v_end = vtx_ids[(i + 1) % n];
+
+                let ec_id = ctx.next_id();
+                writeln!(
+                    ctx.out,
+                    "#{ec_id} = EDGE_CURVE('',#{v_start},#{v_end},#{line_id},.T.);"
+                )?;
+
+                let oe_id = ctx.next_id();
+                writeln!(
+                    ctx.out,
+                    "#{oe_id} = ORIENTED_EDGE('',*,*,#{ec_id},.T.);"
+                )?;
+                oe_ids.push(oe_id);
+            }
+
+            if oe_ids.is_empty() {
+                return Ok(vec![]);
+            }
+
+            // EDGE_LOOP
+            let el_id = ctx.next_id();
+            let oe_refs = oe_ids
+                .iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(ctx.out, "#{el_id} = EDGE_LOOP('',({oe_refs}));")?;
+
+            // FACE_OUTER_BOUND
+            let fb_id = ctx.next_id();
+            writeln!(ctx.out, "#{fb_id} = FACE_OUTER_BOUND('',#{el_id},.T.);")?;
+
+            Ok(vec![fb_id])
+        }
+
         // ── No extent info ────────────────────────────────────────────────────────
         FaceExtent::None => Ok(vec![]),
     }
