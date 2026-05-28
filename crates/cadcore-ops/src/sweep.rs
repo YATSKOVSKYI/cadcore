@@ -25,6 +25,9 @@ pub struct SweepOptions {
     /// Use toroidal fillets at corners (smooth G1 join).
     /// If `false`, use miter-plane cuts (sharp join — faster STEP output).
     pub fillet_corners: bool,
+    /// Radius of the analytic corner fillet surface.  When set to `0.0`, the
+    /// swept profile radius is used for backward compatibility.
+    pub corner_fillet_radius: f64,
     /// Optional name for the resulting solid.
     pub name: Option<String>,
 }
@@ -33,8 +36,33 @@ impl Default for SweepOptions {
     fn default() -> Self {
         Self {
             fillet_corners: false,
+            corner_fillet_radius: 0.0,
             name: None,
         }
+    }
+}
+
+impl SweepOptions {
+    fn effective_corner_fillet_radius(&self, profile_radius: f64) -> Result<f64, SweepError> {
+        if !self.fillet_corners {
+            return Ok(0.0);
+        }
+        if self.corner_fillet_radius < 0.0 {
+            return Err(SweepError::InvalidCornerRadius(self.corner_fillet_radius));
+        }
+
+        let radius = if self.corner_fillet_radius <= 1.0e-9 {
+            profile_radius
+        } else {
+            self.corner_fillet_radius
+        };
+        if radius > profile_radius {
+            return Err(SweepError::CornerFilletRadiusTooLarge {
+                radius,
+                max_radius: profile_radius,
+            });
+        }
+        Ok(radius)
     }
 }
 
@@ -334,6 +362,7 @@ pub fn sweep_circle_along_polyline(
     if radius <= 0.0 {
         return Err(SweepError::InvalidRadius(radius));
     }
+    let corner_fillet_radius = opts.effective_corner_fillet_radius(radius)?;
 
     // Pre-compute segment directions.
     let n = waypoints.len();
@@ -396,7 +425,9 @@ pub fn sweep_circle_along_polyline(
 
             if opts.fillet_corners && (1.0 - cos_angle.abs()) > 1e-4 {
                 // Build toroidal fillet
-                if let Some(torus) = TorusSurf::for_corner(vertex, dir, next_dir, radius) {
+                if let Some(torus) =
+                    TorusSurf::for_corner(vertex, dir, next_dir, corner_fillet_radius)
+                {
                     // Compute the two minor-circle boundaries for the STEP face bounds.
                     //
                     // The torus axis A = dir × next_dir (bend-plane normal).
@@ -502,6 +533,7 @@ pub fn sweep_circle_along_path(
     if radius <= 0.0 {
         return Err(SweepError::InvalidRadius(radius));
     }
+    let corner_fillet_radius = opts.effective_corner_fillet_radius(radius)?;
 
     let mut infos = Vec::with_capacity(segments.len());
     for (idx, segment) in segments.iter().copied().enumerate() {
@@ -597,9 +629,13 @@ pub fn sweep_circle_along_path(
             let current = info.end_tangent;
             let next = infos[idx + 1].start_tangent;
             if opts.fillet_corners && (1.0 - current.dot(next).abs()) > 1.0e-4 {
-                if let Some(connector_id) =
-                    build_corner_connector(brep, info.end, current, next, radius)
-                {
+                if let Some(connector_id) = build_corner_connector(
+                    brep,
+                    info.end,
+                    current,
+                    next,
+                    corner_fillet_radius,
+                ) {
                     face_ids.push(connector_id);
                 }
             }
@@ -629,6 +665,13 @@ pub enum SweepError {
     InvalidCornerRadius(f64),
     /// Requested centre-line corner radius does not fit at vertex index.
     CornerRadiusTooLarge(usize),
+    /// Requested corner fillet radius is larger than the swept profile radius.
+    CornerFilletRadiusTooLarge {
+        /// Requested corner fillet radius.
+        radius: f64,
+        /// Maximum valid fillet radius for the swept profile.
+        max_radius: f64,
+    },
     /// Circular path radius is not larger than the swept profile radius.
     SelfIntersectingSweep(usize),
 }
@@ -644,6 +687,12 @@ impl std::fmt::Display for SweepError {
             Self::InvalidCornerRadius(r) => write!(f, "invalid corner radius: {r}"),
             Self::CornerRadiusTooLarge(i) => {
                 write!(f, "corner radius too large at vertex index {i}")
+            }
+            Self::CornerFilletRadiusTooLarge { radius, max_radius } => {
+                write!(
+                    f,
+                    "corner fillet radius {radius} is larger than profile radius {max_radius}"
+                )
             }
             Self::SelfIntersectingSweep(i) => {
                 write!(f, "self-intersecting sweep at path segment index {i}")
@@ -1060,13 +1109,70 @@ mod tests {
             0.5,
             &SweepOptions {
                 fillet_corners: true,
-                name: None,
+                ..SweepOptions::default()
             },
         )
         .unwrap();
         // 2 cylinders + 1 torus fillet + 2 caps = 5 faces
         let stats = brep.stats();
         assert_eq!(stats.faces, 5, "expected 5 faces, got {}", stats.faces);
+    }
+
+    #[test]
+    fn corner_fillet_radius_controls_connector_torus_minor_radius() {
+        let waypoints = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(5.0, 0.0, 0.0),
+            Point3::new(5.0, 5.0, 0.0),
+        ];
+        let mut brep = BRep::new();
+        sweep_circle_along_polyline(
+            &mut brep,
+            &waypoints,
+            0.5,
+            &SweepOptions {
+                fillet_corners: true,
+                corner_fillet_radius: 0.2,
+                ..SweepOptions::default()
+            },
+        )
+        .unwrap();
+
+        let torus = brep
+            .faces
+            .values()
+            .find_map(|face| match face.geom {
+                FaceGeom::Torus(t) => Some(t),
+                _ => None,
+            })
+            .expect("missing corner fillet torus");
+        assert!((torus.minor_radius - 0.2).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn corner_fillet_radius_cannot_exceed_profile_radius() {
+        let waypoints = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(5.0, 0.0, 0.0),
+            Point3::new(5.0, 5.0, 0.0),
+        ];
+        let mut brep = BRep::new();
+        let err = sweep_circle_along_polyline(
+            &mut brep,
+            &waypoints,
+            0.5,
+            &SweepOptions {
+                fillet_corners: true,
+                corner_fillet_radius: 0.6,
+                ..SweepOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SweepError::CornerFilletRadiusTooLarge { .. }
+        ));
     }
 
     #[test]
@@ -1115,7 +1221,7 @@ mod tests {
             0.2,
             &SweepOptions {
                 fillet_corners: false,
-                name: None,
+                ..SweepOptions::default()
             },
         )
         .unwrap();
@@ -1167,7 +1273,7 @@ mod tests {
             1.5,
             &SweepOptions {
                 fillet_corners: false,
-                name: None,
+                ..SweepOptions::default()
             },
         )
         .unwrap();
@@ -1198,7 +1304,7 @@ mod tests {
             0.2,
             &SweepOptions {
                 fillet_corners: false,
-                name: None,
+                ..SweepOptions::default()
             },
         )
         .unwrap_err();

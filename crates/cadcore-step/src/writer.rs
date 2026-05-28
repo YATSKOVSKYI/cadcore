@@ -507,7 +507,7 @@ mod tests {
             0.5,
             &SweepOptions {
                 fillet_corners: true,
-                name: None,
+                ..SweepOptions::default()
             },
         )
         .unwrap();
@@ -539,7 +539,7 @@ mod tests {
             0.5,
             &SweepOptions {
                 fillet_corners: true,
-                name: None,
+                ..SweepOptions::default()
             },
         )
         .unwrap();
@@ -566,7 +566,7 @@ mod tests {
             0.5,
             &SweepOptions {
                 fillet_corners: true,
-                name: None,
+                ..SweepOptions::default()
             },
         )
         .unwrap();
@@ -592,7 +592,7 @@ mod tests {
             0.5,
             &SweepOptions {
                 fillet_corners: false,
-                name: None,
+                ..SweepOptions::default()
             },
         )
         .unwrap();

@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut brep = BRep::new();
     let opts = SweepOptions {
         fillet_corners: true,
+        corner_fillet_radius: 0.1,
         name: Some("scaffold_leg".to_string()),
     };
     let _solid_id = sweep_circle_along_polyline(&mut brep, &waypoints, filament_radius, &opts)?;
