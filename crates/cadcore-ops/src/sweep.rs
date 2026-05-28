@@ -22,11 +22,15 @@ use cadcore_topo::{
 /// Options that control the sweep.
 #[derive(Clone, Debug)]
 pub struct SweepOptions {
-    /// Use toroidal fillets at corners (smooth G1 join).
-    /// If `false`, use miter-plane cuts (sharp join — faster STEP output).
+    /// Round sharp polyline corners before sweeping.
+    /// If `false`, use miter-plane cuts at sharp joins.
     pub fillet_corners: bool,
-    /// Radius of the analytic corner fillet surface.  When set to `0.0`, the
-    /// swept profile radius is used for backward compatibility.
+    /// Radius left on the inside of a rounded solid corner.
+    ///
+    /// The kernel implements this as a CAD pipe sweep: first it rounds the
+    /// centre-line to `profile_radius + corner_fillet_radius`, then sweeps the
+    /// circular profile along that analytic path.  When set to `0.0`, the swept
+    /// profile radius is used for backward compatibility.
     pub corner_fillet_radius: f64,
     /// Optional name for the resulting solid.
     pub name: Option<String>,
@@ -43,7 +47,7 @@ impl Default for SweepOptions {
 }
 
 impl SweepOptions {
-    fn effective_corner_fillet_radius(&self, profile_radius: f64) -> Result<f64, SweepError> {
+    fn effective_solid_corner_radius(&self, profile_radius: f64) -> Result<f64, SweepError> {
         if !self.fillet_corners {
             return Ok(0.0);
         }
@@ -56,14 +60,33 @@ impl SweepOptions {
         } else {
             self.corner_fillet_radius
         };
-        if radius > profile_radius {
-            return Err(SweepError::CornerFilletRadiusTooLarge {
-                radius,
-                max_radius: profile_radius,
-            });
-        }
         Ok(radius)
     }
+}
+
+/// Convert a solid-corner radius to the centre-line radius needed for a pipe
+/// sweep.
+///
+/// A swept circular profile self-intersects when the centre-line arc radius is
+/// not larger than the profile radius.  Treating `corner_radius` as the inside
+/// radius of the solid gives the safe CAD construction:
+/// `centre_line_radius = profile_radius + corner_radius`.
+///
+/// # Errors
+///
+/// Returns [`SweepError::InvalidRadius`] when `profile_radius <= 0` and
+/// [`SweepError::InvalidCornerRadius`] when `corner_radius < 0`.
+pub fn solid_corner_centerline_radius(
+    profile_radius: f64,
+    corner_radius: f64,
+) -> Result<f64, SweepError> {
+    if profile_radius <= 0.0 {
+        return Err(SweepError::InvalidRadius(profile_radius));
+    }
+    if corner_radius < 0.0 {
+        return Err(SweepError::InvalidCornerRadius(corner_radius));
+    }
+    Ok(profile_radius + corner_radius)
 }
 
 /// Options for recovering analytic path segments from a sampled polyline.
@@ -362,7 +385,22 @@ pub fn sweep_circle_along_polyline(
     if radius <= 0.0 {
         return Err(SweepError::InvalidRadius(radius));
     }
-    let corner_fillet_radius = opts.effective_corner_fillet_radius(radius)?;
+    if opts.fillet_corners {
+        let corner_radius = opts.effective_solid_corner_radius(radius)?;
+        let centerline_radius = solid_corner_centerline_radius(radius, corner_radius)?;
+        let rounded_opts = SweepOptions {
+            fillet_corners: false,
+            corner_fillet_radius: 0.0,
+            name: opts.name.clone(),
+        };
+        return sweep_circle_along_rounded_polyline(
+            brep,
+            waypoints,
+            radius,
+            centerline_radius,
+            &rounded_opts,
+        );
+    }
 
     // Pre-compute segment directions.
     let n = waypoints.len();
@@ -417,66 +455,8 @@ pub fn sweep_circle_along_polyline(
         });
         face_ids.push(cyl_face_id);
 
-        // --- Connector at interior vertex ---
-        if i + 1 < n - 1 {
-            let next_dir = dirs[i + 1];
-            let vertex = waypoints[i + 1];
-            let cos_angle = dir.dot(next_dir);
-
-            if opts.fillet_corners && (1.0 - cos_angle.abs()) > 1e-4 {
-                // Build toroidal fillet
-                if let Some(torus) =
-                    TorusSurf::for_corner(vertex, dir, next_dir, corner_fillet_radius)
-                {
-                    // Compute the two minor-circle boundaries for the STEP face bounds.
-                    //
-                    // The torus axis A = dir × next_dir (bend-plane normal).
-                    // Both `dir` and `next_dir` lie in the equatorial plane of the torus.
-                    //
-                    // The spine point at the incoming junction has radial direction:
-                    //   r_hat_start = normalize(dir × A)
-                    // The spine point at the outgoing junction has radial direction:
-                    //   r_hat_end   = normalize(next_dir × A)
-                    //
-                    // Derivation: axis × r_hat = dir ⟹ r_hat = normalize(dir × axis)
-                    // (valid when dir ⊥ axis, which holds since axis = dir × next_dir).
-                    let extent = if let Some(taxis) = UnitVec3::try_from_vec(dir.cross(next_dir)) {
-                        let rs_vec = dir.cross(taxis);
-                        let re_vec = next_dir.cross(taxis);
-                        match (
-                            UnitVec3::try_from_vec(rs_vec),
-                            UnitVec3::try_from_vec(re_vec),
-                        ) {
-                            (Some(r_s), Some(r_e)) => {
-                                let start_pt = torus.frame.origin + r_s * torus.major_radius;
-                                let end_pt = torus.frame.origin + r_e * torus.major_radius;
-                                FaceExtent::TorusFillet {
-                                    start_circle: Circle3::new(start_pt, dir, torus.minor_radius),
-                                    end_circle: Circle3::new(end_pt, next_dir, torus.minor_radius),
-                                }
-                            }
-                            _ => FaceExtent::None,
-                        }
-                    } else {
-                        FaceExtent::None
-                    };
-
-                    let torus_loop_id = build_placeholder_loop(brep);
-                    let torus_id = brep.add_face(Face {
-                        geom: FaceGeom::Torus(torus),
-                        normal: FaceNormal::Same,
-                        outer_loop: torus_loop_id,
-                        inner_loops: vec![],
-                        shell: cadcore_topo::ShellId::default(),
-                        extent,
-                    });
-                    face_ids.push(torus_id);
-                }
-            }
-            // If fillet_corners=false or nearly straight: miter plane cut.
-            // In a miter join the cylinder segments share the elliptic edge.
-            // The STEP writer handles the shared edge — no extra face needed.
-        }
+        // In a miter join the cylinder segments share the elliptic edge. The
+        // STEP writer handles the shared edge — no extra face is needed.
     }
 
     // ── End cap ───────────────────────────────────────────────────────────────
@@ -533,8 +513,6 @@ pub fn sweep_circle_along_path(
     if radius <= 0.0 {
         return Err(SweepError::InvalidRadius(radius));
     }
-    let corner_fillet_radius = opts.effective_corner_fillet_radius(radius)?;
-
     let mut infos = Vec::with_capacity(segments.len());
     for (idx, segment) in segments.iter().copied().enumerate() {
         let info = segment_info(segment).ok_or(SweepError::InvalidArc(idx))?;
@@ -625,21 +603,9 @@ pub fn sweep_circle_along_path(
             }
         }
 
-        if idx + 1 < infos.len() {
-            let current = info.end_tangent;
-            let next = infos[idx + 1].start_tangent;
-            if opts.fillet_corners && (1.0 - current.dot(next).abs()) > 1.0e-4 {
-                if let Some(connector_id) = build_corner_connector(
-                    brep,
-                    info.end,
-                    current,
-                    next,
-                    corner_fillet_radius,
-                ) {
-                    face_ids.push(connector_id);
-                }
-            }
-        }
+        // Explicit path sweeps expect rounded corners to be represented as
+        // analytic arc segments. Adding a separate connector here would leave
+        // the adjacent cylinder faces untrimmed and produce non-manifold STEP.
     }
 
     let last = infos.last().expect("non-empty path");
@@ -665,13 +631,6 @@ pub enum SweepError {
     InvalidCornerRadius(f64),
     /// Requested centre-line corner radius does not fit at vertex index.
     CornerRadiusTooLarge(usize),
-    /// Requested corner fillet radius is larger than the swept profile radius.
-    CornerFilletRadiusTooLarge {
-        /// Requested corner fillet radius.
-        radius: f64,
-        /// Maximum valid fillet radius for the swept profile.
-        max_radius: f64,
-    },
     /// Circular path radius is not larger than the swept profile radius.
     SelfIntersectingSweep(usize),
 }
@@ -687,12 +646,6 @@ impl std::fmt::Display for SweepError {
             Self::InvalidCornerRadius(r) => write!(f, "invalid corner radius: {r}"),
             Self::CornerRadiusTooLarge(i) => {
                 write!(f, "corner radius too large at vertex index {i}")
-            }
-            Self::CornerFilletRadiusTooLarge { radius, max_radius } => {
-                write!(
-                    f,
-                    "corner fillet radius {radius} is larger than profile radius {max_radius}"
-                )
             }
             Self::SelfIntersectingSweep(i) => {
                 write!(f, "self-intersecting sweep at path segment index {i}")
@@ -964,46 +917,6 @@ fn join_boundary(
     }
 }
 
-fn build_corner_connector(
-    brep: &mut BRep,
-    vertex: Point3,
-    dir: UnitVec3,
-    next_dir: UnitVec3,
-    radius: f64,
-) -> Option<cadcore_topo::FaceId> {
-    let torus = TorusSurf::for_corner(vertex, dir, next_dir, radius)?;
-    let extent = if let Some(taxis) = UnitVec3::try_from_vec(dir.cross(next_dir)) {
-        let rs_vec = dir.cross(taxis);
-        let re_vec = next_dir.cross(taxis);
-        match (
-            UnitVec3::try_from_vec(rs_vec),
-            UnitVec3::try_from_vec(re_vec),
-        ) {
-            (Some(r_s), Some(r_e)) => {
-                let start_pt = torus.frame.origin + r_s * torus.major_radius;
-                let end_pt = torus.frame.origin + r_e * torus.major_radius;
-                FaceExtent::TorusFillet {
-                    start_circle: Circle3::new(start_pt, dir, torus.minor_radius),
-                    end_circle: Circle3::new(end_pt, next_dir, torus.minor_radius),
-                }
-            }
-            _ => FaceExtent::None,
-        }
-    } else {
-        FaceExtent::None
-    };
-
-    let torus_loop_id = build_placeholder_loop(brep);
-    Some(brep.add_face(Face {
-        geom: FaceGeom::Torus(torus),
-        normal: FaceNormal::Same,
-        outer_loop: torus_loop_id,
-        inner_loops: vec![],
-        shell: cadcore_topo::ShellId::default(),
-        extent,
-    }))
-}
-
 fn assemble_solid(
     brep: &mut BRep,
     face_ids: Vec<cadcore_topo::FaceId>,
@@ -1096,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn two_segments_can_add_legacy_connector() {
+    fn two_segments_can_build_rounded_corner_sweep() {
         let waypoints = vec![
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(5.0, 0.0, 0.0),
@@ -1113,13 +1026,13 @@ mod tests {
             },
         )
         .unwrap();
-        // 2 cylinders + 1 torus fillet + 2 caps = 5 faces
+        // 2 cylinders + 1 analytic path torus + 2 caps = 5 faces
         let stats = brep.stats();
         assert_eq!(stats.faces, 5, "expected 5 faces, got {}", stats.faces);
     }
 
     #[test]
-    fn corner_fillet_radius_controls_connector_torus_minor_radius() {
+    fn corner_fillet_radius_controls_inside_solid_corner_radius() {
         let waypoints = vec![
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(5.0, 0.0, 0.0),
@@ -1146,11 +1059,43 @@ mod tests {
                 _ => None,
             })
             .expect("missing corner fillet torus");
-        assert!((torus.minor_radius - 0.2).abs() < 1.0e-10);
+        assert!((torus.major_radius - 0.7).abs() < 1.0e-10);
+        assert!((torus.minor_radius - 0.5).abs() < 1.0e-10);
     }
 
     #[test]
-    fn corner_fillet_radius_cannot_exceed_profile_radius() {
+    fn corner_fillet_radius_can_exceed_profile_radius() {
+        let waypoints = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(5.0, 0.0, 0.0),
+            Point3::new(5.0, 5.0, 0.0),
+        ];
+        let mut brep = BRep::new();
+        sweep_circle_along_polyline(
+            &mut brep,
+            &waypoints,
+            0.5,
+            &SweepOptions {
+                fillet_corners: true,
+                corner_fillet_radius: 0.6,
+                ..SweepOptions::default()
+            },
+        )
+        .unwrap();
+
+        let torus = brep
+            .faces
+            .values()
+            .find_map(|face| match face.geom {
+                FaceGeom::Torus(t) => Some(t),
+                _ => None,
+            })
+            .expect("missing rounded corner torus");
+        assert!((torus.major_radius - 1.1).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn negative_corner_fillet_radius_fails() {
         let waypoints = vec![
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(5.0, 0.0, 0.0),
@@ -1163,16 +1108,13 @@ mod tests {
             0.5,
             &SweepOptions {
                 fillet_corners: true,
-                corner_fillet_radius: 0.6,
+                corner_fillet_radius: -0.1,
                 ..SweepOptions::default()
             },
         )
         .unwrap_err();
 
-        assert!(matches!(
-            err,
-            SweepError::CornerFilletRadiusTooLarge { .. }
-        ));
+        assert!(matches!(err, SweepError::InvalidCornerRadius(_)));
     }
 
     #[test]

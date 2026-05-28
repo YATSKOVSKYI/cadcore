@@ -14,6 +14,7 @@ pub mod sweep;
 
 pub use sweep::{
     analytic_path_from_polyline_samples, rounded_path_from_polyline,
-    sharp_path_from_polyline_samples, sweep_circle_along_path, sweep_circle_along_polyline,
-    sweep_circle_along_rounded_polyline, PathApproxOptions, SweepOptions, SweepPathSegment,
+    sharp_path_from_polyline_samples, solid_corner_centerline_radius, sweep_circle_along_path,
+    sweep_circle_along_polyline, sweep_circle_along_rounded_polyline, PathApproxOptions,
+    SweepOptions, SweepPathSegment,
 };
