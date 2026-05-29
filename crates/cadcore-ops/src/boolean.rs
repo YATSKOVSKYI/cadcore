@@ -1,39 +1,30 @@
 //! Solid Boolean half-space cut for cadcore B-Rep solids.
 //!
-//! # Algorithm
+//! # Strategy
 //!
-//! For each solid in the [`BRep`]:
+//! Each *cylinder face* in the [`BRep`] is classified relative to the cutting
+//! plane and rebuilt independently.  This works because each cylinder face in
+//! the existing sweep pipeline corresponds to one straight segment of the
+//! polyline — solids built segment-by-segment can be trimmed face-by-face.
 //!
-//! 1.  **Determine spatial relationship** between the solid's bounding cylinder
-//!     and the cut plane by inspecting the solid's faces.
-//! 2.  **Entirely on kept side** → solid is unchanged.
-//! 3.  **Entirely on discarded side** → solid is removed.
-//! 4.  **Crossing case: axis perpendicular to plane normal**
-//!     (cylinder axis ⊥ plane normal, i.e. the axis is parallel to the plane)
-//!     → the cylinder is cut laterally — a "partial cylinder" (half-pipe) is
-//!     created with a flat chord face at the cut plane.
-//! 5.  **Crossing case: axis parallel to plane normal**
-//!     (cylinder axis ∥ plane normal, i.e. the axis crosses the plane)
-//!     → the cylinder is truncated at the plane; the end cap becomes a flat circle.
-//!     This case is already handled correctly by `sweep_circle_along_path_with_caps`
-//!     in the polyline-clip pipeline — it is kept unchanged here.
+//! Three cases per cylinder:
 //!
-//! # Why this is needed
+//! | axis ⊥ plane.normal? | dist(axis, plane) | result                              |
+//! |----------------------|-------------------|-------------------------------------|
+//! | yes (LATERAL)        | > radius          | kept                                |
+//! | yes (LATERAL)        | < −radius         | dropped                             |
+//! | yes (LATERAL)        | |dist| < radius   | partial cylinder + flat chord       |
+//! | no  (AXIAL)          | both ends kept    | kept                                |
+//! | no  (AXIAL)          | both ends discard | dropped                             |
+//! | no  (AXIAL)          | crosses plane     | truncated + flat disk cap           |
 //!
-//! The existing `clip_polyline_with_radius` clips polyline *centre-lines* before
-//! sweeping.  A filament whose centre-line is **parallel** to the cut plane and
-//! whose centre is within one radius of the plane cannot be represented by
-//! any clipped centre-line: the centre-line is either fully kept or fully dropped.
-//!
-//! `half_space_cut_brep` operates on the already-swept *solid* and correctly
-//! handles the lateral case by building a new partial-cylinder solid.
-
-use std::f64::consts::PI;
+//! The same cylinder may be cut by multiple planes; planes are processed
+//! sequentially.
 
 use cadcore_geom::{CylSurf, Plane3};
 use cadcore_math::{Point3, UnitVec3};
 use cadcore_topo::{
-    BRep, Face, FaceExtent, FaceGeom, FaceNormal, Shell, Solid, SolidId,
+    BRep, Face, FaceBoundary, FaceExtent, FaceGeom, FaceNormal, Shell, Solid, SolidId,
 };
 
 use crate::sweep::ClipPlane;
@@ -42,368 +33,485 @@ use crate::sweep::ClipPlane;
 
 /// Apply a half-space cut to every solid in `brep`.
 ///
-/// For each solid:
-/// - If entirely on the **kept** side (`plane.normal · (centre − plane.origin) ≥ radius`):
-///   the solid is left unchanged.
-/// - If entirely on the **discarded** side: the solid (and all its topology) is dropped.
-/// - If **crossing** (the plane intersects the solid's bounding cylinder laterally):
-///   the solid is replaced with a partial-cylinder solid whose flat face lies on the plane.
+/// Iterates over every solid and over every face inside that solid:
+/// each cylinder face is classified relative to `plane` and replaced with the
+/// surviving partial geometry (partial cylinder + chord face for lateral cuts,
+/// truncated cylinder + flat disk cap for axial cuts).
+///
+/// Solids whose ALL cylinder faces are entirely on the discarded side are
+/// removed; solids whose ALL cylinder faces are entirely on the kept side are
+/// left unchanged; mixed solids are rebuilt face-by-face.
 ///
 /// Returns the number of solids remaining after the cut.
-///
-/// # Notes
-///
-/// This function works on the solid metadata encoded in [`FaceExtent`] variants.
-/// Solids whose faces do not carry recognisable extent information are left as-is.
 pub fn half_space_cut_brep(brep: &mut BRep, plane: &ClipPlane) -> usize {
-    // Collect solid ids to avoid borrow conflicts.
     let solid_ids: Vec<SolidId> = brep.solids.keys().collect();
-    let mut to_drop: Vec<SolidId>   = Vec::new();
-    let mut to_add:  Vec<CutResult> = Vec::new();
+    let mut to_drop: Vec<SolidId> = Vec::new();
+    let mut to_add: Vec<NewSolidParts> = Vec::new();
 
     for solid_id in solid_ids {
-        match classify_solid(brep, solid_id, plane) {
-            SolidRelation::EntirelyKept => {
-                // Keep unchanged.
-            }
-            SolidRelation::EntirelyDiscarded => {
+        match process_solid(brep, solid_id, plane) {
+            SolidOutcome::Unchanged => {}
+            SolidOutcome::Drop => to_drop.push(solid_id),
+            SolidOutcome::Replace(parts) => {
                 to_drop.push(solid_id);
-            }
-            SolidRelation::LateralCrossing { axis_start, axis_end, radius, dist } => {
-                to_drop.push(solid_id);
-                if let Some(result) = build_partial_cylinder(
-                    axis_start, axis_end, radius, plane, dist,
-                ) {
-                    to_add.push(result);
-                }
-            }
-            SolidRelation::Unknown => {
-                // Leave as-is; don't know how to cut.
+                to_add.push(parts);
             }
         }
     }
 
-    // Drop marked solids (shells + faces are orphaned — acceptable for STEP export).
     for id in to_drop {
         brep.solids.remove(id);
     }
-
-    // Insert new partial-cylinder solids.
-    for result in to_add {
-        add_partial_cylinder_solid(brep, result);
+    for parts in to_add {
+        materialise_solid(brep, parts);
     }
 
     brep.solids.len()
 }
 
-// ── Solid classification ──────────────────────────────────────────────────────
+// ── Implementation ────────────────────────────────────────────────────────────
 
-enum SolidRelation {
-    EntirelyKept,
-    EntirelyDiscarded,
-    /// The solid is a cylinder whose axis is approximately PARALLEL to the cut
-    /// plane (axis · plane_normal ≈ 0).  The cylinder centre is within the
-    /// lateral intersection zone: |dist| < radius.
-    LateralCrossing {
+enum SolidOutcome {
+    Unchanged,
+    Drop,
+    Replace(NewSolidParts),
+}
+
+/// Rebuilt geometry to be inserted as a new solid.
+struct NewSolidParts {
+    faces: Vec<FaceTemplate>,
+    name:  Option<String>,
+}
+
+/// A face waiting to be materialised in the BRep.
+enum FaceTemplate {
+    /// Full cylinder (kept as-is, copied from the original solid).
+    FullCylinder {
+        cyl:    CylSurf,
+        length: f64,
+        start:  FaceBoundary,
+        end:    FaceBoundary,
+    },
+    /// Cylinder with the axis parallel to the cut plane — chord cut.
+    PartialCylinder {
+        axis_start:     Point3,
+        axis_end:       Point3,
+        radius:         f64,
+        arc_half_angle: f64,
+        up:             UnitVec3,   // cut plane normal (into kept half-space)
+    },
+    /// Cylinder with the axis perpendicular to the cut plane — truncated.
+    /// The cylinder runs from `axis_start` to `axis_end`; `axis_end` was
+    /// originally past the plane and is now exactly on it.
+    AxialTruncated {
         axis_start: Point3,
         axis_end:   Point3,
         radius:     f64,
-        /// Signed distance from cylinder centre to plane.
-        /// Positive = centre is on the kept side.
-        dist: f64,
     },
-    Unknown,
+    /// Polygonal flat face (e.g. chord face of a PartialCylinder).
+    Polygon {
+        plane:  Plane3,
+        points: Vec<Point3>,
+    },
+    /// Flat disk (full circle, used for AxialTruncated end caps).
+    Disk {
+        plane:  Plane3,
+        radius: f64,
+    },
+    /// Partial disk (used for PartialCylinder end caps).
+    PartialDisk {
+        plane:       Plane3,
+        radius:      f64,
+        start_angle: f64,
+        end_angle:   f64,
+    },
 }
 
-/// Inspect the faces of `solid_id` to classify its spatial relationship with
-/// `plane`.  Only cylindrical solids produced by `sweep_circle_along_path_with_caps`
-/// are handled; others return [`SolidRelation::Unknown`].
-fn classify_solid(brep: &BRep, solid_id: SolidId, plane: &ClipPlane) -> SolidRelation {
+/// Process one solid: classify each face and build the replacement parts.
+fn process_solid(brep: &BRep, solid_id: SolidId, plane: &ClipPlane) -> SolidOutcome {
     let solid = match brep.solids.get(solid_id) {
         Some(s) => s,
-        None    => return SolidRelation::Unknown,
+        None    => return SolidOutcome::Unchanged,
     };
 
-    // Gather cylinder faces to extract axis and radius.
-    let mut cyl_axis_dir: Option<UnitVec3> = None;
-    let mut cyl_origin:   Option<Point3>   = None;
-    let mut cyl_length:   Option<f64>      = None;
-    let mut cyl_radius:   Option<f64>      = None;
-
+    // Collect face references.
+    let mut cyl_faces: Vec<(CylSurf, f64, FaceBoundary, FaceBoundary)> = Vec::new();
     for &shell_id in &solid.shells {
-        let shell = match brep.shells.get(shell_id) {
-            Some(s) => s,
-            None    => continue,
-        };
+        let shell = match brep.shells.get(shell_id) { Some(s) => s, None => continue };
         for &face_id in &shell.faces {
-            let face = match brep.faces.get(face_id) {
-                Some(f) => f,
-                None    => continue,
-            };
-            if let FaceGeom::Cylinder(cyl) = &face.geom {
-                if cyl_axis_dir.is_none() {
-                    cyl_axis_dir = Some(cyl.frame.z);
-                    cyl_origin   = Some(cyl.frame.origin);
-                    cyl_radius   = Some(cyl.radius);
-                    if let FaceExtent::Cylinder { length, .. } = &face.extent {
-                        cyl_length = Some(*length);
-                    }
-                }
+            let face = match brep.faces.get(face_id) { Some(f) => f, None => continue };
+            if let (FaceGeom::Cylinder(cyl), FaceExtent::Cylinder { length, start, end }) =
+                (&face.geom, &face.extent)
+            {
+                cyl_faces.push((*cyl, *length, start.clone(), end.clone()));
             }
         }
     }
 
-    let (axis_dir, origin, radius, length) = match (cyl_axis_dir, cyl_origin, cyl_radius, cyl_length) {
-        (Some(d), Some(o), Some(r), Some(l)) => (d, o, r, l),
-        _ => return SolidRelation::Unknown,
-    };
-
-    // axis_end is origin + axis_dir * length (CylSurf convention).
-    let axis_start = origin;
-    let axis_end   = origin + axis_dir.as_vec() * length;
-
-    // Distance from cylinder centre-line to the cutting plane.
-    // For a straight cylinder the centre-line is the axis; use its midpoint.
-    let mid = axis_start + (axis_end - axis_start) * 0.5;
-    let dist = plane.normal.dot_vec(mid - plane.origin);
-
-    // Check if axis is parallel to the plane (axis · plane_normal ≈ 0).
-    let axis_dot_normal = plane.normal.dot_vec(axis_dir.as_vec()).abs();
-    let is_lateral      = axis_dot_normal < 0.05; // within ~3° of parallel
-
-    if is_lateral {
-        // Lateral (parallel) case — classify by cylinder envelope.
-        if dist >= radius - 1.0e-7 {
-            SolidRelation::EntirelyKept
-        } else if dist <= -radius + 1.0e-7 {
-            SolidRelation::EntirelyDiscarded
-        } else {
-            SolidRelation::LateralCrossing { axis_start, axis_end, radius, dist }
-        }
-    } else {
-        // Axial (perpendicular) case.
-        // Bounding AABB along the axis direction.
-        let d_start = plane.normal.dot_vec(axis_start - plane.origin);
-        let d_end   = plane.normal.dot_vec(axis_end   - plane.origin);
-        // Physical extent in the plane-normal direction (add ±radius slop).
-        let d_min = d_start.min(d_end) - radius;
-        let d_max = d_start.max(d_end) + radius;
-
-        if d_min >= -1.0e-7 {
-            SolidRelation::EntirelyKept
-        } else if d_max <= 1.0e-7 {
-            SolidRelation::EntirelyDiscarded
-        } else {
-            // Let the existing polyline-clip pipeline handle this case
-            // (it already produces the correct flat-cap solid).
-            SolidRelation::Unknown
-        }
-    }
-}
-
-// ── Partial cylinder solid construction ───────────────────────────────────────
-
-/// Intermediate representation of a partial-cylinder solid to be inserted.
-struct CutResult {
-    axis_start:      Point3,
-    axis_end:        Point3,
-    radius:          f64,
-    arc_half_angle:  f64,   // π/2 = semicircle, π = full (shouldn't happen)
-    plane_normal:    UnitVec3,
-    /// "Up" direction in the cross-section: the direction toward the kept half.
-    up:              UnitVec3,
-}
-
-/// Build a `CutResult` for a cylinder that is laterally crossed by `plane`.
-///
-/// `dist` = signed distance from cylinder centre to plane (positive = kept side).
-fn build_partial_cylinder(
-    axis_start: Point3,
-    axis_end:   Point3,
-    radius:     f64,
-    plane:      &ClipPlane,
-    dist:       f64,
-) -> Option<CutResult> {
-    // Arc half-angle of the surviving portion.
-    // The kept arc spans where the cross-section is on the kept side of the plane.
-    // If dist = 0: half of the circle → arc_half_angle = π/2.
-    // If dist > 0: more than half → arc_half_angle > π/2.
-    // If dist < 0: less than half → arc_half_angle < π/2.
-    let cos_half = -(dist / radius).clamp(-1.0, 1.0); // negate: cos(π - θ) trick
-    let arc_half_angle = cos_half.acos(); // in [0, π]
-
-    if arc_half_angle < 1.0e-6 {
-        // Tangent case: no surviving material.
-        return None;
+    if cyl_faces.is_empty() {
+        return SolidOutcome::Unchanged;
     }
 
-    // "Up" direction is the plane normal pointing INTO the kept half-space.
-    let up = plane.normal;
+    // Classify each cylinder face.
+    let mut new_faces: Vec<FaceTemplate> = Vec::new();
+    let mut any_kept   = false;
+    let mut any_cut    = false;
+    let mut all_dropped = true;
 
-    Some(CutResult {
-        axis_start,
-        axis_end,
-        radius,
-        arc_half_angle,
-        plane_normal: plane.normal,
-        up,
+    for (cyl, length, start, end) in cyl_faces {
+        let outcome = classify_cylinder(&cyl, length, plane);
+        match outcome {
+            CylinderOutcome::EntirelyKept => {
+                new_faces.push(FaceTemplate::FullCylinder { cyl, length, start, end });
+                any_kept    = true;
+                all_dropped = false;
+            }
+            CylinderOutcome::EntirelyDiscarded => {
+                // Drop this cylinder.
+            }
+            CylinderOutcome::LateralCut { arc_half_angle, up, axis_start, axis_end, radius } => {
+                new_faces.push(FaceTemplate::PartialCylinder {
+                    axis_start, axis_end, radius, arc_half_angle, up,
+                });
+                // Add chord face + 2 partial disk caps.
+                add_lateral_cut_caps(&mut new_faces, axis_start, axis_end, radius, arc_half_angle, up);
+                any_cut     = true;
+                all_dropped = false;
+            }
+            CylinderOutcome::AxialCut { new_start, new_end, kept_end_at_plane, radius, axis_dir } => {
+                new_faces.push(FaceTemplate::AxialTruncated {
+                    axis_start: new_start,
+                    axis_end:   new_end,
+                    radius,
+                });
+                // Add flat disk cap at the cut end (replacing the original hemisphere).
+                // Cap normal points OUTWARD = away from the kept solid:
+                //   = +axis_dir if the cut was at the END,
+                //   = -axis_dir if the cut was at the START.
+                let cap_normal = if kept_end_at_plane {
+                    // axis_end is the cut end → outward = +axis_dir
+                    axis_dir
+                } else {
+                    // axis_start is the cut end → outward = -axis_dir
+                    -axis_dir
+                };
+                let cap_centre = if kept_end_at_plane { new_end } else { new_start };
+                new_faces.push(FaceTemplate::Disk {
+                    plane:  Plane3::from_origin_normal(cap_centre, cap_normal),
+                    radius,
+                });
+                any_cut     = true;
+                all_dropped = false;
+            }
+        }
+    }
+
+    if all_dropped {
+        return SolidOutcome::Drop;
+    }
+    if any_kept && !any_cut {
+        return SolidOutcome::Unchanged;
+    }
+
+    SolidOutcome::Replace(NewSolidParts {
+        faces: new_faces,
+        name:  solid.name.clone(),
     })
 }
 
-/// Materialise a `CutResult` as new faces/shells/solid in `brep`.
-///
-/// The solid consists of:
-/// 1. **Partial cylinder** face — the arc of the CylSurf above the cut plane.
-/// 2. **Chord face** — flat rectangle at the cut plane boundary.
-/// 3. **Start arc cap** — partial disk at the axis start.
-/// 4. **End arc cap** — partial disk at the axis end.
-fn add_partial_cylinder_solid(brep: &mut BRep, r: CutResult) {
-    let axis_vec = r.axis_end - r.axis_start;
-    let length = axis_vec.length();
-    if length < 1.0e-9 { return; }
+// ── Cylinder classification ───────────────────────────────────────────────────
+
+enum CylinderOutcome {
+    EntirelyKept,
+    EntirelyDiscarded,
+    /// Cylinder axis is approximately parallel to the cut plane; centre-line
+    /// runs along the plane, and the cylinder envelope partially intersects it.
+    LateralCut {
+        axis_start:     Point3,
+        axis_end:       Point3,
+        radius:         f64,
+        arc_half_angle: f64,
+        up:             UnitVec3,
+    },
+    /// Cylinder axis is approximately perpendicular to the cut plane; the axis
+    /// crosses the plane.  The surviving cylinder runs from `new_start` to
+    /// `new_end`; one of those points is on the plane (the truncation point).
+    AxialCut {
+        new_start:           Point3,
+        new_end:             Point3,
+        /// `true` when `new_end` is the truncation point (original `end` was discarded).
+        /// `false` when `new_start` is the truncation point.
+        kept_end_at_plane:   bool,
+        radius:              f64,
+        axis_dir:            UnitVec3,
+    },
+}
+
+const PARALLEL_TOL: f64 = 0.05;        // ~3° from parallel
+const COINCIDENT_TOL: f64 = 1.0e-6;
+
+fn classify_cylinder(cyl: &CylSurf, length: f64, plane: &ClipPlane) -> CylinderOutcome {
+    let axis_dir   = cyl.frame.z;
+    let axis_start = cyl.frame.origin;
+    let axis_end   = axis_start + axis_dir.as_vec() * length;
+    let radius     = cyl.radius;
+
+    let axis_dot_n = plane.normal.dot_vec(axis_dir.as_vec());
+
+    // ── LATERAL case (axis ⊥ plane.normal, axis ∥ plane) ──────────────────────
+    if axis_dot_n.abs() < PARALLEL_TOL {
+        // Distance from any axis point to the plane (axis is parallel to plane).
+        let dist = plane.normal.dot_vec(axis_start - plane.origin);
+
+        if dist >= radius - COINCIDENT_TOL {
+            return CylinderOutcome::EntirelyKept;
+        }
+        if dist <= -radius + COINCIDENT_TOL {
+            return CylinderOutcome::EntirelyDiscarded;
+        }
+
+        // arc_half_angle = the half-span of the surviving arc, measured from
+        // the "up" direction (= plane.normal, pointing into kept half-space).
+        //   dist =  radius → arc_half_angle = 0     (tangent from outside, nothing kept)
+        //   dist =  0      → arc_half_angle = π/2   (half-cylinder)
+        //   dist = -radius → arc_half_angle = π     (whole cylinder, but EntirelyDiscarded above)
+        let cos_a = (-dist / radius).clamp(-1.0, 1.0);
+        let arc_half_angle = cos_a.acos();
+
+        return CylinderOutcome::LateralCut {
+            axis_start, axis_end, radius,
+            arc_half_angle,
+            up: plane.normal,
+        };
+    }
+
+    // ── AXIAL case (axis ∥ plane.normal) ───────────────────────────────────────
+    let d_start = plane.normal.dot_vec(axis_start - plane.origin);
+    let d_end   = plane.normal.dot_vec(axis_end   - plane.origin);
+
+    let s_kept = d_start >= -COINCIDENT_TOL;
+    let e_kept = d_end   >= -COINCIDENT_TOL;
+
+    if s_kept && e_kept {
+        return CylinderOutcome::EntirelyKept;
+    }
+    if !s_kept && !e_kept {
+        return CylinderOutcome::EntirelyDiscarded;
+    }
+
+    // Crossing: compute the intersection.
+    let denom = d_end - d_start;
+    if denom.abs() < 1.0e-12 {
+        return CylinderOutcome::EntirelyKept; // degenerate; bail
+    }
+    let t = -d_start / denom;
+    let intersect = axis_start + (axis_end - axis_start) * t;
+
+    if s_kept {
+        // start kept, end discarded → truncate at end
+        CylinderOutcome::AxialCut {
+            new_start: axis_start,
+            new_end:   intersect,
+            kept_end_at_plane: true,
+            radius,
+            axis_dir,
+        }
+    } else {
+        // start discarded, end kept → truncate at start
+        CylinderOutcome::AxialCut {
+            new_start: intersect,
+            new_end:   axis_end,
+            kept_end_at_plane: false,
+            radius,
+            axis_dir,
+        }
+    }
+}
+
+// ── Chord-face / partial-disk cap construction ────────────────────────────────
+
+fn add_lateral_cut_caps(
+    out:            &mut Vec<FaceTemplate>,
+    axis_start:     Point3,
+    axis_end:       Point3,
+    radius:         f64,
+    arc_half_angle: f64,
+    up:             UnitVec3,
+) {
+    let axis_vec = axis_end - axis_start;
     let axis_dir = match UnitVec3::try_from_vec(axis_vec) {
         Some(u) => u,
         None    => return,
     };
 
+    let right = match UnitVec3::try_from_vec(axis_dir.cross(up)) {
+        Some(u) => u,
+        None    => return,
+    };
+
+    let cos_a = arc_half_angle.cos();
+    let sin_a = arc_half_angle.sin();
+
+    // Arc endpoints in cross-section at axis_start:
+    //   p = axis_start + radius*(cos(α)*up + ±sin(α)*right)
+    let chord_offset = up.as_vec() * (radius * cos_a);
+    let chord_p_neg_start = axis_start + chord_offset - right.as_vec() * (radius * sin_a);
+    let chord_p_pos_start = axis_start + chord_offset + right.as_vec() * (radius * sin_a);
+    let chord_p_neg_end   = axis_end   + chord_offset - right.as_vec() * (radius * sin_a);
+    let chord_p_pos_end   = axis_end   + chord_offset + right.as_vec() * (radius * sin_a);
+
+    // ── Chord rectangle face (flat) ──────────────────────────────────────────
+    // Outward normal points into the DISCARDED half-space = −up.
+    let chord_normal = -up;
+    let chord_plane  = Plane3::from_origin_normal(chord_p_neg_start, chord_normal);
+    out.push(FaceTemplate::Polygon {
+        plane:  chord_plane,
+        // CCW order viewed from -up direction:
+        points: vec![chord_p_neg_start, chord_p_neg_end, chord_p_pos_end, chord_p_pos_start],
+    });
+
+    // ── Two partial-disk end caps ────────────────────────────────────────────
+    use std::f64::consts::PI;
+    let cap_start_plane = Plane3::from_origin_normal(axis_start, -axis_dir);
+    let cap_end_plane   = Plane3::from_origin_normal(axis_end,    axis_dir);
+    // Arc angles are measured from "up" (plane normal); for the disk cap we
+    // need angles measured from the plane's frame x-axis.  As an approximation
+    // we use 0..arc_full_angle and rely on the writer's frame orientation.
+    let arc_full = 2.0 * arc_half_angle;
+    out.push(FaceTemplate::PartialDisk {
+        plane:       cap_start_plane,
+        radius,
+        start_angle: PI * 0.5 - arc_half_angle,
+        end_angle:   PI * 0.5 + arc_half_angle,
+    });
+    out.push(FaceTemplate::PartialDisk {
+        plane:       cap_end_plane,
+        radius,
+        start_angle: PI * 0.5 - arc_half_angle,
+        end_angle:   PI * 0.5 + arc_half_angle,
+    });
+    let _ = arc_full;
+}
+
+// ── Materialisation ───────────────────────────────────────────────────────────
+
+fn materialise_solid(brep: &mut BRep, parts: NewSolidParts) {
     let mut face_ids = Vec::new();
 
-    // ── 1. Partial cylinder face ─────────────────────────────────────────────
-    {
-        let cyl = CylSurf::new(r.axis_start, axis_dir, r.radius);
-        let loop_id = build_placeholder_loop(brep);
-        let face_id = brep.add_face(Face {
-            geom:        FaceGeom::Cylinder(cyl),
-            normal:      FaceNormal::Same,
-            outer_loop:  loop_id,
-            inner_loops: vec![],
-            shell:       cadcore_topo::ShellId::default(),
-            extent:      FaceExtent::PartialCylinder {
-                length,
-                arc_start_angle: PI * 0.5 - r.arc_half_angle,
-                arc_end_angle:   PI * 0.5 + r.arc_half_angle,
-                arc_ref_dir:     r.up,
-            },
-        });
-        face_ids.push(face_id);
-    }
-
-    // ── 2. Chord face (flat rectangle at cut plane) ──────────────────────────
-    //
-    // The chord rectangle is built from the arc endpoints at each end of the
-    // cylinder.  The arc spans angle = ±arc_half_angle from the "up" direction
-    // (= plane normal, pointing into the kept half-space) in the cylinder
-    // cross-section plane.
-    //
-    // Local frame in the cross-section:
-    //   up    = r.up           (toward kept half-space)
-    //   right = axis_dir × up  (right-handed)
-    {
-        let right = match UnitVec3::try_from_vec(axis_dir.cross(r.up)) {
-            Some(u) => u,
-            None    => return,
+    for tpl in parts.faces {
+        let fid = match tpl {
+            FaceTemplate::FullCylinder { cyl, length, start, end } => {
+                let loop_id = build_placeholder_loop(brep);
+                brep.add_face(Face {
+                    geom:        FaceGeom::Cylinder(cyl),
+                    normal:      FaceNormal::Same,
+                    outer_loop:  loop_id,
+                    inner_loops: vec![],
+                    shell:       cadcore_topo::ShellId::default(),
+                    extent:      FaceExtent::Cylinder { length, start, end },
+                })
+            }
+            FaceTemplate::PartialCylinder { axis_start, axis_end, radius, arc_half_angle, up } => {
+                use std::f64::consts::PI;
+                let axis_vec = axis_end - axis_start;
+                let length = axis_vec.length();
+                let axis_dir = match UnitVec3::try_from_vec(axis_vec) {
+                    Some(u) => u,
+                    None    => continue,
+                };
+                let cyl = CylSurf::new(axis_start, axis_dir, radius);
+                let loop_id = build_placeholder_loop(brep);
+                brep.add_face(Face {
+                    geom:        FaceGeom::Cylinder(cyl),
+                    normal:      FaceNormal::Same,
+                    outer_loop:  loop_id,
+                    inner_loops: vec![],
+                    shell:       cadcore_topo::ShellId::default(),
+                    extent:      FaceExtent::PartialCylinder {
+                        length,
+                        arc_start_angle: PI * 0.5 - arc_half_angle,
+                        arc_end_angle:   PI * 0.5 + arc_half_angle,
+                        arc_ref_dir:     up,
+                    },
+                })
+            }
+            FaceTemplate::AxialTruncated { axis_start, axis_end, radius } => {
+                let axis_vec = axis_end - axis_start;
+                let length = axis_vec.length();
+                let axis_dir = match UnitVec3::try_from_vec(axis_vec) {
+                    Some(u) => u,
+                    None    => continue,
+                };
+                let cyl = CylSurf::new(axis_start, axis_dir, radius);
+                let loop_id = build_placeholder_loop(brep);
+                brep.add_face(Face {
+                    geom:        FaceGeom::Cylinder(cyl),
+                    normal:      FaceNormal::Same,
+                    outer_loop:  loop_id,
+                    inner_loops: vec![],
+                    shell:       cadcore_topo::ShellId::default(),
+                    extent:      FaceExtent::Cylinder {
+                        length,
+                        start: FaceBoundary::Circle(cadcore_geom::Circle3::new(axis_start, axis_dir, radius)),
+                        end:   FaceBoundary::Circle(cadcore_geom::Circle3::new(axis_end,   axis_dir, radius)),
+                    },
+                })
+            }
+            FaceTemplate::Polygon { plane, points } => {
+                let loop_id = build_placeholder_loop(brep);
+                brep.add_face(Face {
+                    geom:        FaceGeom::Plane(plane),
+                    normal:      FaceNormal::Same,
+                    outer_loop:  loop_id,
+                    inner_loops: vec![],
+                    shell:       cadcore_topo::ShellId::default(),
+                    extent:      FaceExtent::Polygon { points },
+                })
+            }
+            FaceTemplate::Disk { plane, radius } => {
+                let loop_id = build_placeholder_loop(brep);
+                brep.add_face(Face {
+                    geom:        FaceGeom::Plane(plane),
+                    normal:      FaceNormal::Same,
+                    outer_loop:  loop_id,
+                    inner_loops: vec![],
+                    shell:       cadcore_topo::ShellId::default(),
+                    extent:      FaceExtent::Disk { radius },
+                })
+            }
+            FaceTemplate::PartialDisk { plane, radius, start_angle, end_angle } => {
+                let loop_id = build_placeholder_loop(brep);
+                brep.add_face(Face {
+                    geom:        FaceGeom::Plane(plane),
+                    normal:      FaceNormal::Same,
+                    outer_loop:  loop_id,
+                    inner_loops: vec![],
+                    shell:       cadcore_topo::ShellId::default(),
+                    extent:      FaceExtent::PartialDisk { radius, start_angle, end_angle },
+                })
+            }
         };
-        let alpha = r.arc_half_angle;
-        // The arc endpoints at axis_start are:
-        //   p_left  = axis_start + up * cos(α) * r + right * sin(α) * r ... no
-        // Wait: angle measured from UP (not from right). At angle=0 → up direction.
-        // At angle=+α → rotated CCW by α from up in the (up, right) plane:
-        //   p = axis_start + r*(sin(α)*right + cos(α)*up)   ... no, that's angle from up toward right
-        // The chord connects the two arc endpoints:
-        //   p1 = axis_start + r * (sin(-α) * right + cos(-α) * up)  (one side)
-        //      = axis_start + r * (-sin(α) * right + cos(α) * up)
-        //   p2 = axis_start + r * (sin(+α) * right + cos(α) * up)
-        //
-        // But cos(α) * r is the distance from the chord to the cylinder centre in the "up" direction.
-        // And the chord is at: axis_start + r*cos(α)*up + (±r*sin(α))*right
-        // The chord face (flat rectangle) is at y = axis_start.y + r*cos(α)  [for y-plane]
-        // which matches: the plane is at this position when we built arc_half_angle.
-        let cos_a = alpha.cos();
-        let sin_a = alpha.sin();
-        let chord_offset = r.up.as_vec() * (r.radius * cos_a); // shift from axis toward plane
-
-        let chord_p1s = r.axis_start + chord_offset - right.as_vec() * (r.radius * sin_a);
-        let chord_p2s = r.axis_start + chord_offset + right.as_vec() * (r.radius * sin_a);
-        let chord_p1e = r.axis_end   + chord_offset - right.as_vec() * (r.radius * sin_a);
-        let chord_p2e = r.axis_end   + chord_offset + right.as_vec() * (r.radius * sin_a);
-
-        // Chord face normal points in the -up direction (into the discarded side):
-        // But we want outward normal from the solid = -up (solid is above the plane).
-        let chord_normal = -r.plane_normal;
-        let chord_plane = Plane3::from_origin_normal(chord_p1s, chord_normal);
-        let loop_id = build_placeholder_loop(brep);
-        let face_id = brep.add_face(Face {
-            geom:        FaceGeom::Plane(chord_plane),
-            normal:      FaceNormal::Same,
-            outer_loop:  loop_id,
-            inner_loops: vec![],
-            shell:       cadcore_topo::ShellId::default(),
-            // CCW order when viewed from outside (from discarded side, i.e. -up direction):
-            extent:      FaceExtent::Polygon {
-                points: vec![chord_p1s, chord_p1e, chord_p2e, chord_p2s],
-            },
-        });
-        face_ids.push(face_id);
+        face_ids.push(fid);
     }
 
-    // ── 3. Start arc end cap ─────────────────────────────────────────────────
-    {
-        let cap_normal = -axis_dir; // outward = toward negative axis
-        let cap_plane  = Plane3::from_origin_normal(r.axis_start, cap_normal);
-        let loop_id    = build_placeholder_loop(brep);
-        let face_id    = brep.add_face(Face {
-            geom:        FaceGeom::Plane(cap_plane),
-            normal:      FaceNormal::Same,
-            outer_loop:  loop_id,
-            inner_loops: vec![],
-            shell:       cadcore_topo::ShellId::default(),
-            extent:      FaceExtent::PartialDisk {
-                radius:      r.radius,
-                start_angle: PI * 0.5 - r.arc_half_angle,
-                end_angle:   PI * 0.5 + r.arc_half_angle,
-            },
-        });
-        face_ids.push(face_id);
+    if face_ids.is_empty() {
+        return;
     }
 
-    // ── 4. End arc end cap ───────────────────────────────────────────────────
-    {
-        let cap_normal = axis_dir;
-        let cap_plane  = Plane3::from_origin_normal(r.axis_end, cap_normal);
-        let loop_id    = build_placeholder_loop(brep);
-        let face_id    = brep.add_face(Face {
-            geom:        FaceGeom::Plane(cap_plane),
-            normal:      FaceNormal::Same,
-            outer_loop:  loop_id,
-            inner_loops: vec![],
-            shell:       cadcore_topo::ShellId::default(),
-            extent:      FaceExtent::PartialDisk {
-                radius:      r.radius,
-                start_angle: PI * 0.5 - r.arc_half_angle,
-                end_angle:   PI * 0.5 + r.arc_half_angle,
-            },
-        });
-        face_ids.push(face_id);
-    }
-
-    // ── Assemble solid ────────────────────────────────────────────────────────
     let shell_id = brep.add_shell(Shell {
         faces:    face_ids.clone(),
         is_outer: true,
         solid:    cadcore_topo::SolidId::default(),
     });
-
     for &fid in &face_ids {
         if let Some(f) = brep.faces.get_mut(fid) {
             f.shell = shell_id;
         }
     }
-
     let solid_id = brep.add_solid(Solid {
         shells: vec![shell_id],
-        name:   Some("partial_cylinder_cut".to_string()),
+        name:   parts.name,
     });
-
     if let Some(sh) = brep.shells.get_mut(shell_id) {
         sh.solid = solid_id;
     }
@@ -414,4 +522,108 @@ fn build_placeholder_loop(brep: &mut BRep) -> cadcore_topo::LoopId {
         start: cadcore_topo::CoEdgeId::default(),
         face:  cadcore_topo::FaceId::default(),
     })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sweep::{sweep_circle_along_polyline, SweepOptions};
+
+    /// X-direction cylinder centred at y=0.20 (= radius), cut by plane y=0.20.
+    /// Axis runs through the plane → LATERAL case, half-cylinder survives.
+    #[test]
+    fn x_cylinder_tangent_to_plane_survives_as_halfcyl() {
+        let mut brep = BRep::new();
+        sweep_circle_along_polyline(
+            &mut brep,
+            &[Point3::new(0.0, 0.20, 0.0), Point3::new(20.0, 0.20, 0.0)],
+            0.20,
+            &SweepOptions::default(),
+        ).unwrap();
+        let plane = ClipPlane {
+            origin: Point3::new(0.0, 0.20, 0.0),
+            normal: UnitVec3::Y,  // keep y >= 0.20
+        };
+        let n = half_space_cut_brep(&mut brep, &plane);
+        assert_eq!(n, 1, "cylinder must survive as a partial cylinder");
+
+        let total_faces = brep.faces.len();
+        assert!(total_faces >= 3,
+            "partial-cyl solid needs >= 3 faces (cyl + chord + 2 caps), got {total_faces}");
+
+        // Must contain a PartialCylinder extent.
+        let has_partial_cyl = brep.faces.values()
+            .any(|f| matches!(f.extent, FaceExtent::PartialCylinder { .. }));
+        assert!(has_partial_cyl, "no PartialCylinder face produced");
+
+        // Must contain at least one Polygon (the chord face).
+        let has_polygon = brep.faces.values()
+            .any(|f| matches!(f.extent, FaceExtent::Polygon { .. }));
+        assert!(has_polygon, "no chord polygon face produced");
+    }
+
+    /// Y-direction cylinder running from y=0 to y=20, cut by plane y=0.40.
+    /// Axis ∥ plane.normal → AXIAL case, truncated cylinder + flat disk cap.
+    #[test]
+    fn y_cylinder_perpendicular_to_plane_truncates() {
+        let mut brep = BRep::new();
+        sweep_circle_along_polyline(
+            &mut brep,
+            &[Point3::new(5.0, 0.0, 0.0), Point3::new(5.0, 20.0, 0.0)],
+            0.20,
+            &SweepOptions::default(),
+        ).unwrap();
+        let plane = ClipPlane {
+            origin: Point3::new(0.0, 0.40, 0.0),
+            normal: UnitVec3::Y,  // keep y >= 0.40
+        };
+        let n = half_space_cut_brep(&mut brep, &plane);
+        assert_eq!(n, 1, "cylinder must survive as truncated");
+
+        // Flat disk cap should be present.
+        let has_disk = brep.faces.values()
+            .any(|f| matches!(f.extent, FaceExtent::Disk { .. }));
+        assert!(has_disk, "no flat disk cap produced after axial cut");
+    }
+
+    /// Cylinder fully below the plane → dropped.
+    #[test]
+    fn cylinder_below_plane_dropped() {
+        let mut brep = BRep::new();
+        sweep_circle_along_polyline(
+            &mut brep,
+            &[Point3::new(0.0, -5.0, 0.0), Point3::new(20.0, -5.0, 0.0)],
+            0.20,
+            &SweepOptions::default(),
+        ).unwrap();
+        let plane = ClipPlane {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            normal: UnitVec3::Y,
+        };
+        let n = half_space_cut_brep(&mut brep, &plane);
+        assert_eq!(n, 0, "cylinder fully below plane must be dropped");
+    }
+
+    /// Cylinder fully above the plane → kept unchanged.
+    #[test]
+    fn cylinder_above_plane_kept() {
+        let mut brep = BRep::new();
+        sweep_circle_along_polyline(
+            &mut brep,
+            &[Point3::new(0.0, 5.0, 0.0), Point3::new(20.0, 5.0, 0.0)],
+            0.20,
+            &SweepOptions::default(),
+        ).unwrap();
+        let face_count_before = brep.faces.len();
+        let plane = ClipPlane {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            normal: UnitVec3::Y,
+        };
+        let n = half_space_cut_brep(&mut brep, &plane);
+        assert_eq!(n, 1);
+        assert_eq!(brep.faces.len(), face_count_before,
+            "fully-above cylinder must not gain or lose faces");
+    }
 }
