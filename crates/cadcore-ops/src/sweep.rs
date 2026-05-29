@@ -386,6 +386,112 @@ pub fn clip_polyline(points: &[Point3], planes: &[ClipPlane]) -> Vec<Vec<Point3>
     current_set
 }
 
+/// Clip a polyline by a set of planes, with awareness of the profile radius
+/// to avoid completely dropping parallel segments that physically intersect the kept region.
+pub fn clip_polyline_with_radius(
+    points: &[Point3],
+    planes: &[ClipPlane],
+    radius: f64,
+) -> Vec<Vec<Point3>> {
+    let mut current_set = vec![points.to_vec()];
+    for plane in planes {
+        let mut next_set = Vec::new();
+        for poly in current_set {
+            let clipped = clip_polyline_by_plane_with_radius(&poly, plane, radius);
+            next_set.extend(clipped);
+        }
+        current_set = next_set;
+    }
+    current_set
+}
+
+fn clip_polyline_by_plane_with_radius(
+    points: &[Point3],
+    plane: &ClipPlane,
+    radius: f64,
+) -> Vec<Vec<Point3>> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut current_poly = Vec::new();
+
+    let d = |p: Point3| -> f64 {
+        plane.normal.dot_vec(p - plane.origin)
+    };
+
+    let mut prev_pt = points[0];
+    let mut prev_d = d(prev_pt);
+
+    // Apply envelope intersection margin to parallel segments
+    let mut prev_adjusted_d = prev_d;
+    
+    if points.len() > 1 {
+        let next_pt = points[1];
+        let diff = next_pt - prev_pt;
+        let len_sq = diff.length_sq();
+        if len_sq > 1e-12 {
+            let dir = diff / len_sq.sqrt();
+            let is_parallel = plane.normal.dot_vec(dir).abs() < 1.0e-3;
+            if is_parallel && prev_d < 0.0 && prev_d.abs() < radius * 0.99 {
+                prev_adjusted_d = 0.0;
+            }
+        }
+    }
+
+    if prev_adjusted_d >= -1e-7 {
+        current_poly.push(prev_pt);
+    }
+
+    for i in 1..points.len() {
+        let pt = points[i];
+        let cur_d = d(pt);
+        let mut cur_adjusted_d = cur_d;
+
+        let diff = pt - prev_pt;
+        let len_sq = diff.length_sq();
+        if len_sq > 1e-12 {
+            let dir = diff / len_sq.sqrt();
+            let is_parallel = plane.normal.dot_vec(dir).abs() < 1.0e-3;
+            if is_parallel {
+                if prev_d < 0.0 && prev_d.abs() < radius * 0.99 {
+                    prev_adjusted_d = 0.0;
+                }
+                if cur_d < 0.0 && cur_d.abs() < radius * 0.99 {
+                    cur_adjusted_d = 0.0;
+                }
+            }
+        }
+
+        if prev_adjusted_d >= -1e-7 && cur_adjusted_d >= -1e-7 {
+            current_poly.push(pt);
+        } else if prev_adjusted_d >= -1e-7 && cur_adjusted_d < -1e-7 {
+            let t = prev_d / (prev_d - cur_d);
+            let intersect = prev_pt + (pt - prev_pt) * t;
+            current_poly.push(intersect);
+            if current_poly.len() >= 2 {
+                result.push(current_poly);
+            }
+            current_poly = Vec::new();
+        } else if prev_adjusted_d < -1e-7 && cur_adjusted_d >= -1e-7 {
+            let t = prev_d / (prev_d - cur_d);
+            let intersect = prev_pt + (pt - prev_pt) * t;
+            current_poly.push(intersect);
+            current_poly.push(pt);
+        }
+
+        prev_pt = pt;
+        prev_d = cur_d;
+        prev_adjusted_d = cur_adjusted_d;
+    }
+
+    if current_poly.len() >= 2 {
+        result.push(current_poly);
+    }
+    result
+}
+
+
 fn clip_polyline_by_plane(points: &[Point3], plane: &ClipPlane) -> Vec<Vec<Point3>> {
     if points.len() < 2 {
         return Vec::new();
