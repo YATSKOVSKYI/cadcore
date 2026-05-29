@@ -1,25 +1,22 @@
 //! B-Rep entity structs.
+//!
+//! Extended with `PartialCylinder`, `PartialDisk`, and `Arc` boundary
+//! for solid Boolean half-space cut support.
 
 use cadcore_geom::{Circle3, CylSurf, Ellipse3, Line3, Plane3, SphereSurf, TorusSurf};
-use cadcore_math::Point3;
+use cadcore_math::{Point3, UnitVec3};
 
 use crate::ids::*;
 
 // ── FaceExtent ────────────────────────────────────────────────────────────────
 
 /// Geometric extent of a face — data *not* captured by the infinite carrier surface.
-///
-/// The STEP writer uses this to generate proper `FACE_OUTER_BOUND` /
-/// `FACE_BOUND` loops for each `ADVANCED_FACE`.  Without extent info the face
-/// bounds list would be empty `()`, which is rejected by most CAD importers.
 #[derive(Clone, Debug)]
 pub enum FaceExtent {
     /// No extent info available (placeholder — face will have empty bounds).
     None,
     /// Finite cylinder extending from z = 0 to z = `length` along the carrier
-    /// cylinder's axis. The carrier surface's frame origin is at z = 0.
-    /// The start/end curves bound the face in STEP. At polyline corners these
-    /// are oblique miter ellipses, not perpendicular circles.
+    /// cylinder's axis.  Full circular cross-section.
     Cylinder {
         /// Length along the cylinder axis (mm).
         length: f64,
@@ -28,13 +25,40 @@ pub enum FaceExtent {
         /// Boundary at z = `length`.
         end: FaceBoundary,
     },
+    /// **NEW** — Finite cylinder with an arc cross-section (chord cut by a plane
+    /// parallel to the cylinder axis).
+    ///
+    /// The surviving arc spans from `arc_start_angle` to `arc_end_angle`
+    /// (CCW, in radians) measured in the cylinder cross-section plane.
+    /// Angle 0 points in the `arc_ref_dir` direction.
+    PartialCylinder {
+        /// Length along the cylinder axis (mm).
+        length: f64,
+        /// Arc start angle (radians, CCW from `arc_ref_dir`).
+        arc_start_angle: f64,
+        /// Arc end angle (radians, CCW from `arc_ref_dir`).
+        arc_end_angle: f64,
+        /// Reference direction in the cross-section (usually the cut plane normal).
+        arc_ref_dir: UnitVec3,
+    },
     /// Planar disk at the carrier plane's origin with the given radius.
     Disk {
         /// Disk radius (mm).
         radius: f64,
     },
-    /// Torus fillet arc: the boundary consists of two minor circles — one at
-    /// each end of the arc span.
+    /// **NEW** — Planar arc sector (partial disk): the region bounded by an arc
+    /// from `start_angle` to `end_angle` and the chord connecting the endpoints.
+    ///
+    /// Used for the end caps of a `PartialCylinder` solid.
+    PartialDisk {
+        /// Outer arc radius (mm).
+        radius: f64,
+        /// Arc start angle (radians, CCW from the plane's x-axis).
+        start_angle: f64,
+        /// Arc end angle (radians).
+        end_angle: f64,
+    },
+    /// Torus fillet arc: the boundary consists of two minor circles.
     TorusFillet {
         /// Minor circle bounding the arc at the incoming-cylinder junction.
         start_circle: Circle3,
@@ -84,11 +108,7 @@ pub enum EdgeGeom {
     Ellipse(Ellipse3),
 }
 
-/// An undirected topological edge: a bounded segment of a curve between two
-/// vertices.
-///
-/// The *sense* of traversal (which vertex is start vs. end) is defined per
-/// face-use in [`CoEdge`].
+/// An undirected topological edge.
 #[derive(Clone, Debug)]
 pub struct Edge {
     /// Curve the edge lies on.
@@ -101,37 +121,32 @@ pub struct Edge {
     pub t_start: f64,
     /// Parameter value at the end vertex.
     pub t_end: f64,
-    /// Back-reference to paired `CoEdge` on the neighbouring face (may be
-    /// `None` for open boundary / naked edge).
+    /// Back-reference to paired `CoEdge`.
     pub partner: Option<CoEdgeId>,
 }
 
 // ── CoEdge ───────────────────────────────────────────────────────────────────
 
-/// Whether a co-edge traverses its underlying [`Edge`] in the same or
-/// opposite direction.
+/// Whether a co-edge traverses its underlying [`Edge`] in the same or opposite direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoEdgeSense {
-    /// Same direction as the edge (v_start → v_end).
+    /// Same direction as the edge.
     Same,
-    /// Opposite direction (v_end → v_start).
+    /// Opposite direction.
     Opposite,
 }
 
 /// A *directed* use of an [`Edge`] by a single [`Loop`].
-///
-/// Two co-edges with the same underlying edge but opposite sense are the
-/// shared boundary between two adjacent faces.
 #[derive(Clone, Debug)]
 pub struct CoEdge {
     /// The underlying geometric edge.
-    pub edge: EdgeId,
+    pub edge:    EdgeId,
     /// Traversal sense.
-    pub sense: CoEdgeSense,
-    /// Next co-edge in the loop (forms a circular linked list).
-    pub next: CoEdgeId,
+    pub sense:   CoEdgeSense,
+    /// Next co-edge in the loop.
+    pub next:    CoEdgeId,
     /// Previous co-edge in the loop.
-    pub prev: CoEdgeId,
+    pub prev:    CoEdgeId,
     /// The loop this co-edge belongs to.
     pub loop_id: LoopId,
 }
@@ -139,14 +154,12 @@ pub struct CoEdge {
 // ── Loop ─────────────────────────────────────────────────────────────────────
 
 /// A closed chain of co-edges bounding (part of) a face.
-///
-/// A face has exactly one *outer* loop and zero or more *inner* loops (holes).
 #[derive(Clone, Debug)]
 pub struct Loop {
-    /// Arbitrary start co-edge (walk `next` to traverse).
+    /// Arbitrary start co-edge.
     pub start: CoEdgeId,
     /// The face this loop belongs to.
-    pub face: FaceId,
+    pub face:  FaceId,
 }
 
 // ── Face geometry ─────────────────────────────────────────────────────────────
@@ -177,45 +190,39 @@ pub enum FaceNormal {
 #[derive(Clone, Debug)]
 pub struct Face {
     /// Carrier surface.
-    pub geom: FaceGeom,
+    pub geom:        FaceGeom,
     /// Normal orientation relative to the surface.
-    pub normal: FaceNormal,
+    pub normal:      FaceNormal,
     /// Outer boundary loop.
-    pub outer_loop: LoopId,
-    /// Inner loops (holes/voids within the face).
+    pub outer_loop:  LoopId,
+    /// Inner loops (holes / voids within the face).
     pub inner_loops: Vec<LoopId>,
     /// The shell this face belongs to.
-    pub shell: ShellId,
-    /// Geometric extent — used by the STEP writer to emit proper face bounds.
-    pub extent: FaceExtent,
+    pub shell:       ShellId,
+    /// Geometric extent — used by the STEP writer for face bounds.
+    pub extent:      FaceExtent,
 }
 
 // ── Shell ─────────────────────────────────────────────────────────────────────
 
 /// A connected, orientable set of faces forming a closed or open surface.
-///
-/// A *closed* shell (no naked edges) encloses a volume.
 #[derive(Clone, Debug)]
 pub struct Shell {
     /// All faces in the shell.
-    pub faces: Vec<FaceId>,
-    /// Whether this shell is the outer boundary (`true`) or an inner void
-    /// (`false`) of its solid.
+    pub faces:    Vec<FaceId>,
+    /// Outer boundary (`true`) or inner void (`false`) of its solid.
     pub is_outer: bool,
     /// The solid this shell belongs to.
-    pub solid: SolidId,
+    pub solid:    SolidId,
 }
 
 // ── Solid ─────────────────────────────────────────────────────────────────────
 
 /// A single connected solid body defined by its boundary shells.
-///
-/// A valid manifold solid has exactly one outer shell and zero or more
-/// inner void shells.
 #[derive(Clone, Debug)]
 pub struct Solid {
     /// All shells (outer first, then voids).
     pub shells: Vec<ShellId>,
     /// Optional human-readable name (used in STEP output).
-    pub name: Option<String>,
+    pub name:   Option<String>,
 }

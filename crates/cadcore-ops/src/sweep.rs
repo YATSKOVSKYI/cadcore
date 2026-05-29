@@ -447,6 +447,7 @@ fn clip_polyline_by_plane_with_radius(
         let pt = points[i];
         let cur_d = d(pt);
         let mut cur_adjusted_d = cur_d;
+        prev_adjusted_d = prev_d;
 
         let diff = pt - prev_pt;
         let len_sq = diff.length_sq();
@@ -482,7 +483,6 @@ fn clip_polyline_by_plane_with_radius(
 
         prev_pt = pt;
         prev_d = cur_d;
-        prev_adjusted_d = cur_adjusted_d;
     }
 
     if current_poly.len() >= 2 {
