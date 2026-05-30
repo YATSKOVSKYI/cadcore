@@ -23,6 +23,8 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use cadcore_geom::{Circle3, CylSurf, Plane3, SphereSurf, TorusSurf};
 use cadcore_math::{Frame3, Point3, UnitVec3, Vec3, PI, TAU};
 use cadcore_topo::{
@@ -564,6 +566,54 @@ const BSP_EPS: f64 = 1.0e-7;
 const EDGE_EPS: f64 = 1.0e-6;
 /// Quantisation scale for the welding spatial hash.
 const WELD_SCALE: f64 = 1.0 / WELD_TOL;
+/// AABB expansion used to decide whether two solids may overlap (and thus need
+/// a real CSG union).  Clearly-disjoint solids are never sent to the BSP.
+const AABB_EPS: f64 = 1.0e-6;
+
+/// Axis-aligned bounding box used for spatial culling of solid pairs.
+#[derive(Clone, Copy)]
+struct Aabb {
+    min: [f64; 3],
+    max: [f64; 3],
+}
+
+impl Aabb {
+    fn empty() -> Self {
+        Self { min: [f64::INFINITY; 3], max: [f64::NEG_INFINITY; 3] }
+    }
+
+    fn add(&mut self, p: Point3) {
+        let c = [p.x, p.y, p.z];
+        for k in 0..3 {
+            if c[k] < self.min[k] {
+                self.min[k] = c[k];
+            }
+            if c[k] > self.max[k] {
+                self.max[k] = c[k];
+            }
+        }
+    }
+
+    fn from_polys(polys: &[CsgPoly]) -> Self {
+        let mut bb = Aabb::empty();
+        for p in polys {
+            for &v in &p.verts {
+                bb.add(v);
+            }
+        }
+        bb
+    }
+
+    /// True if the two boxes overlap when expanded by `eps` on each side.
+    fn overlaps(&self, o: &Aabb, eps: f64) -> bool {
+        for k in 0..3 {
+            if self.min[k] - eps > o.max[k] || self.max[k] + eps < o.min[k] {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 /// Options controlling the faceted Boolean union.
 #[derive(Clone, Copy, Debug)]
@@ -645,22 +695,109 @@ pub fn union_all(brep: &mut BRep, opts: &UnionOptions) -> Result<Option<SolidId>
         return Ok(None);
     }
     let name = brep.solids.get(ids[0]).and_then(|s| s.name.clone());
-    let mut acc = solid_to_polys(brep, ids[0], opts.facets)?;
-    if acc.is_empty() {
+    let facets = opts.facets.max(8);
+
+    // 1. Tessellate every solid in parallel (one outward-oriented mesh + AABB each).
+    let meshes: Vec<(Vec<CsgPoly>, Aabb)> = ids
+        .par_iter()
+        .map(|&id| {
+            let polys = solid_to_polys(brep, id, facets)?;
+            let aabb = Aabb::from_polys(&polys);
+            Ok::<_, BooleanError>((polys, aabb))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if meshes.iter().all(|(p, _)| p.is_empty()) {
         return Err(BooleanError::EmptyInput);
     }
-    for &id in &ids[1..] {
-        let p = solid_to_polys(brep, id, opts.facets)?;
-        if p.is_empty() {
-            continue;
-        }
-        acc = polys_union(acc, p);
+
+    // 2. Spatial culling: group solids into connected components by AABB overlap.
+    //    Disjoint solids never enter a CSG union — they are merely collected.
+    let aabbs: Vec<Aabb> = meshes.iter().map(|(_, a)| *a).collect();
+    let components = connected_components(&aabbs, AABB_EPS);
+
+    // 3. Union each component independently (components in parallel; inside a
+    //    component a parallel tree-reduction replaces the O(n²) linear fold).
+    let merged: Vec<CsgPoly> = components
+        .par_iter()
+        .map(|comp| {
+            let layers: Vec<Vec<CsgPoly>> =
+                comp.iter().map(|&i| meshes[i].0.clone()).collect();
+            union_reduce(layers)
+        })
+        .reduce(Vec::new, |mut a, b| {
+            a.extend(b);
+            a
+        });
+
+    if merged.is_empty() {
+        return Err(BooleanError::FacetingFailed);
     }
+
     for &id in &ids {
         remove_solid(brep, id);
     }
-    let sid = finalize(brep, acc, name)?;
+    let sid = finalize(brep, merged, name)?;
     Ok(Some(sid))
+}
+
+/// Group solids into connected components: two solids are connected when their
+/// AABBs overlap (the only pairs that can geometrically intersect).  Union-find
+/// over the overlap graph.
+fn connected_components(aabbs: &[Aabb], eps: f64) -> Vec<Vec<usize>> {
+    let n = aabbs.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]]; // path halving
+            x = parent[x];
+        }
+        x
+    }
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if aabbs[i].overlaps(&aabbs[j], eps) {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+    groups.into_values().collect()
+}
+
+/// Union a component's solids via a parallel balanced tree-reduction.
+///
+/// Linear folding (`acc = acc ∪ next`) is O(n) deep and repeatedly re-clips the
+/// growing accumulator → ~O(n · P).  A balanced reduction is O(log n) deep,
+/// pairs at each level run on separate cores (rayon), and total work drops to
+/// ~O(P · log n).
+fn union_reduce(mut layers: Vec<Vec<CsgPoly>>) -> Vec<CsgPoly> {
+    layers.retain(|l| !l.is_empty());
+    if layers.is_empty() {
+        return Vec::new();
+    }
+    while layers.len() > 1 {
+        let half = layers.len() / 2;
+        let mut next: Vec<Vec<CsgPoly>> = (0..half)
+            .into_par_iter()
+            .map(|i| polys_union(layers[2 * i].clone(), layers[2 * i + 1].clone()))
+            .collect();
+        if layers.len() % 2 == 1 {
+            next.push(layers.last().unwrap().clone());
+        }
+        layers = next;
+    }
+    layers.pop().unwrap_or_default()
 }
 
 /// Validate that a faceted solid (made of `FaceExtent::Polygon` faces) is a
@@ -1286,8 +1423,36 @@ fn weld(tris: &[[Point3; 3]]) -> (Vec<Point3>, Vec<[usize; 3]>) {
 /// edge, re-triangulate that triangle (fan from its centroid through the split
 /// boundary) so every edge is shared by exactly two triangles.
 fn heal(verts: &mut Vec<Point3>, tris: &[[usize; 3]]) -> Vec<[usize; 3]> {
-    let candidates: Vec<usize> = (0..verts.len()).collect();
+    let nv = verts.len();
+    if nv == 0 {
+        return tris.to_vec();
+    }
+
+    // Spatial grid over the original vertices so each edge only tests nearby
+    // candidates.  Without this, heal is O(triangles × vertices) and becomes the
+    // dominant cost on large meshes.  Cell size ≈ mean edge length → ~O(1) per cell.
+    let h = {
+        let mut sum = 0.0f64;
+        let mut cnt = 0usize;
+        for t in tris {
+            for e in 0..3 {
+                sum += (verts[t[(e + 1) % 3]] - verts[t[e]]).length();
+                cnt += 1;
+            }
+        }
+        if cnt == 0 { 1.0 } else { (sum / cnt as f64).max(1.0e-6) }
+    };
+    let inv = 1.0 / h;
+    let cell = |p: Point3| -> (i64, i64, i64) {
+        ((p.x * inv).floor() as i64, (p.y * inv).floor() as i64, (p.z * inv).floor() as i64)
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for i in 0..nv {
+        grid.entry(cell(verts[i])).or_default().push(i);
+    }
+
     let mut out: Vec<[usize; 3]> = Vec::with_capacity(tris.len());
+    let mut near: Vec<usize> = Vec::new();
     for t in tris {
         let corners = [t[0], t[1], t[2]];
         let mut loop_pts: Vec<usize> = Vec::new();
@@ -1301,8 +1466,20 @@ fn heal(verts: &mut Vec<Point3>, tris: &[[usize; 3]]) -> Vec<[usize; 3]> {
             let ab = b - a;
             let len2 = ab.length_sq();
             if len2 > 1.0e-24 {
+                // Gather candidate vertices from the grid cells spanning this edge.
+                near.clear();
+                let (c0, c1) = (cell(a), cell(b));
+                for cx in (c0.0.min(c1.0) - 1)..=(c0.0.max(c1.0) + 1) {
+                    for cy in (c0.1.min(c1.1) - 1)..=(c0.1.max(c1.1) + 1) {
+                        for cz in (c0.2.min(c1.2) - 1)..=(c0.2.max(c1.2) + 1) {
+                            if let Some(list) = grid.get(&(cx, cy, cz)) {
+                                near.extend_from_slice(list);
+                            }
+                        }
+                    }
+                }
                 let mut on: Vec<(f64, usize)> = Vec::new();
-                for &k in &candidates {
+                for &k in &near {
                     if k == i || k == j {
                         continue;
                     }
@@ -1318,6 +1495,7 @@ fn heal(verts: &mut Vec<Point3>, tris: &[[usize; 3]]) -> Vec<[usize; 3]> {
                 if !on.is_empty() {
                     any = true;
                     on.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+                    on.dedup_by_key(|x| x.1);
                     for (_, k) in on {
                         loop_pts.push(k);
                     }

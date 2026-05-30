@@ -16,3 +16,4 @@ categories   = ["science"]
 cadcore-math = { path = "../cadcore-math", version = "0.1" }
 cadcore-geom = { path = "../cadcore-geom", version = "0.1" }
 cadcore-topo = { path = "../cadcore-topo", version = "0.1" }
+rayon        = "1"

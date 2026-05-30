@@ -39,7 +39,7 @@
 //! | [`step`]       | `cadcore-step`       | brep_to_step, StepWriter                  |
 
 #![warn(missing_docs)]
-#![doc(html_root_url = "https://docs.rs/cadcore/0.1.17")]
+#![doc(html_root_url = "https://docs.rs/cadcore/0.1.18")]
 
 /// Re-export of `cadcore-math`.
 pub mod math {
