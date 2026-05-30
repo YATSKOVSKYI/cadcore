@@ -75,6 +75,7 @@ pub use cadcore_ops::{
     sweep_circle_along_rounded_polyline, PathApproxOptions, SweepOptions, SweepPathSegment,
     ClipPlane, clip_polyline, clip_polyline_with_radius, sweep_circle_along_path_with_caps,
     sweep_circle_along_polyline_with_caps, build_solid_box,
+    union_all, union_solids, UnionOptions, BooleanError, WatertightReport, validate_watertight,
 };
 pub use cadcore_step::brep_to_step;
 pub use cadcore_topo::BRep;

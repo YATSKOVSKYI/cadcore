@@ -558,12 +558,12 @@ fn build_placeholder_loop(brep: &mut BRep) -> cadcore_topo::LoopId {
 // The result is faceted, not analytic, but it is genuinely watertight for the
 // general case (including unequal-radius perpendicular cylinders).
 
-/// Vertex-coincidence tolerance (microns) — see task §3.1.
-const WELD_TOL: f64 = 1.0e-7;
-/// BSP plane-classification epsilon.
-const BSP_EPS: f64 = 1.0e-7;
+/// Vertex-coincidence tolerance (mm-scale geometry: 10 nm).
+const WELD_TOL: f64 = 1.0e-5;
+/// BSP plane-classification epsilon (matched to weld tolerance).
+const BSP_EPS: f64 = 1.0e-5;
 /// Parametric edge-interior threshold for T-junction detection.
-const EDGE_EPS: f64 = 1.0e-6;
+const EDGE_EPS: f64 = 1.0e-4;
 /// Quantisation scale for the welding spatial hash.
 const WELD_SCALE: f64 = 1.0 / WELD_TOL;
 /// AABB expansion used to decide whether two solids may overlap (and thus need
