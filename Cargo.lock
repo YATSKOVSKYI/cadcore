@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "cadcore"
-version = "0.1.15"
+version = "0.1.17"
 dependencies = [
  "cadcore-geom",
  "cadcore-math",
@@ -15,18 +15,18 @@ dependencies = [
 
 [[package]]
 name = "cadcore-geom"
-version = "0.1.15"
+version = "0.1.17"
 dependencies = [
  "cadcore-math",
 ]
 
 [[package]]
 name = "cadcore-math"
-version = "0.1.15"
+version = "0.1.17"
 
 [[package]]
 name = "cadcore-ops"
-version = "0.1.15"
+version = "0.1.17"
 dependencies = [
  "cadcore-geom",
  "cadcore-math",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "cadcore-step"
-version = "0.1.15"
+version = "0.1.17"
 dependencies = [
  "cadcore-geom",
  "cadcore-math",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "cadcore-topo"
-version = "0.1.15"
+version = "0.1.17"
 dependencies = [
  "cadcore-geom",
  "cadcore-math",

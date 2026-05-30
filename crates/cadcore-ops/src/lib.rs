@@ -15,4 +15,7 @@ pub use sweep::{
     sweep_circle_along_polyline_with_caps, build_solid_box,
 };
 
-pub use boolean::half_space_cut_brep;
+pub use boolean::{
+    half_space_cut_brep, union_all, union_solids, validate_watertight, BooleanError,
+    UnionOptions, WatertightReport,
+};

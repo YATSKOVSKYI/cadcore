@@ -21,10 +21,13 @@
 //! The same cylinder may be cut by multiple planes; planes are processed
 //! sequentially.
 
-use cadcore_geom::{CylSurf, Plane3};
-use cadcore_math::{Frame3, Point3, UnitVec3};
+use std::collections::HashMap;
+
+use cadcore_geom::{Circle3, CylSurf, Plane3, SphereSurf, TorusSurf};
+use cadcore_math::{Frame3, Point3, UnitVec3, Vec3, PI, TAU};
 use cadcore_topo::{
-    BRep, Face, FaceBoundary, FaceExtent, FaceGeom, FaceNormal, Shell, Solid, SolidId,
+    BRep, Face, FaceBoundary, FaceExtent, FaceGeom, FaceId, FaceNormal, Shell, ShellId, Solid,
+    SolidId,
 };
 
 use crate::sweep::ClipPlane;
@@ -531,6 +534,946 @@ fn build_placeholder_loop(brep: &mut BRep) -> cadcore_topo::LoopId {
     })
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  Boolean UNION (faceted / watertight)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// A general analytic Boolean union is not expressible in this kernel: the STEP
+// writer derives face bounds from `FaceExtent` (not the half-edge topology), and
+// the edge vocabulary is limited to Line / Circle / Ellipse — which cannot carry
+// the quartic intersection curve of two unequal cylinders.  We therefore take the
+// robust faceted route:
+//
+//   1. Tessellate each input solid into a closed, outward-oriented triangle mesh.
+//   2. Combine the two meshes with a BSP CSG union (the classic `csg.js`
+//      algorithm) — splits faces along the partner solid and keeps the outside.
+//   3. Weld coincident vertices (tol = 1e-7) and heal T-junctions so the result
+//      is a true closed 2-manifold (every edge shared by exactly two triangles
+//      with opposite orientation).
+//   4. Materialise the result as `FaceExtent::Polygon` faces, which the existing
+//      STEP writer emits as a watertight `MANIFOLD_SOLID_BREP`.
+//
+// The result is faceted, not analytic, but it is genuinely watertight for the
+// general case (including unequal-radius perpendicular cylinders).
+
+/// Vertex-coincidence tolerance (microns) — see task §3.1.
+const WELD_TOL: f64 = 1.0e-7;
+/// BSP plane-classification epsilon.
+const BSP_EPS: f64 = 1.0e-7;
+/// Parametric edge-interior threshold for T-junction detection.
+const EDGE_EPS: f64 = 1.0e-6;
+/// Quantisation scale for the welding spatial hash.
+const WELD_SCALE: f64 = 1.0 / WELD_TOL;
+
+/// Options controlling the faceted Boolean union.
+#[derive(Clone, Copy, Debug)]
+pub struct UnionOptions {
+    /// Number of facets around a full circle (cylinders, disks, …).
+    pub facets: usize,
+}
+
+impl Default for UnionOptions {
+    fn default() -> Self {
+        Self { facets: 32 }
+    }
+}
+
+/// Errors returned by the faceted Boolean operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BooleanError {
+    /// An input solid was missing or tessellated to nothing.
+    EmptyInput,
+    /// A face used a `FaceExtent`/`FaceGeom` combination the faceter cannot handle.
+    UnsupportedFace,
+    /// Tessellation produced no usable triangles.
+    FacetingFailed,
+}
+
+/// Watertightness / manifold report for a faceted solid (task §3.4).
+#[derive(Clone, Copy, Debug)]
+pub struct WatertightReport {
+    /// Number of triangles in the solid.
+    pub triangles: usize,
+    /// Number of welded (unique) vertices.
+    pub vertices: usize,
+    /// Number of undirected edges.
+    pub edges: usize,
+    /// Edges whose two directed uses do not cancel (open / naked edges).
+    pub open_edges: usize,
+    /// Edges shared by a number of faces other than two (non-manifold).
+    pub non_manifold_edges: usize,
+}
+
+impl WatertightReport {
+    /// `true` when the solid is a closed 2-manifold: no naked edges and every
+    /// edge shared by exactly two oppositely-oriented faces.
+    pub fn is_watertight(&self) -> bool {
+        self.open_edges == 0 && self.non_manifold_edges == 0
+    }
+}
+
+/// Boolean union of two solids in `brep`.
+///
+/// Both input solids are removed and replaced by a single watertight faceted
+/// solid; its id is returned.  The result inherits `a`'s name.
+pub fn union_solids(
+    brep: &mut BRep,
+    a: SolidId,
+    b: SolidId,
+    opts: &UnionOptions,
+) -> Result<SolidId, BooleanError> {
+    let pa = solid_to_polys(brep, a, opts.facets)?;
+    let pb = solid_to_polys(brep, b, opts.facets)?;
+    if pa.is_empty() || pb.is_empty() {
+        return Err(BooleanError::EmptyInput);
+    }
+    let name = brep.solids.get(a).and_then(|s| s.name.clone());
+    let merged = polys_union(pa, pb);
+    remove_solid(brep, a);
+    remove_solid(brep, b);
+    finalize(brep, merged, name)
+}
+
+/// Boolean union of *every* solid in `brep` into one watertight faceted solid.
+///
+/// This is the honest replacement for the old container-merge `fuse_solids`:
+/// overlapping interior faces are trimmed away instead of being left as
+/// non-manifold internal partitions.  Returns `Ok(None)` if there are no solids.
+pub fn union_all(brep: &mut BRep, opts: &UnionOptions) -> Result<Option<SolidId>, BooleanError> {
+    let ids: Vec<SolidId> = brep.solids.keys().collect();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let name = brep.solids.get(ids[0]).and_then(|s| s.name.clone());
+    let mut acc = solid_to_polys(brep, ids[0], opts.facets)?;
+    if acc.is_empty() {
+        return Err(BooleanError::EmptyInput);
+    }
+    for &id in &ids[1..] {
+        let p = solid_to_polys(brep, id, opts.facets)?;
+        if p.is_empty() {
+            continue;
+        }
+        acc = polys_union(acc, p);
+    }
+    for &id in &ids {
+        remove_solid(brep, id);
+    }
+    let sid = finalize(brep, acc, name)?;
+    Ok(Some(sid))
+}
+
+/// Validate that a faceted solid (made of `FaceExtent::Polygon` faces) is a
+/// closed, oriented 2-manifold.  See [`WatertightReport`].
+pub fn validate_watertight(brep: &BRep, solid: SolidId) -> WatertightReport {
+    let mut tris: Vec<[Point3; 3]> = Vec::new();
+    if let Some(s) = brep.solids.get(solid) {
+        for &sh in &s.shells {
+            let shell = match brep.shells.get(sh) {
+                Some(x) => x,
+                None => continue,
+            };
+            for &fid in &shell.faces {
+                if let Some(f) = brep.faces.get(fid) {
+                    if let FaceExtent::Polygon { points } = &f.extent {
+                        if points.len() >= 3 {
+                            for i in 1..points.len() - 1 {
+                                tris.push([points[0], points[i], points[i + 1]]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (verts, idx) = weld(&tris);
+    report_from(&idx, verts.len())
+}
+
+// ── BSP CSG (port of the csg.js union algorithm) ────────────────────────────────
+
+/// A convex polygon used by the BSP CSG, carrying its support plane.
+#[derive(Clone)]
+struct CsgPoly {
+    verts: Vec<Point3>,
+    normal: Vec3,
+    w: f64,
+}
+
+impl CsgPoly {
+    /// Build from a vertex ring, deriving the plane via Newell's method.
+    fn new(verts: Vec<Point3>) -> Option<Self> {
+        let m = verts.len();
+        if m < 3 {
+            return None;
+        }
+        let mut n = Vec3::ZERO;
+        for i in 0..m {
+            let a = verts[i];
+            let b = verts[(i + 1) % m];
+            n.x += (a.y - b.y) * (a.z + b.z);
+            n.y += (a.z - b.z) * (a.x + b.x);
+            n.z += (a.x - b.x) * (a.y + b.y);
+        }
+        let nn = n.try_normalize()?;
+        let w = nn.dot(verts[0].to_vec());
+        Some(Self { verts, normal: nn, w })
+    }
+
+    fn flip(&mut self) {
+        self.verts.reverse();
+        self.normal = -self.normal;
+        self.w = -self.w;
+    }
+}
+
+const C_COPLANAR: u8 = 0;
+const C_FRONT: u8 = 1;
+const C_BACK: u8 = 2;
+const C_SPANNING: u8 = 3;
+
+/// Split `poly` against the plane `(pn, pw)`; append the pieces to the four
+/// output buckets (coplanar-front, coplanar-back, front, back).
+fn split_poly(
+    pn: Vec3,
+    pw: f64,
+    poly: &CsgPoly,
+    coplanar_front: &mut Vec<CsgPoly>,
+    coplanar_back: &mut Vec<CsgPoly>,
+    front: &mut Vec<CsgPoly>,
+    back: &mut Vec<CsgPoly>,
+) {
+    let mut poly_type: u8 = 0;
+    let mut types: Vec<u8> = Vec::with_capacity(poly.verts.len());
+    for v in &poly.verts {
+        let t = pn.dot(v.to_vec()) - pw;
+        let ty = if t < -BSP_EPS {
+            C_BACK
+        } else if t > BSP_EPS {
+            C_FRONT
+        } else {
+            C_COPLANAR
+        };
+        poly_type |= ty;
+        types.push(ty);
+    }
+
+    match poly_type {
+        C_COPLANAR => {
+            if pn.dot(poly.normal) > 0.0 {
+                coplanar_front.push(poly.clone());
+            } else {
+                coplanar_back.push(poly.clone());
+            }
+        }
+        C_FRONT => front.push(poly.clone()),
+        C_BACK => back.push(poly.clone()),
+        _ => {
+            // Spanning — split along the plane.
+            let mut fv: Vec<Point3> = Vec::new();
+            let mut bv: Vec<Point3> = Vec::new();
+            let n = poly.verts.len();
+            for i in 0..n {
+                let j = (i + 1) % n;
+                let ti = types[i];
+                let tj = types[j];
+                let vi = poly.verts[i];
+                let vj = poly.verts[j];
+                if ti != C_BACK {
+                    fv.push(vi);
+                }
+                if ti != C_FRONT {
+                    bv.push(vi);
+                }
+                if (ti | tj) == C_SPANNING {
+                    let denom = pn.dot(vj - vi);
+                    if denom.abs() > 1.0e-18 {
+                        let tt = (pw - pn.dot(vi.to_vec())) / denom;
+                        let v = vi + (vj - vi) * tt;
+                        fv.push(v);
+                        bv.push(v);
+                    }
+                }
+            }
+            if let Some(p) = CsgPoly::new(fv) {
+                front.push(p);
+            }
+            if let Some(p) = CsgPoly::new(bv) {
+                back.push(p);
+            }
+        }
+    }
+}
+
+/// A node in the BSP tree.
+struct Node {
+    plane: Option<(Vec3, f64)>,
+    front: Option<Box<Node>>,
+    back: Option<Box<Node>>,
+    polys: Vec<CsgPoly>,
+}
+
+impl Node {
+    fn new() -> Self {
+        Self { plane: None, front: None, back: None, polys: Vec::new() }
+    }
+
+    fn from_polys(polys: Vec<CsgPoly>) -> Self {
+        let mut n = Node::new();
+        n.build(polys);
+        n
+    }
+
+    fn build(&mut self, polys: Vec<CsgPoly>) {
+        if polys.is_empty() {
+            return;
+        }
+        if self.plane.is_none() {
+            self.plane = Some((polys[0].normal, polys[0].w));
+        }
+        let (pn, pw) = self.plane.unwrap();
+        let mut cf = Vec::new();
+        let mut cb = Vec::new();
+        let mut f = Vec::new();
+        let mut b = Vec::new();
+        for p in &polys {
+            split_poly(pn, pw, p, &mut cf, &mut cb, &mut f, &mut b);
+        }
+        self.polys.extend(cf);
+        self.polys.extend(cb);
+        if !f.is_empty() {
+            self.front.get_or_insert_with(|| Box::new(Node::new())).build(f);
+        }
+        if !b.is_empty() {
+            self.back.get_or_insert_with(|| Box::new(Node::new())).build(b);
+        }
+    }
+
+    fn clip_polygons(&self, polys: Vec<CsgPoly>) -> Vec<CsgPoly> {
+        let (pn, pw) = match self.plane {
+            Some(p) => p,
+            None => return polys,
+        };
+        let mut cf = Vec::new();
+        let mut cb = Vec::new();
+        let mut f = Vec::new();
+        let mut b = Vec::new();
+        for p in &polys {
+            split_poly(pn, pw, p, &mut cf, &mut cb, &mut f, &mut b);
+        }
+        f.extend(cf);
+        b.extend(cb);
+        let mut f = match &self.front {
+            Some(node) => node.clip_polygons(f),
+            None => f,
+        };
+        let b = match &self.back {
+            Some(node) => node.clip_polygons(b),
+            None => Vec::new(),
+        };
+        f.extend(b);
+        f
+    }
+
+    fn clip_to(&mut self, bsp: &Node) {
+        self.polys = bsp.clip_polygons(std::mem::take(&mut self.polys));
+        if let Some(n) = self.front.as_mut() {
+            n.clip_to(bsp);
+        }
+        if let Some(n) = self.back.as_mut() {
+            n.clip_to(bsp);
+        }
+    }
+
+    fn invert(&mut self) {
+        for p in self.polys.iter_mut() {
+            p.flip();
+        }
+        if let Some((n, w)) = self.plane {
+            self.plane = Some((-n, -w));
+        }
+        if let Some(n) = self.front.as_mut() {
+            n.invert();
+        }
+        if let Some(n) = self.back.as_mut() {
+            n.invert();
+        }
+        std::mem::swap(&mut self.front, &mut self.back);
+    }
+
+    fn all_polygons(&self) -> Vec<CsgPoly> {
+        let mut out = self.polys.clone();
+        if let Some(n) = &self.front {
+            out.extend(n.all_polygons());
+        }
+        if let Some(n) = &self.back {
+            out.extend(n.all_polygons());
+        }
+        out
+    }
+}
+
+/// CSG union of two polygon sets (`a ∪ b`).
+fn polys_union(a: Vec<CsgPoly>, b: Vec<CsgPoly>) -> Vec<CsgPoly> {
+    let mut a = Node::from_polys(a);
+    let mut b = Node::from_polys(b);
+    a.clip_to(&b);
+    b.clip_to(&a);
+    b.invert();
+    b.clip_to(&a);
+    b.invert();
+    a.build(b.all_polygons());
+    a.all_polygons()
+}
+
+// ── Tessellation (FaceExtent → outward-oriented triangles) ──────────────────────
+
+/// Flip an axis to a canonical sign so that a ring is identical regardless of the
+/// axis orientation it was generated from (lets cap and cylinder-end rings weld).
+fn canon_axis(a: UnitVec3) -> UnitVec3 {
+    let v = a.as_vec();
+    let s = if v.x.abs() > 1.0e-12 {
+        v.x
+    } else if v.y.abs() > 1.0e-12 {
+        v.y
+    } else {
+        v.z
+    };
+    if s < 0.0 {
+        -a
+    } else {
+        a
+    }
+}
+
+/// A canonical ring of `n` points on a circle (centre, axis, radius).
+fn ring(center: Point3, axis: UnitVec3, r: f64, n: usize) -> Vec<Point3> {
+    let a = canon_axis(axis);
+    let (u, v) = a.perp_basis();
+    (0..n)
+        .map(|i| {
+            let th = TAU * (i as f64) / (n as f64);
+            center + u * (r * th.cos()) + v * (r * th.sin())
+        })
+        .collect()
+}
+
+/// Outward radial direction at `p` on a cylinder of axis `(c0, axis)`.
+fn radial(c0: Point3, axis: UnitVec3, p: Point3, flip: bool) -> Vec3 {
+    let foot = c0 + axis * axis.dot_vec(p - c0);
+    let d = p - foot;
+    let u = d.try_normalize().unwrap_or_else(|| axis.as_vec());
+    if flip {
+        -u
+    } else {
+        u
+    }
+}
+
+/// Push a triangle oriented so its geometric normal agrees with `outward`.
+fn push_tri(out: &mut Vec<CsgPoly>, a: Point3, b: Point3, c: Point3, outward: Vec3) {
+    let g = (b - a).cross(c - a);
+    if g.length_sq() < 1.0e-24 {
+        return;
+    }
+    let (b, c) = if g.dot(outward) < 0.0 { (c, b) } else { (b, c) };
+    if let Some(p) = CsgPoly::new(vec![a, b, c]) {
+        out.push(p);
+    }
+}
+
+/// Tessellate every face of a solid into outward-oriented triangles.
+fn solid_to_polys(brep: &BRep, solid: SolidId, n: usize) -> Result<Vec<CsgPoly>, BooleanError> {
+    let n = n.max(8);
+    let solid = brep.solids.get(solid).ok_or(BooleanError::EmptyInput)?;
+    let mut out = Vec::new();
+    for &sh in &solid.shells {
+        let shell = match brep.shells.get(sh) {
+            Some(x) => x,
+            None => continue,
+        };
+        for &fid in &shell.faces {
+            let face = match brep.faces.get(fid) {
+                Some(x) => x,
+                None => continue,
+            };
+            facet_face(face, n, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+fn facet_face(face: &Face, n: usize, out: &mut Vec<CsgPoly>) -> Result<(), BooleanError> {
+    let flip = matches!(face.normal, FaceNormal::Reversed);
+    match (&face.geom, &face.extent) {
+        (FaceGeom::Cylinder(cyl), FaceExtent::Cylinder { length, .. }) => {
+            facet_cylinder(*cyl, *length, n, flip, out);
+        }
+        (FaceGeom::Cylinder(cyl), FaceExtent::PartialCylinder {
+            length,
+            arc_start_angle,
+            arc_end_angle,
+            arc_ref_dir,
+        }) => {
+            facet_partial_cylinder(
+                *cyl, *length, *arc_start_angle, *arc_end_angle, *arc_ref_dir, n, flip, out,
+            );
+        }
+        (FaceGeom::Plane(p), FaceExtent::Disk { radius }) => {
+            facet_disk(*p, *radius, n, flip, out);
+        }
+        (FaceGeom::Plane(p), FaceExtent::PartialDisk { radius, start_angle, end_angle }) => {
+            facet_partial_disk(*p, *radius, *start_angle, *end_angle, n, flip, out);
+        }
+        (FaceGeom::Plane(p), FaceExtent::Polygon { points }) => {
+            facet_polygon(*p, points, flip, out);
+        }
+        (FaceGeom::Plane(p), FaceExtent::PlanarBoundary { boundary }) => {
+            facet_planar_boundary(*p, boundary, n, flip, out);
+        }
+        (FaceGeom::Torus(t), FaceExtent::TorusFillet { start_circle, end_circle }) => {
+            facet_torus_fillet(*t, *start_circle, *end_circle, n, flip, out);
+        }
+        (FaceGeom::Sphere(s), _) => {
+            facet_sphere(*s, n, flip, out);
+        }
+        _ => return Err(BooleanError::UnsupportedFace),
+    }
+    Ok(())
+}
+
+fn facet_cylinder(cyl: CylSurf, length: f64, n: usize, flip: bool, out: &mut Vec<CsgPoly>) {
+    let axis = cyl.frame.z;
+    let c0 = cyl.frame.origin;
+    let c1 = c0 + axis * length;
+    let r = cyl.radius;
+    let r0 = ring(c0, axis, r, n);
+    let r1 = ring(c1, axis, r, n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (a, b, c, d) = (r0[i], r0[j], r1[j], r1[i]);
+        push_tri(out, a, b, c, radial(c0, axis, b, flip));
+        push_tri(out, a, c, d, radial(c0, axis, a, flip));
+    }
+}
+
+fn facet_partial_cylinder(
+    cyl: CylSurf,
+    length: f64,
+    start: f64,
+    end: f64,
+    arc_ref_dir: UnitVec3,
+    n: usize,
+    flip: bool,
+    out: &mut Vec<CsgPoly>,
+) {
+    let axis = cyl.frame.z;
+    let c0 = cyl.frame.origin;
+    let r = cyl.radius;
+    let right = UnitVec3::try_from_vec(axis.cross(arc_ref_dir)).unwrap_or(cyl.frame.x);
+    let range = end - start;
+    let mut a_ring = Vec::with_capacity(n + 1);
+    let mut b_ring = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let th = start + range * (i as f64 / n as f64);
+        let local = arc_ref_dir.as_vec() * (r * th.cos()) + right.as_vec() * (r * th.sin());
+        a_ring.push(c0 + local);
+        b_ring.push(c0 + axis * length + local);
+    }
+    for i in 0..n {
+        let (a, b, c, d) = (a_ring[i], a_ring[i + 1], b_ring[i + 1], b_ring[i]);
+        push_tri(out, a, b, c, radial(c0, axis, b, flip));
+        push_tri(out, a, c, d, radial(c0, axis, a, flip));
+    }
+}
+
+fn facet_disk(plane: Plane3, r: f64, n: usize, flip: bool, out: &mut Vec<CsgPoly>) {
+    let c = plane.frame.origin;
+    let nrm = if flip { -plane.frame.z } else { plane.frame.z };
+    let pts = ring(c, plane.frame.z, r, n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        push_tri(out, c, pts[i], pts[j], nrm.as_vec());
+    }
+}
+
+fn facet_partial_disk(
+    plane: Plane3,
+    r: f64,
+    start: f64,
+    end: f64,
+    n: usize,
+    flip: bool,
+    out: &mut Vec<CsgPoly>,
+) {
+    let c = plane.frame.origin;
+    let nrm = if flip { -plane.frame.z } else { plane.frame.z };
+    let x = plane.frame.x;
+    let y = plane.frame.y;
+    let range = end - start;
+    let mut prev: Option<Point3> = None;
+    for i in 0..=n {
+        let th = start + range * (i as f64 / n as f64);
+        let p = c + x * (r * th.cos()) + y * (r * th.sin());
+        if let Some(pp) = prev {
+            push_tri(out, c, pp, p, nrm.as_vec());
+        }
+        prev = Some(p);
+    }
+}
+
+fn facet_polygon(plane: Plane3, points: &[Point3], flip: bool, out: &mut Vec<CsgPoly>) {
+    if points.len() < 3 {
+        return;
+    }
+    let nrm = if flip { -plane.frame.z } else { plane.frame.z };
+    for i in 1..points.len() - 1 {
+        push_tri(out, points[0], points[i], points[i + 1], nrm.as_vec());
+    }
+}
+
+fn facet_planar_boundary(
+    plane: Plane3,
+    boundary: &FaceBoundary,
+    n: usize,
+    flip: bool,
+    out: &mut Vec<CsgPoly>,
+) {
+    let c = plane.frame.origin;
+    let nrm = if flip { -plane.frame.z } else { plane.frame.z };
+    match boundary {
+        FaceBoundary::Circle(circ) => {
+            let pts = ring(c, plane.frame.z, circ.radius, n);
+            for i in 0..n {
+                let j = (i + 1) % n;
+                push_tri(out, c, pts[i], pts[j], nrm.as_vec());
+            }
+        }
+        FaceBoundary::Ellipse(e) => {
+            let mut prev = e.point_at(0.0);
+            for i in 1..=n {
+                let th = TAU * (i as f64) / (n as f64);
+                let p = e.point_at(th);
+                push_tri(out, e.frame.origin, prev, p, nrm.as_vec());
+                prev = p;
+            }
+        }
+    }
+}
+
+fn torus_theta(t: &TorusSurf, p: Point3) -> f64 {
+    let d = p - t.frame.origin;
+    let x = t.frame.x.dot_vec(d);
+    let y = t.frame.y.dot_vec(d);
+    y.atan2(x)
+}
+
+fn facet_torus_fillet(
+    t: TorusSurf,
+    start_circle: Circle3,
+    end_circle: Circle3,
+    n: usize,
+    flip: bool,
+    out: &mut Vec<CsgPoly>,
+) {
+    let ts = torus_theta(&t, start_circle.frame.origin);
+    let te = torus_theta(&t, end_circle.frame.origin);
+    let mut dte = te - ts;
+    while dte > PI {
+        dte -= TAU;
+    }
+    while dte <= -PI {
+        dte += TAU;
+    }
+    let tsteps = n.max(8);
+    let psteps = n.max(8);
+    for i in 0..tsteps {
+        let th0 = ts + dte * (i as f64 / tsteps as f64);
+        let th1 = ts + dte * ((i + 1) as f64 / tsteps as f64);
+        for k in 0..psteps {
+            let ph0 = TAU * (k as f64) / (psteps as f64);
+            let ph1 = TAU * ((k + 1) as f64) / (psteps as f64);
+            let p00 = t.point_at(th0, ph0);
+            let p10 = t.point_at(th1, ph0);
+            let p11 = t.point_at(th1, ph1);
+            let p01 = t.point_at(th0, ph1);
+            let nm = t.normal_at((th0 + th1) * 0.5, (ph0 + ph1) * 0.5);
+            let nm = if flip { -nm } else { nm };
+            push_tri(out, p00, p10, p11, nm.as_vec());
+            push_tri(out, p00, p11, p01, nm.as_vec());
+        }
+    }
+}
+
+fn facet_sphere(s: SphereSurf, n: usize, flip: bool, out: &mut Vec<CsgPoly>) {
+    let lat = n.max(4);
+    let lon = n.max(6);
+    for i in 0..lat {
+        let ph0 = -PI / 2.0 + PI * (i as f64 / lat as f64);
+        let ph1 = -PI / 2.0 + PI * ((i + 1) as f64 / lat as f64);
+        for k in 0..lon {
+            let th0 = TAU * (k as f64) / (lon as f64);
+            let th1 = TAU * ((k + 1) as f64) / (lon as f64);
+            let p00 = s.point_at(th0, ph0);
+            let p10 = s.point_at(th1, ph0);
+            let p11 = s.point_at(th1, ph1);
+            let p01 = s.point_at(th0, ph1);
+            let outward = |p: Point3| -> Vec3 {
+                let d = (p - s.centre).try_normalize().unwrap_or(Vec3::Z);
+                if flip {
+                    -d
+                } else {
+                    d
+                }
+            };
+            push_tri(out, p00, p10, p11, outward(p10));
+            push_tri(out, p00, p11, p01, outward(p01));
+        }
+    }
+}
+
+// ── Welding, T-junction healing, validation, materialisation ────────────────────
+
+/// Index a point into a shared vertex pool, welding within `WELD_TOL`.
+fn weld_index(
+    verts: &mut Vec<Point3>,
+    map: &mut HashMap<(i64, i64, i64), Vec<usize>>,
+    p: Point3,
+) -> usize {
+    let key = (
+        (p.x * WELD_SCALE).round() as i64,
+        (p.y * WELD_SCALE).round() as i64,
+        (p.z * WELD_SCALE).round() as i64,
+    );
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                let k = (key.0 + dx, key.1 + dy, key.2 + dz);
+                if let Some(list) = map.get(&k) {
+                    for &i in list {
+                        if (verts[i] - p).length() < WELD_TOL {
+                            return i;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let i = verts.len();
+    verts.push(p);
+    map.entry(key).or_default().push(i);
+    i
+}
+
+/// Weld a triangle soup into a shared vertex pool + index triples.
+fn weld(tris: &[[Point3; 3]]) -> (Vec<Point3>, Vec<[usize; 3]>) {
+    let mut verts: Vec<Point3> = Vec::new();
+    let mut map: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    let mut idx: Vec<[usize; 3]> = Vec::with_capacity(tris.len());
+    for t in tris {
+        let a = weld_index(&mut verts, &mut map, t[0]);
+        let b = weld_index(&mut verts, &mut map, t[1]);
+        let c = weld_index(&mut verts, &mut map, t[2]);
+        if a == b || b == c || c == a {
+            continue;
+        }
+        idx.push([a, b, c]);
+    }
+    (verts, idx)
+}
+
+/// Heal T-junctions: where a welded vertex lies on the interior of a triangle
+/// edge, re-triangulate that triangle (fan from its centroid through the split
+/// boundary) so every edge is shared by exactly two triangles.
+fn heal(verts: &mut Vec<Point3>, tris: &[[usize; 3]]) -> Vec<[usize; 3]> {
+    let candidates: Vec<usize> = (0..verts.len()).collect();
+    let mut out: Vec<[usize; 3]> = Vec::with_capacity(tris.len());
+    for t in tris {
+        let corners = [t[0], t[1], t[2]];
+        let mut loop_pts: Vec<usize> = Vec::new();
+        let mut any = false;
+        for e in 0..3 {
+            let i = corners[e];
+            let j = corners[(e + 1) % 3];
+            loop_pts.push(i);
+            let a = verts[i];
+            let b = verts[j];
+            let ab = b - a;
+            let len2 = ab.length_sq();
+            if len2 > 1.0e-24 {
+                let mut on: Vec<(f64, usize)> = Vec::new();
+                for &k in &candidates {
+                    if k == i || k == j {
+                        continue;
+                    }
+                    let p = verts[k];
+                    let tp = (p - a).dot(ab) / len2;
+                    if tp > EDGE_EPS && tp < 1.0 - EDGE_EPS {
+                        let proj = a + ab * tp;
+                        if (p - proj).length() < WELD_TOL {
+                            on.push((tp, k));
+                        }
+                    }
+                }
+                if !on.is_empty() {
+                    any = true;
+                    on.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+                    for (_, k) in on {
+                        loop_pts.push(k);
+                    }
+                }
+            }
+        }
+        if !any {
+            out.push(*t);
+            continue;
+        }
+        // Fan from the centroid of the (now subdivided) boundary loop.
+        let m = loop_pts.len() as f64;
+        let (mut cx, mut cy, mut cz) = (0.0, 0.0, 0.0);
+        for &p in &loop_pts {
+            let v = verts[p];
+            cx += v.x;
+            cy += v.y;
+            cz += v.z;
+        }
+        let cen = Point3::new(cx / m, cy / m, cz / m);
+        let ci = verts.len();
+        verts.push(cen);
+        let nl = loop_pts.len();
+        for e in 0..nl {
+            let p0 = loop_pts[e];
+            let p1 = loop_pts[(e + 1) % nl];
+            if p0 != p1 {
+                out.push([ci, p0, p1]);
+            }
+        }
+    }
+    out
+}
+
+/// Build a [`WatertightReport`] from welded index triples.
+fn report_from(idx: &[[usize; 3]], nverts: usize) -> WatertightReport {
+    let mut dir: HashMap<(usize, usize), i32> = HashMap::new();
+    for t in idx {
+        for k in 0..3 {
+            let a = t[k];
+            let b = t[(k + 1) % 3];
+            if a == b {
+                continue;
+            }
+            *dir.entry((a, b)).or_insert(0) += 1;
+        }
+    }
+    let mut und: HashMap<(usize, usize), i32> = HashMap::new();
+    for (&(a, b), &c) in &dir {
+        *und.entry((a.min(b), a.max(b))).or_insert(0) += c;
+    }
+    let mut open = 0;
+    for (&(a, b), &c) in &dir {
+        let rev = *dir.get(&(b, a)).unwrap_or(&0);
+        if c != rev {
+            open += 1;
+        }
+    }
+    let mut nm = 0;
+    for (_, &c) in &und {
+        if c != 2 {
+            nm += 1;
+        }
+    }
+    WatertightReport {
+        triangles: idx.len(),
+        vertices: nverts,
+        edges: und.len(),
+        open_edges: open,
+        non_manifold_edges: nm,
+    }
+}
+
+/// Triangulate, weld, heal, and materialise CSG polygons into a new solid built
+/// from `FaceExtent::Polygon` faces.
+fn finalize(
+    brep: &mut BRep,
+    polys: Vec<CsgPoly>,
+    name: Option<String>,
+) -> Result<SolidId, BooleanError> {
+    let mut tris: Vec<[Point3; 3]> = Vec::new();
+    for p in &polys {
+        if p.verts.len() < 3 {
+            continue;
+        }
+        for i in 1..p.verts.len() - 1 {
+            tris.push([p.verts[0], p.verts[i], p.verts[i + 1]]);
+        }
+    }
+    if tris.is_empty() {
+        return Err(BooleanError::FacetingFailed);
+    }
+    let (mut verts, idx) = weld(&tris);
+    let idx = heal(&mut verts, &idx);
+
+    let mut face_ids: Vec<FaceId> = Vec::with_capacity(idx.len());
+    for t in &idx {
+        let a = verts[t[0]];
+        let b = verts[t[1]];
+        let c = verts[t[2]];
+        let g = (b - a).cross(c - a);
+        let nrm = match g.try_normalize() {
+            Some(u) => u,
+            None => continue,
+        };
+        let normal = UnitVec3::new_unchecked(nrm);
+        let plane = Plane3::from_origin_normal(a, normal);
+        let loop_id = brep.add_loop(cadcore_topo::Loop {
+            start: cadcore_topo::CoEdgeId::default(),
+            face: FaceId::default(),
+        });
+        let fid = brep.add_face(Face {
+            geom: FaceGeom::Plane(plane),
+            normal: FaceNormal::Same,
+            outer_loop: loop_id,
+            inner_loops: vec![],
+            shell: ShellId::default(),
+            extent: FaceExtent::Polygon { points: vec![a, b, c] },
+        });
+        face_ids.push(fid);
+    }
+    if face_ids.is_empty() {
+        return Err(BooleanError::FacetingFailed);
+    }
+    let shell_id = brep.add_shell(Shell {
+        faces: face_ids.clone(),
+        is_outer: true,
+        solid: SolidId::default(),
+    });
+    for &fid in &face_ids {
+        if let Some(f) = brep.faces.get_mut(fid) {
+            f.shell = shell_id;
+        }
+    }
+    let solid_id = brep.add_solid(Solid { shells: vec![shell_id], name });
+    if let Some(sh) = brep.shells.get_mut(shell_id) {
+        sh.solid = solid_id;
+    }
+    Ok(solid_id)
+}
+
+/// Remove a solid and its shells/faces from the B-Rep.
+fn remove_solid(brep: &mut BRep, id: SolidId) {
+    if let Some(solid) = brep.solids.get(id).cloned() {
+        for sh in &solid.shells {
+            if let Some(shell) = brep.shells.get(*sh).cloned() {
+                for f in &shell.faces {
+                    brep.faces.remove(*f);
+                }
+                brep.shells.remove(*sh);
+            }
+        }
+        brep.solids.remove(id);
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -632,5 +1575,106 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(brep.faces.len(), face_count_before,
             "fully-above cylinder must not gain or lose faces");
+    }
+
+    // ── Boolean UNION (faceted) ─────────────────────────────────────────────
+
+    /// A single swept cylinder (lateral surface + two disk caps) tessellates to
+    /// a closed manifold mesh.  This is the precondition for a correct CSG union.
+    #[test]
+    fn single_cylinder_tessellates_watertight() {
+        let mut brep = BRep::new();
+        let cyl = sweep_circle_along_polyline(
+            &mut brep,
+            &[Point3::new(-2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0)],
+            0.5,
+            &SweepOptions::default(),
+        )
+        .unwrap();
+        let polys = solid_to_polys(&brep, cyl, 32).unwrap();
+        let mut tris = Vec::new();
+        for p in &polys {
+            for i in 1..p.verts.len() - 1 {
+                tris.push([p.verts[0], p.verts[i], p.verts[i + 1]]);
+            }
+        }
+        let (verts, idx) = weld(&tris);
+        let rep = report_from(&idx, verts.len());
+        assert!(
+            rep.is_watertight(),
+            "tessellated cylinder must be closed: {rep:?}"
+        );
+    }
+
+    /// Two equal-radius cylinders whose axes cross perpendicularly through the
+    /// origin must fuse into a SINGLE watertight (closed, oriented 2-manifold)
+    /// solid — the classic Steinmetz-cross union.
+    #[test]
+    fn perpendicular_cylinders_fuse_watertight() {
+        let mut brep = BRep::new();
+        let r = 0.5;
+        // Cylinder A along X, cylinder B along Z, both through the origin.
+        let a = sweep_circle_along_polyline(
+            &mut brep,
+            &[Point3::new(-2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0)],
+            r,
+            &SweepOptions::default(),
+        )
+        .unwrap();
+        let b = sweep_circle_along_polyline(
+            &mut brep,
+            &[Point3::new(0.0, 0.0, -2.0), Point3::new(0.0, 0.0, 2.0)],
+            r,
+            &SweepOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(brep.solids.len(), 2);
+
+        let fused = union_solids(&mut brep, a, b, &UnionOptions { facets: 32 }).unwrap();
+
+        // Exactly one solid remains.
+        assert_eq!(brep.solids.len(), 1, "union must leave a single solid");
+
+        // The fused solid is a closed, oriented 2-manifold: no naked edges,
+        // every edge shared by exactly two oppositely-oriented faces (task §3.4).
+        let rep = validate_watertight(&brep, fused);
+        assert!(
+            rep.is_watertight(),
+            "fused perpendicular cylinders must be watertight: {rep:?}"
+        );
+        assert!(rep.triangles > 0 && rep.vertices > 0);
+
+        // Euler characteristic of a genus-0 closed surface: V - E + F = 2.
+        let euler = rep.vertices as i64 - rep.edges as i64 + rep.triangles as i64;
+        assert_eq!(euler, 2, "fused cross must be a topological sphere: {rep:?}");
+    }
+
+    /// Two disjoint cylinders fuse to two shells worth of geometry, still a valid
+    /// closed surface set (each component watertight).
+    #[test]
+    fn perpendicular_cylinders_offset_still_watertight() {
+        let mut brep = BRep::new();
+        let r = 0.4;
+        let a = sweep_circle_along_polyline(
+            &mut brep,
+            &[Point3::new(-2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0)],
+            r,
+            &SweepOptions::default(),
+        )
+        .unwrap();
+        // Unequal radius crossing — exercises the general (non-elliptic) seam.
+        let b = sweep_circle_along_polyline(
+            &mut brep,
+            &[Point3::new(0.0, 0.0, -2.0), Point3::new(0.0, 0.0, 2.0)],
+            r * 1.7,
+            &SweepOptions::default(),
+        )
+        .unwrap();
+        let fused = union_solids(&mut brep, a, b, &UnionOptions { facets: 28 }).unwrap();
+        let rep = validate_watertight(&brep, fused);
+        assert!(
+            rep.is_watertight(),
+            "unequal-radius perpendicular cylinders must fuse watertight: {rep:?}"
+        );
     }
 }
