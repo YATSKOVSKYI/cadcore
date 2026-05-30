@@ -5,6 +5,7 @@
 //! Every entity is emitted as `#N = ENTITY_TYPE(args);`.
 
 use std::fmt::Write as FmtWrite;
+use std::collections::HashMap;
 
 use cadcore_geom::{Circle3, CylSurf, Ellipse3, Line3, Plane3, SphereSurf, TorusSurf};
 use cadcore_math::{Frame3, Point3, UnitVec3, Vec3};
@@ -27,14 +28,52 @@ impl std::fmt::Display for StepError {
 }
 impl std::error::Error for StepError {}
 
+#[derive(Hash, PartialEq, Eq, Debug, Clone, Copy)]
+pub(crate) enum StepCurveKey {
+    Line {
+        v1: usize,
+        v2: usize,
+    },
+    Circle {
+        center: [i64; 3],
+        radius_micro: i64,
+        normal: [i64; 3],
+    },
+    Ellipse {
+        center: [i64; 3],
+        semi_major_micro: i64,
+        semi_minor_micro: i64,
+        normal: [i64; 3],
+    },
+}
+
+pub(crate) fn point_key(p: Point3) -> [i64; 3] {
+    [
+        (p.x * 100_000.0).round() as i64,
+        (p.y * 100_000.0).round() as i64,
+        (p.z * 100_000.0).round() as i64,
+    ]
+}
+
 /// Mutable counter + output buffer, shared across all entity emission calls.
 pub(crate) struct Ctx {
     pub counter: usize,
     pub out:     String,
+    pub point_cache: HashMap<[i64; 3], usize>,
+    pub vertex_cache: HashMap<[i64; 3], usize>,
+    pub edge_cache: HashMap<StepCurveKey, (usize, usize)>, // (ec_id, orig_start_vtx_id)
 }
 
 impl Ctx {
-    pub fn new() -> Self { Self { counter: 0, out: String::with_capacity(8192) } }
+    pub fn new() -> Self {
+        Self {
+            counter: 0,
+            out: String::with_capacity(8192),
+            point_cache: HashMap::new(),
+            vertex_cache: HashMap::new(),
+            edge_cache: HashMap::new(),
+        }
+    }
 
     /// Allocate the next entity id (1-based) and return it.
     pub fn next_id(&mut self) -> usize {
@@ -52,11 +91,28 @@ impl Ctx {
 // ── Point3 → CARTESIAN_POINT ─────────────────────────────────────────────────
 
 pub(crate) fn emit_point(ctx: &mut Ctx, p: Point3, label: &str) -> Result<usize, StepError> {
+    let key = point_key(p);
+    if let Some(&id) = ctx.point_cache.get(&key) {
+        return Ok(id);
+    }
     let id = ctx.next_id();
     ctx.emit_raw(id, &format!(
         "CARTESIAN_POINT('{label}',({:.10},{:.10},{:.10}))",
         p.x, p.y, p.z
     ))?;
+    ctx.point_cache.insert(key, id);
+    Ok(id)
+}
+
+pub(crate) fn emit_vertex_point(ctx: &mut Ctx, p: Point3) -> Result<usize, StepError> {
+    let key = point_key(p);
+    if let Some(&id) = ctx.vertex_cache.get(&key) {
+        return Ok(id);
+    }
+    let cp_id = emit_point(ctx, p, "v")?;
+    let id = ctx.next_id();
+    ctx.emit_raw(id, &format!("VERTEX_POINT('',#{cp_id})"))?;
+    ctx.vertex_cache.insert(key, id);
     Ok(id)
 }
 

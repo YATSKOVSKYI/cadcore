@@ -22,7 +22,7 @@
 //! sequentially.
 
 use cadcore_geom::{CylSurf, Plane3};
-use cadcore_math::{Point3, UnitVec3};
+use cadcore_math::{Frame3, Point3, UnitVec3};
 use cadcore_topo::{
     BRep, Face, FaceBoundary, FaceExtent, FaceGeom, FaceNormal, Shell, Solid, SolidId,
 };
@@ -371,26 +371,34 @@ fn add_lateral_cut_caps(
     });
 
     // ── Two partial-disk end caps ────────────────────────────────────────────
-    use std::f64::consts::PI;
-    let cap_start_plane = Plane3::from_origin_normal(axis_start, -axis_dir);
-    let cap_end_plane   = Plane3::from_origin_normal(axis_end,    axis_dir);
-    // Arc angles are measured from "up" (plane normal); for the disk cap we
-    // need angles measured from the plane's frame x-axis.  As an approximation
-    // we use 0..arc_full_angle and rely on the writer's frame orientation.
-    let arc_full = 2.0 * arc_half_angle;
+    let cap_start_frame = Frame3 {
+        origin: axis_start,
+        x:      up,
+        y:      -right,
+        z:      -axis_dir,
+    };
+    let cap_start_plane = Plane3 { frame: cap_start_frame };
+
+    let cap_end_frame = Frame3 {
+        origin: axis_end,
+        x:      up,
+        y:      right,
+        z:      axis_dir,
+    };
+    let cap_end_plane = Plane3 { frame: cap_end_frame };
+
     out.push(FaceTemplate::PartialDisk {
         plane:       cap_start_plane,
         radius,
-        start_angle: PI * 0.5 - arc_half_angle,
-        end_angle:   PI * 0.5 + arc_half_angle,
+        start_angle: -arc_half_angle,
+        end_angle:   arc_half_angle,
     });
     out.push(FaceTemplate::PartialDisk {
         plane:       cap_end_plane,
         radius,
-        start_angle: PI * 0.5 - arc_half_angle,
-        end_angle:   PI * 0.5 + arc_half_angle,
+        start_angle: -arc_half_angle,
+        end_angle:   arc_half_angle,
     });
-    let _ = arc_full;
 }
 
 // ── Materialisation ───────────────────────────────────────────────────────────
@@ -412,7 +420,6 @@ fn materialise_solid(brep: &mut BRep, parts: NewSolidParts) {
                 })
             }
             FaceTemplate::PartialCylinder { axis_start, axis_end, radius, arc_half_angle, up } => {
-                use std::f64::consts::PI;
                 let axis_vec = axis_end - axis_start;
                 let length = axis_vec.length();
                 let axis_dir = match UnitVec3::try_from_vec(axis_vec) {
@@ -429,8 +436,8 @@ fn materialise_solid(brep: &mut BRep, parts: NewSolidParts) {
                     shell:       cadcore_topo::ShellId::default(),
                     extent:      FaceExtent::PartialCylinder {
                         length,
-                        arc_start_angle: PI * 0.5 - arc_half_angle,
-                        arc_end_angle:   PI * 0.5 + arc_half_angle,
+                        arc_start_angle: -arc_half_angle,
+                        arc_end_angle:   arc_half_angle,
                         arc_ref_dir:     up,
                     },
                 })

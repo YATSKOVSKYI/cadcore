@@ -433,7 +433,7 @@ fn clip_polyline_by_plane_with_radius(
         if len_sq > 1e-12 {
             let dir = diff / len_sq.sqrt();
             let is_parallel = plane.normal.dot_vec(dir).abs() < 1.0e-3;
-            if is_parallel && prev_d < 0.0 && prev_d.abs() < radius * 0.99 {
+            if is_parallel && prev_d < 0.0 && prev_d.abs() < radius * 1.01 {
                 prev_adjusted_d = 0.0;
             }
         }
@@ -455,10 +455,10 @@ fn clip_polyline_by_plane_with_radius(
             let dir = diff / len_sq.sqrt();
             let is_parallel = plane.normal.dot_vec(dir).abs() < 1.0e-3;
             if is_parallel {
-                if prev_d < 0.0 && prev_d.abs() < radius * 0.99 {
+                if prev_d < 0.0 && prev_d.abs() < radius * 1.01 {
                     prev_adjusted_d = 0.0;
                 }
-                if cur_d < 0.0 && cur_d.abs() < radius * 0.99 {
+                if cur_d < 0.0 && cur_d.abs() < radius * 1.01 {
                     cur_adjusted_d = 0.0;
                 }
             }

@@ -4,13 +4,13 @@
 
 use std::fmt::Write as FmtWrite;
 
-use cadcore_geom::{Circle3, Ellipse3};
+use cadcore_geom::Ellipse3;
 use cadcore_math::{Point3, UnitVec3};
 use cadcore_topo::{BRep, FaceBoundary, FaceExtent, FaceGeom, SolidId};
 
 use crate::entities::{
     emit_cylinder, emit_ellipse, emit_plane, emit_point, emit_sphere, emit_torus,
-    emit_unit_direction, Ctx, StepError,
+    emit_unit_direction, Ctx, StepError, emit_vertex_point, StepCurveKey, point_key,
 };
 
 /// Builder that serialises a [`BRep`] to a STEP AP203 string.
@@ -107,11 +107,14 @@ impl<'a> StepWriter<'a> {
             FaceGeom::Torus(t)    => emit_torus(ctx, t),
         }
     }
-
     fn emit_advanced_faces(&self, ctx: &mut Ctx, solid_id: SolidId) -> Result<Vec<usize>, StepError> {
         let solid = match self.brep.solids.get(solid_id) { Some(s) => s, None => return Ok(vec![]) };
         let mut ids = Vec::new();
         for &shell_id in &solid.shells {
+            ctx.point_cache.clear();
+            ctx.vertex_cache.clear();
+            ctx.edge_cache.clear();
+
             let shell = match self.brep.shells.get(shell_id) { Some(s) => s, None => continue };
             for &face_id in &shell.faces {
                 let face = match self.brep.faces.get(face_id) { Some(f) => f, None => continue };
@@ -184,7 +187,7 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
             )
         }
 
-        // ── Torus fillet ──────────────────────────────────────────────────────
+        // ── Torus fillet arc: boundary consists of two minor circles ───────────
         FaceExtent::TorusFillet { start_circle, end_circle } => {
             let s_x = start_circle.frame.x;
             let e_x = end_circle.frame.x;
@@ -205,9 +208,7 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
             if points.len() < 3 { return Ok(vec![]); }
             let mut vtx_ids = Vec::with_capacity(points.len());
             for &pt in points {
-                let vp_id  = emit_point(ctx, pt, "v")?;
-                let vtx_id = ctx.next_id();
-                writeln!(ctx.out, "#{vtx_id} = VERTEX_POINT('',#{vp_id});")?;
+                let vtx_id = emit_vertex_point(ctx, pt)?;
                 vtx_ids.push(vtx_id);
             }
             let mut oe_ids = Vec::with_capacity(points.len());
@@ -218,16 +219,28 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
                 let dir_vec = p_end - p_start;
                 if dir_vec.length() < 1e-7 { continue; }
                 let dir = match UnitVec3::try_from_vec(dir_vec) { Some(u) => u, None => continue };
-                let lp_id   = emit_point(ctx, p_start, "lp")?;
-                let ld_id   = emit_unit_direction(ctx, dir, "ld")?;
-                let line_id = ctx.next_id();
-                writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
-                let v_start = vtx_ids[i];
-                let v_end   = vtx_ids[(i + 1) % n];
-                let ec_id   = ctx.next_id();
-                writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{v_start},#{v_end},#{line_id},.T.);")?;
-                let oe_id   = ctx.next_id();
-                writeln!(ctx.out, "#{oe_id} = ORIENTED_EDGE('',*,*,#{ec_id},.T.);")?;
+                let v_s = vtx_ids[i];
+                let v_e = vtx_ids[(i + 1) % n];
+                
+                let v_min = v_s.min(v_e);
+                let v_max = v_s.max(v_e);
+                let key = StepCurveKey::Line { v1: v_min, v2: v_max };
+                let (ec_id, orig_start) = if let Some(&pair) = ctx.edge_cache.get(&key) {
+                    pair
+                } else {
+                    let lp_id   = emit_point(ctx, p_start, "lp")?;
+                    let ld_id   = emit_unit_direction(ctx, dir, "ld")?;
+                    let line_id = ctx.next_id();
+                    writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
+                    let ec_id   = ctx.next_id();
+                    writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{v_s},#{v_e},#{line_id},.T.);")?;
+                    ctx.edge_cache.insert(key, (ec_id, v_s));
+                    (ec_id, v_s)
+                };
+                let orient = orig_start == v_s;
+                let sense = if orient { ".T." } else { ".F." };
+                let oe_id = ctx.next_id();
+                writeln!(ctx.out, "#{oe_id} = ORIENTED_EDGE('',*,*,#{ec_id},{sense});")?;
                 oe_ids.push(oe_id);
             }
             if oe_ids.is_empty() { return Ok(vec![]); }
@@ -245,39 +258,23 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
 
 // ── Partial cylinder bound emission ───────────────────────────────────────────
 
-/// Emit the 4-edge FACE_OUTER_BOUND for a partial cylinder face.
-///
-/// The bound consists of:
-/// 1. Arc at `start` end (partial circle from arc_start_angle to arc_end_angle)
-/// 2. Line along one cylinder side (from arc endpoint at start to arc endpoint at end)
-/// 3. Arc at `end` end (reversed partial circle)
-/// 4. Line along the other cylinder side (back to start)
 fn emit_partial_cylinder_bounds(
     ctx:             &mut Ctx,
     origin:          Point3,
-    axis:            UnitVec3,  // cylinder axis direction
-    x_ref:           UnitVec3,  // reference direction in cross-section
+    axis:            UnitVec3,
+    x_ref:           UnitVec3,
     radius:          f64,
     length:          f64,
     arc_start_angle: f64,
     arc_end_angle:   f64,
-    arc_ref_dir:     UnitVec3,  // "up" direction (cut plane normal)
+    arc_ref_dir:     UnitVec3,
 ) -> Result<Vec<usize>, StepError> {
-    // Compute a proper x_ref that points along arc_ref_dir when possible.
-    // The cross-section frame: (arc_ref_dir, right) where right = axis × arc_ref_dir.
     let right = match UnitVec3::try_from_vec(axis.cross(arc_ref_dir)) {
         Some(u) => u,
-        None => x_ref, // fallback
+        None => x_ref,
     };
 
-    // Arc angles measured from "up" (arc_ref_dir):
-    //   angle=0 → arc_ref_dir, angle=+π/2 → right
-    // Point at angle θ: origin + radius*(sin(θ)*right + cos(θ)*arc_ref_dir)
-    // ... but STEP circles measure from x_ref, so we need angle_from_x_ref.
-    //
-    // For simplicity, approximate the arc as a Polygon face (polyline of segments).
-    // This avoids the complex STEP EDGE_CURVE arc parameterisation.
-    let n_segs = 24usize; // arc approximation segments
+    let n_segs = 24usize;
     let angle_range = arc_end_angle - arc_start_angle;
     let mut pts_start: Vec<Point3> = Vec::with_capacity(n_segs + 1);
     let mut pts_end:   Vec<Point3> = Vec::with_capacity(n_segs + 1);
@@ -287,31 +284,25 @@ fn emit_partial_cylinder_bounds(
     for i in 0..=n_segs {
         let t = i as f64 / n_segs as f64;
         let angle = arc_start_angle + t * angle_range;
-        // angle measured from arc_ref_dir (up):
         let local = arc_ref_dir.as_vec() * (radius * angle.cos())
                   + right.as_vec()       * (radius * angle.sin());
         pts_start.push(origin + local);
         pts_end.push(end + local);
     }
 
-    // Build polygon loop: pts_start[0..n] → pts_end[0..n] → pts_end[n..0] → pts_start[n..0]
     let mut all_pts: Vec<Point3> = Vec::new();
-    all_pts.extend_from_slice(&pts_start);           // start arc
-    all_pts.extend(pts_end.iter().rev().cloned());   // end arc reversed
+    all_pts.extend_from_slice(&pts_start);
+    all_pts.extend(pts_end.iter().rev().cloned());
 
-    // Remove duplicates at the seam
     if (*all_pts.first().unwrap() - *all_pts.last().unwrap()).length() < 1e-7 {
         all_pts.pop();
     }
 
     if all_pts.len() < 3 { return Ok(vec![]); }
 
-    // Emit as a Polygon face bound.
     let mut vtx_ids = Vec::with_capacity(all_pts.len());
     for &pt in &all_pts {
-        let vp_id  = emit_point(ctx, pt, "v")?;
-        let vtx_id = ctx.next_id();
-        writeln!(ctx.out, "#{vtx_id} = VERTEX_POINT('',#{vp_id});")?;
+        let vtx_id = emit_vertex_point(ctx, pt)?;
         vtx_ids.push(vtx_id);
     }
 
@@ -323,16 +314,28 @@ fn emit_partial_cylinder_bounds(
         let dv = p_end - p_start;
         if dv.length() < 1e-7 { continue; }
         let dir = match UnitVec3::try_from_vec(dv) { Some(u) => u, None => continue };
-        let lp_id   = emit_point(ctx, p_start, "lp")?;
-        let ld_id   = emit_unit_direction(ctx, dir, "ld")?;
-        let line_id = ctx.next_id();
-        writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
         let v_s = vtx_ids[i];
         let v_e = vtx_ids[(i + 1) % n];
-        let ec_id = ctx.next_id();
-        writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{v_s},#{v_e},#{line_id},.T.);")?;
+        
+        let v_min = v_s.min(v_e);
+        let v_max = v_s.max(v_e);
+        let key = StepCurveKey::Line { v1: v_min, v2: v_max };
+        let (ec_id, orig_start) = if let Some(&pair) = ctx.edge_cache.get(&key) {
+            pair
+        } else {
+            let lp_id   = emit_point(ctx, p_start, "lp")?;
+            let ld_id   = emit_unit_direction(ctx, dir, "ld")?;
+            let line_id = ctx.next_id();
+            writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
+            let ec_id   = ctx.next_id();
+            writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{v_s},#{v_e},#{line_id},.T.);")?;
+            ctx.edge_cache.insert(key, (ec_id, v_s));
+            (ec_id, v_s)
+        };
+        let orient = orig_start == v_s;
+        let sense = if orient { ".T." } else { ".F." };
         let oe_id = ctx.next_id();
-        writeln!(ctx.out, "#{oe_id} = ORIENTED_EDGE('',*,*,#{ec_id},.T.);")?;
+        writeln!(ctx.out, "#{oe_id} = ORIENTED_EDGE('',*,*,#{ec_id},{sense});")?;
         oe_ids.push(oe_id);
     }
     if oe_ids.is_empty() { return Ok(vec![]); }
@@ -346,7 +349,6 @@ fn emit_partial_cylinder_bounds(
 
 // ── Partial disk bound emission ───────────────────────────────────────────────
 
-/// Emit the FACE_OUTER_BOUND for a partial disk (arc + chord).
 fn emit_partial_disk_bound(
     ctx:         &mut Ctx,
     centre:      Point3,
@@ -356,11 +358,9 @@ fn emit_partial_disk_bound(
     start_angle: f64,
     end_angle:   f64,
 ) -> Result<Vec<usize>, StepError> {
-    // The boundary is a closed polygon: arc (approximated) + chord line.
-    let n_segs = 16usize;
+    let n_segs = 24usize;
     let angle_range = end_angle - start_angle;
 
-    // y_ref: perpendicular to normal and x_ref in the plane
     let y_ref = match UnitVec3::try_from_vec(normal.cross(x_ref)) {
         Some(u) => u,
         None => return Ok(vec![]),
@@ -370,21 +370,14 @@ fn emit_partial_disk_bound(
     for i in 0..=n_segs {
         let t     = i as f64 / n_segs as f64;
         let angle = start_angle + t * angle_range;
-        // Arc point measured from x_ref in the (x_ref, y_ref) plane:
         let local = x_ref.as_vec() * (radius * angle.cos())
                   + y_ref.as_vec() * (radius * angle.sin());
         pts.push(centre + local);
     }
-    // Add centre point to close via chord (arc end → centre → arc start is a triangle fan;
-    // for a proper STEP loop we just use arc + chord line).
-    // The chord closes pts[n_segs] back to pts[0] via a straight line (already done by loop).
 
-    // Emit polygon.
     let mut vtx_ids = Vec::with_capacity(pts.len());
     for &pt in &pts {
-        let vp_id  = emit_point(ctx, pt, "v")?;
-        let vtx_id = ctx.next_id();
-        writeln!(ctx.out, "#{vtx_id} = VERTEX_POINT('',#{vp_id});")?;
+        let vtx_id = emit_vertex_point(ctx, pt)?;
         vtx_ids.push(vtx_id);
     }
 
@@ -396,16 +389,28 @@ fn emit_partial_disk_bound(
         let dv = p_end - p_start;
         if dv.length() < 1e-7 { continue; }
         let dir = match UnitVec3::try_from_vec(dv) { Some(u) => u, None => continue };
-        let lp_id   = emit_point(ctx, p_start, "lp")?;
-        let ld_id   = emit_unit_direction(ctx, dir, "ld")?;
-        let line_id = ctx.next_id();
-        writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
         let v_s = vtx_ids[i];
         let v_e = vtx_ids[(i + 1) % n];
-        let ec_id = ctx.next_id();
-        writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{v_s},#{v_e},#{line_id},.T.);")?;
+        
+        let v_min = v_s.min(v_e);
+        let v_max = v_s.max(v_e);
+        let key = StepCurveKey::Line { v1: v_min, v2: v_max };
+        let (ec_id, orig_start) = if let Some(&pair) = ctx.edge_cache.get(&key) {
+            pair
+        } else {
+            let lp_id   = emit_point(ctx, p_start, "lp")?;
+            let ld_id   = emit_unit_direction(ctx, dir, "ld")?;
+            let line_id = ctx.next_id();
+            writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
+            let ec_id   = ctx.next_id();
+            writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{v_s},#{v_e},#{line_id},.T.);")?;
+            ctx.edge_cache.insert(key, (ec_id, v_s));
+            (ec_id, v_s)
+        };
+        let orient = orig_start == v_s;
+        let sense = if orient { ".T." } else { ".F." };
         let oe_id = ctx.next_id();
-        writeln!(ctx.out, "#{oe_id} = ORIENTED_EDGE('',*,*,#{ec_id},.T.);")?;
+        writeln!(ctx.out, "#{oe_id} = ORIENTED_EDGE('',*,*,#{ec_id},{sense});")?;
         oe_ids.push(oe_id);
     }
     if oe_ids.is_empty() { return Ok(vec![]); }
@@ -436,24 +441,43 @@ fn emit_circle_bound(
     ctx:    &mut Ctx,
     centre: Point3,
     normal: UnitVec3,
-    x_dir:  UnitVec3,
+    _x_dir:  UnitVec3,
     radius: f64,
     outer:  bool,
     orient: bool,
 ) -> Result<usize, StepError> {
-    let cp_id  = emit_point(ctx, centre, "c")?;
-    let cz_id  = emit_unit_direction(ctx, normal, "cn")?;
-    let cx_id  = emit_unit_direction(ctx, x_dir, "cx")?;
-    let cax_id = ctx.next_id();
-    writeln!(ctx.out, "#{cax_id} = AXIS2_PLACEMENT_3D('',#{cp_id},#{cz_id},#{cx_id});")?;
-    let circ_id = ctx.next_id();
-    writeln!(ctx.out, "#{circ_id} = CIRCLE('',#{cax_id},{:.10});", radius)?;
-    let vp_world = centre + x_dir.as_vec() * radius;
-    let vpt_id = emit_point(ctx, vp_world, "v")?;
-    let vtx_id = ctx.next_id();
-    writeln!(ctx.out, "#{vtx_id} = VERTEX_POINT('',#{vpt_id});")?;
-    let ec_id  = ctx.next_id();
-    writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{vtx_id},#{vtx_id},#{circ_id},.T.);")?;
+    let key = StepCurveKey::Circle {
+        center: point_key(centre),
+        radius_micro: (radius * 1_000_000.0).round() as i64,
+        normal: normal_key(normal),
+    };
+    let ec_id = if let Some(&(id, _)) = ctx.edge_cache.get(&key) {
+        id
+    } else {
+        // Deterministically compute x_dir orthogonal to normal
+        let n_vec = normal.as_vec();
+        let ref_vec = if n_vec.x.abs() > 0.9 {
+            cadcore_math::Vec3::new(0.0, 1.0, 0.0)
+        } else {
+            cadcore_math::Vec3::new(1.0, 0.0, 0.0)
+        };
+        let ortho = n_vec.cross(ref_vec);
+        let x_dir = UnitVec3::try_from_vec(ortho).unwrap_or(normal);
+
+        let cp_id  = emit_point(ctx, centre, "c")?;
+        let cz_id  = emit_unit_direction(ctx, normal, "cn")?;
+        let cx_id  = emit_unit_direction(ctx, x_dir, "cx")?;
+        let cax_id = ctx.next_id();
+        writeln!(ctx.out, "#{cax_id} = AXIS2_PLACEMENT_3D('',#{cp_id},#{cz_id},#{cx_id});")?;
+        let circ_id = ctx.next_id();
+        writeln!(ctx.out, "#{circ_id} = CIRCLE('',#{cax_id},{:.10});", radius)?;
+        let vp_world = centre + x_dir.as_vec() * radius;
+        let vtx_id = emit_vertex_point(ctx, vp_world)?;
+        let ec_id  = ctx.next_id();
+        writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{vtx_id},#{vtx_id},#{circ_id},.T.);")?;
+        ctx.edge_cache.insert(key, (ec_id, vtx_id));
+        ec_id
+    };
     let sense  = if orient { ".T." } else { ".F." };
     let oe_id  = ctx.next_id();
     writeln!(ctx.out, "#{oe_id} = ORIENTED_EDGE('',*,*,#{ec_id},{sense});")?;
@@ -472,13 +496,23 @@ fn emit_ellipse_bound(
     outer: bool,
     orient: bool,
 ) -> Result<usize, StepError> {
-    let ellipse_id = emit_ellipse(ctx, ellipse)?;
-    let vp_world = ellipse.frame.origin + ellipse.frame.x.as_vec() * ellipse.semi_major;
-    let vpt_id = emit_point(ctx, vp_world, "v")?;
-    let vtx_id = ctx.next_id();
-    writeln!(ctx.out, "#{vtx_id} = VERTEX_POINT('',#{vpt_id});")?;
-    let ec_id  = ctx.next_id();
-    writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{vtx_id},#{vtx_id},#{ellipse_id},.T.);")?;
+    let key = StepCurveKey::Ellipse {
+        center: point_key(ellipse.frame.origin),
+        semi_major_micro: (ellipse.semi_major * 1_000_000.0).round() as i64,
+        semi_minor_micro: (ellipse.semi_minor * 1_000_000.0).round() as i64,
+        normal: normal_key(ellipse.frame.z),
+    };
+    let ec_id = if let Some(&(id, _)) = ctx.edge_cache.get(&key) {
+        id
+    } else {
+        let ellipse_id = emit_ellipse(ctx, ellipse)?;
+        let vp_world = ellipse.frame.origin + ellipse.frame.x.as_vec() * ellipse.semi_major;
+        let vtx_id = emit_vertex_point(ctx, vp_world)?;
+        let ec_id  = ctx.next_id();
+        writeln!(ctx.out, "#{ec_id} = EDGE_CURVE('',#{vtx_id},#{vtx_id},#{ellipse_id},.T.);")?;
+        ctx.edge_cache.insert(key, (ec_id, vtx_id));
+        ec_id
+    };
     let sense  = if orient { ".T." } else { ".F." };
     let oe_id  = ctx.next_id();
     writeln!(ctx.out, "#{oe_id} = ORIENTED_EDGE('',*,*,#{ec_id},{sense});")?;
@@ -495,4 +529,17 @@ pub fn brep_to_step(brep: &BRep) -> Result<String, StepError> {
     StepWriter::new(brep).to_step(&[])
 }
 
-fn _use_circle3(_c: Circle3) {}
+fn normal_key(v: UnitVec3) -> [i64; 3] {
+    let vec = v.as_vec();
+    let mut x = (vec.x * 10.0).round() as i64;
+    let mut y = (vec.y * 10.0).round() as i64;
+    let mut z = (vec.z * 10.0).round() as i64;
+    if x != 0 {
+        if x < 0 { x = -x; y = -y; z = -z; }
+    } else if y != 0 {
+        if y < 0 { y = -y; z = -z; }
+    } else if z != 0 {
+        if z < 0 { z = -z; }
+    }
+    [x, y, z]
+}
