@@ -39,7 +39,7 @@
 //! | [`step`]       | `cadcore-step`       | brep_to_step, StepWriter                  |
 
 #![warn(missing_docs)]
-#![doc(html_root_url = "https://docs.rs/cadcore/0.1.18")]
+#![doc(html_root_url = "https://docs.rs/cadcore/0.1.19")]
 
 /// Re-export of `cadcore-math`.
 pub mod math {
@@ -70,12 +70,11 @@ pub mod step {
 
 pub use cadcore_math::{Frame3, Point3, UnitVec3, Vec3};
 pub use cadcore_ops::{
-    analytic_path_from_polyline_samples, rounded_path_from_polyline,
-    sharp_path_from_polyline_samples, sweep_circle_along_path, sweep_circle_along_polyline,
-    sweep_circle_along_rounded_polyline, PathApproxOptions, SweepOptions, SweepPathSegment,
-    ClipPlane, clip_polyline, clip_polyline_with_radius, sweep_circle_along_path_with_caps,
-    sweep_circle_along_polyline_with_caps, build_solid_box,
-    union_all, union_solids, UnionOptions, BooleanError, WatertightReport, validate_watertight,
+    analytic_path_from_polyline_samples, build_solid_box, clip_polyline, clip_polyline_with_radius,
+    rounded_path_from_polyline, sharp_path_from_polyline_samples, sweep_circle_along_path,
+    sweep_circle_along_path_with_caps, sweep_circle_along_polyline,
+    sweep_circle_along_polyline_with_caps, sweep_circle_along_rounded_polyline, ClipPlane,
+    PathApproxOptions, SweepOptions, SweepPathSegment,
 };
-pub use cadcore_step::brep_to_step;
+pub use cadcore_step::{brep_to_step, brep_to_step_assembly};
 pub use cadcore_topo::BRep;

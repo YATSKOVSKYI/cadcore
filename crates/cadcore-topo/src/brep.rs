@@ -2,10 +2,7 @@
 
 use slotmap::SlotMap;
 
-use crate::{
-    ids::*,
-    entities::*,
-};
+use crate::{entities::*, ids::*};
 
 /// The complete B-Rep model.
 ///
@@ -23,34 +20,40 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct BRep {
     /// Vertex arena.
-    pub vertices:  SlotMap<VertexId,  Vertex>,
+    pub vertices: SlotMap<VertexId, Vertex>,
     /// Edge arena.
-    pub edges:     SlotMap<EdgeId,    Edge>,
+    pub edges: SlotMap<EdgeId, Edge>,
     /// CoEdge arena.
-    pub coedges:   SlotMap<CoEdgeId,  CoEdge>,
+    pub coedges: SlotMap<CoEdgeId, CoEdge>,
     /// Loop arena.
-    pub loops:     SlotMap<LoopId,    Loop>,
+    pub loops: SlotMap<LoopId, Loop>,
     /// Face arena.
-    pub faces:     SlotMap<FaceId,    Face>,
+    pub faces: SlotMap<FaceId, Face>,
     /// Shell arena.
-    pub shells:    SlotMap<ShellId,   Shell>,
+    pub shells: SlotMap<ShellId, Shell>,
     /// Solid arena.
-    pub solids:    SlotMap<SolidId,   Solid>,
+    pub solids: SlotMap<SolidId, Solid>,
 }
 
 impl BRep {
     /// Create an empty B-Rep.
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     // ── Insertion helpers ────────────────────────────────────────────────────
 
     /// Add a vertex and return its id.
     #[inline]
-    pub fn add_vertex(&mut self, v: Vertex) -> VertexId { self.vertices.insert(v) }
+    pub fn add_vertex(&mut self, v: Vertex) -> VertexId {
+        self.vertices.insert(v)
+    }
 
     /// Add an edge and return its id.
     #[inline]
-    pub fn add_edge(&mut self, e: Edge) -> EdgeId { self.edges.insert(e) }
+    pub fn add_edge(&mut self, e: Edge) -> EdgeId {
+        self.edges.insert(e)
+    }
 
     /// Add a co-edge and return its id.
     ///
@@ -58,23 +61,33 @@ impl BRep {
     /// all co-edges in the loop are inserted.  Use a placeholder id and then
     /// [`BRep::patch_coedge_links`] when the loop is complete.
     #[inline]
-    pub fn add_coedge(&mut self, ce: CoEdge) -> CoEdgeId { self.coedges.insert(ce) }
+    pub fn add_coedge(&mut self, ce: CoEdge) -> CoEdgeId {
+        self.coedges.insert(ce)
+    }
 
     /// Add a loop and return its id.
     #[inline]
-    pub fn add_loop(&mut self, lp: Loop) -> LoopId { self.loops.insert(lp) }
+    pub fn add_loop(&mut self, lp: Loop) -> LoopId {
+        self.loops.insert(lp)
+    }
 
     /// Add a face and return its id.
     #[inline]
-    pub fn add_face(&mut self, f: Face) -> FaceId { self.faces.insert(f) }
+    pub fn add_face(&mut self, f: Face) -> FaceId {
+        self.faces.insert(f)
+    }
 
     /// Add a shell and return its id.
     #[inline]
-    pub fn add_shell(&mut self, s: Shell) -> ShellId { self.shells.insert(s) }
+    pub fn add_shell(&mut self, s: Shell) -> ShellId {
+        self.shells.insert(s)
+    }
 
     /// Add a solid and return its id.
     #[inline]
-    pub fn add_solid(&mut self, s: Solid) -> SolidId { self.solids.insert(s) }
+    pub fn add_solid(&mut self, s: Solid) -> SolidId {
+        self.solids.insert(s)
+    }
 
     // ── Link patching ────────────────────────────────────────────────────────
 
@@ -105,7 +118,7 @@ impl BRep {
         let lp = self.loops.get(loop_id)?;
         let start = lp.start;
         let mut ids = Vec::new();
-        let mut cur  = start;
+        let mut cur = start;
         loop {
             ids.push(cur);
             let ce = self.coedges.get(cur)?;
@@ -121,12 +134,12 @@ impl BRep {
     pub fn stats(&self) -> BRepStats {
         BRepStats {
             vertices: self.vertices.len(),
-            edges:    self.edges.len(),
-            coedges:  self.coedges.len(),
-            loops:    self.loops.len(),
-            faces:    self.faces.len(),
-            shells:   self.shells.len(),
-            solids:   self.solids.len(),
+            edges: self.edges.len(),
+            coedges: self.coedges.len(),
+            loops: self.loops.len(),
+            faces: self.faces.len(),
+            shells: self.shells.len(),
+            solids: self.solids.len(),
         }
     }
 
@@ -159,17 +172,17 @@ pub struct BRepStats {
     /// Number of vertices.
     pub vertices: usize,
     /// Number of edges.
-    pub edges:    usize,
+    pub edges: usize,
     /// Number of co-edges.
-    pub coedges:  usize,
+    pub coedges: usize,
     /// Number of loops.
-    pub loops:    usize,
+    pub loops: usize,
     /// Number of faces.
-    pub faces:    usize,
+    pub faces: usize,
     /// Number of shells.
-    pub shells:   usize,
+    pub shells: usize,
     /// Number of solids.
-    pub solids:   usize,
+    pub solids: usize,
 }
 
 #[cfg(test)]
@@ -188,7 +201,9 @@ mod tests {
     #[test]
     fn add_vertex_increases_count() {
         let mut b = BRep::new();
-        b.add_vertex(Vertex { point: Point3::ORIGIN });
+        b.add_vertex(Vertex {
+            point: Point3::ORIGIN,
+        });
         assert_eq!(b.stats().vertices, 1);
     }
 }

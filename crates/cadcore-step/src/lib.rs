@@ -24,8 +24,8 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-mod writer;
 mod entities;
+mod writer;
 
-pub use writer::{brep_to_step, StepWriter};
 pub use entities::StepError;
+pub use writer::{brep_to_step, brep_to_step_assembly, StepWriter};

@@ -416,16 +416,14 @@ fn clip_polyline_by_plane_with_radius(
     let mut result = Vec::new();
     let mut current_poly = Vec::new();
 
-    let d = |p: Point3| -> f64 {
-        plane.normal.dot_vec(p - plane.origin)
-    };
+    let d = |p: Point3| -> f64 { plane.normal.dot_vec(p - plane.origin) };
 
     let mut prev_pt = points[0];
     let mut prev_d = d(prev_pt);
 
     // Apply envelope intersection margin to parallel segments
     let mut prev_adjusted_d = prev_d;
-    
+
     if points.len() > 1 {
         let next_pt = points[1];
         let diff = next_pt - prev_pt;
@@ -491,7 +489,6 @@ fn clip_polyline_by_plane_with_radius(
     result
 }
 
-
 fn clip_polyline_by_plane(points: &[Point3], plane: &ClipPlane) -> Vec<Vec<Point3>> {
     if points.len() < 2 {
         return Vec::new();
@@ -499,9 +496,7 @@ fn clip_polyline_by_plane(points: &[Point3], plane: &ClipPlane) -> Vec<Vec<Point
     let mut result = Vec::new();
     let mut current_poly = Vec::new();
 
-    let d = |p: Point3| -> f64 {
-        plane.normal.dot_vec(p - plane.origin)
-    };
+    let d = |p: Point3| -> f64 { plane.normal.dot_vec(p - plane.origin) };
 
     let mut prev_pt = points[0];
     let mut prev_d = d(prev_pt);
@@ -595,12 +590,20 @@ pub fn sweep_circle_along_polyline_with_caps(
         }
     };
     let start_extent = if start_cut_normal.is_some() {
-        FaceExtent::PlanarBoundary { boundary: start_bound.clone() }
+        FaceExtent::PlanarBoundary {
+            boundary: start_bound.clone(),
+        }
     } else {
         FaceExtent::Disk { radius }
     };
     let start_normal = start_cut_normal.map(|n| -n).unwrap_or(-dirs[0]);
-    let _cap_start_id = build_end_cap(brep, waypoints[0], start_normal, start_extent, &mut face_ids);
+    let _cap_start_id = build_end_cap(
+        brep,
+        waypoints[0],
+        start_normal,
+        start_extent,
+        &mut face_ids,
+    );
 
     // ── Cylinder + connector loop ─────────────────────────────────────────────
     for i in 0..n - 1 {
@@ -611,7 +614,10 @@ pub fn sweep_circle_along_polyline_with_caps(
         let start_bound = if i == 0 {
             start_bound.clone()
         } else {
-            miter_boundary(p0, dirs[i - 1], dir, dir, radius)
+            // Use dirs[i-1] (incoming direction) as cylinder_dir so that this
+            // boundary uses the same parameterisation as the end_bound of the
+            // previous cylinder — they share the same physical junction ring.
+            miter_boundary(p0, dirs[i - 1], dir, dirs[i - 1], radius)
         };
         let end_bound = if i + 1 == n - 1 {
             if let Some(n) = end_cut_normal {
@@ -649,7 +655,9 @@ pub fn sweep_circle_along_polyline_with_caps(
         FaceBoundary::Circle(Circle3::new(waypoints[last], dirs[last - 1], radius))
     };
     let end_extent = if end_cut_normal.is_some() {
-        FaceExtent::PlanarBoundary { boundary: end_bound }
+        FaceExtent::PlanarBoundary {
+            boundary: end_bound,
+        }
     } else {
         FaceExtent::Disk { radius }
     };
@@ -722,11 +730,15 @@ pub fn sweep_circle_along_path_with_caps(
         }
     };
     let start_extent = if start_cut_normal.is_some() {
-        FaceExtent::PlanarBoundary { boundary: start_bound.clone() }
+        FaceExtent::PlanarBoundary {
+            boundary: start_bound.clone(),
+        }
     } else {
         FaceExtent::Disk { radius }
     };
-    let start_normal = start_cut_normal.map(|n| -n).unwrap_or(-infos[0].start_tangent);
+    let start_normal = start_cut_normal
+        .map(|n| -n)
+        .unwrap_or(-infos[0].start_tangent);
     let _cap_start_id = build_end_cap(
         brep,
         infos[0].start,
@@ -740,11 +752,13 @@ pub fn sweep_circle_along_path_with_caps(
         let start_bound = if idx == 0 {
             start_bound.clone()
         } else {
+            // Use the previous segment's end_tangent as cylinder_dir so this
+            // boundary has the same parameterisation as that segment's end_bound.
             join_boundary(
                 info.start,
                 infos[idx - 1].end_tangent,
                 info.start_tangent,
-                info.start_tangent,
+                infos[idx - 1].end_tangent,
                 radius,
             )
         };
@@ -813,18 +827,14 @@ pub fn sweep_circle_along_path_with_caps(
         FaceBoundary::Circle(Circle3::new(last.end, last.end_tangent, radius))
     };
     let end_extent = if end_cut_normal.is_some() {
-        FaceExtent::PlanarBoundary { boundary: end_bound }
+        FaceExtent::PlanarBoundary {
+            boundary: end_bound,
+        }
     } else {
         FaceExtent::Disk { radius }
     };
     let end_normal = end_cut_normal.map(|n| -n).unwrap_or(last.end_tangent);
-    let _cap_end_id = build_end_cap(
-        brep,
-        last.end,
-        end_normal,
-        end_extent,
-        &mut face_ids,
-    );
+    let _cap_end_id = build_end_cap(brep, last.end, end_normal, end_extent, &mut face_ids);
 
     assemble_solid(brep, face_ids, opts.name.clone())
 }
@@ -1025,7 +1035,6 @@ impl std::fmt::Display for SweepError {
 }
 
 impl std::error::Error for SweepError {}
-
 
 #[derive(Clone, Copy, Debug)]
 enum SegmentKind {

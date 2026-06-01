@@ -13,9 +13,9 @@ keywords     = ["cad", "step", "ap203", "brep", "export"]
 categories   = ["science", "encoding"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math", version = "0.1" }
-cadcore-geom = { path = "../cadcore-geom", version = "0.1" }
-cadcore-topo = { path = "../cadcore-topo", version = "0.1" }
+cadcore-math = { path = "../cadcore-math", version = "0.1.19" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.1.19" }
+cadcore-topo = { path = "../cadcore-topo", version = "0.1.19" }
 
 [dev-dependencies]
-cadcore-ops  = { path = "../cadcore-ops", version = "0.1" }
+cadcore-ops  = { path = "../cadcore-ops", version = "0.1.19" }
