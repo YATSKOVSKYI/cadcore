@@ -79,6 +79,28 @@ in `push_shared_arc`: `.T.` when `p_from → p_to` runs CCW about the circle axi
 else `.F.` (computed via `atan2` on the `(xref, axis × xref)` basis).  Never
 hard-code it per corner — that does not generalise across Y-levels / corners.
 
+### Half-space cut (trim) must preserve the UNCUT-end boundary
+
+`half_space_cut_brep` (cadcore-ops `boolean.rs`) rebuilds each cylinder face
+independently against the cut plane.  When a cylinder is **axially truncated**
+(`CylinderOutcome::AxialCut`), only the end that actually meets the plane may be
+replaced with a fresh plain `Circle` (it pairs with the new flat disk cap).  The
+**other** (untouched) end MUST keep its *original* `FaceBoundary` — which is
+usually a **miter ellipse** shared with a surviving neighbour (e.g. the
+serpentine connector that joins this leg).
+
+> ⚠️ HISTORICAL BUG (do not reintroduce): `AxialTruncated` used to emit a plain
+> circle at *both* ends.  The kept neighbour still carried its miter ellipse at
+> the shared junction, so the two faces no longer shared one EDGE_CURVE → that
+> edge was used **once** → open shell.  CAD tools (SpaceClaim) then rendered the
+> filament as **cut short / not drawn at exactly one end** — and because layers
+> are laid orthogonally, the broken end alternated sides per layer.  Fix =
+> `FaceTemplate::AxialTruncated` carries `start`/`end: FaceBoundary` and the
+> cut-end-only gets a new circle; the uncut end is `start.clone()`/`end.clone()`.
+
+Covered by `half_space_cut_serpentine_stays_manifold` (writer.rs tests) and the
+`two_layer_caps` integration test in `gcode-viewer-rs/crates/brep`.
+
 ### Regression tests (writer.rs `mod tests`)
 
 `check_ap214_manifold` parses the STEP output and asserts every `EDGE_CURVE` is

@@ -1434,6 +1434,64 @@ mod tests {
         }
     }
 
+    // ── Half-space cut (trim) — filament end caps ─────────────────────────────
+
+    /// A serpentine filament swept as a SINGLE solid (ellipse miters at the
+    /// junctions) and then trimmed by ONE half-space plane must stay a watertight
+    /// AP214 manifold.  Regression for the "filament ends not drawn" bug: an
+    /// axially-truncated leg used to drop its original miter boundary and emit a
+    /// plain circle, while the surviving connector kept its miter ellipse — the
+    /// shared junction edge then appeared only once → open shell → CAD tools
+    /// rendered the end as broken / cut short on exactly one side.
+    #[test]
+    fn half_space_cut_serpentine_stays_manifold() {
+        use cadcore_math::UnitVec3;
+        use cadcore_ops::{
+            half_space_cut_brep, sweep_circle_along_path_with_caps, ClipPlane, SweepPathSegment,
+        };
+
+        let raw = [
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 20.0, 0.0),
+            Point3::new(2.0, 20.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(3.0, 0.0, 0.0),
+            Point3::new(3.0, 20.0, 0.0),
+        ];
+        let segs: Vec<SweepPathSegment> = raw
+            .windows(2)
+            .map(|w| SweepPathSegment::Line { start: w[0], end: w[1] })
+            .collect();
+
+        // A single plane (keeps only one side) leaves connectors alive next to
+        // truncated legs — the exact configuration that used to open the shell.
+        for &(oy, ny) in &[(1.0_f64, 1.0_f64), (19.0, -1.0)] {
+            let mut brep = BRep::new();
+            sweep_circle_along_path_with_caps(
+                &mut brep,
+                &segs,
+                0.2,
+                &SweepOptions {
+                    fillet_corners: false,
+                    corner_fillet_radius: 0.0,
+                    name: Some("serp".into()),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let plane = ClipPlane {
+                origin: Point3::new(0.0, oy, 0.0),
+                normal: if ny > 0.0 { UnitVec3::Y } else { -UnitVec3::Y },
+            };
+            half_space_cut_brep(&mut brep, &plane);
+            let step = brep_to_step(&brep).unwrap();
+            if let Err(e) = check_ap214_manifold(&step) {
+                panic!("half-space cut opened the shell (oy={oy}):\n{e}");
+            }
+        }
+    }
+
     /// The 4 arc EDGE_CURVEs shared between caps and corner cylinders must each
     /// appear exactly once (no duplication).
     #[test]

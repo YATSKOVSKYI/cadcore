@@ -105,12 +105,22 @@ enum FaceTemplate {
         up: UnitVec3, // cut plane normal (into kept half-space)
     },
     /// Cylinder with the axis perpendicular to the cut plane вЂ” truncated.
-    /// The cylinder runs from `axis_start` to `axis_end`; `axis_end` was
-    /// originally past the plane and is now exactly on it.
+    /// The cylinder runs from `axis_start` to `axis_end`; one of those points is
+    /// the truncation point (exactly on the plane), the other is the original,
+    /// untouched endpoint.
+    ///
+    /// `start`/`end` carry the boundary curves for each end.  The **cut** end
+    /// gets a fresh plain `Circle` (it pairs with the new flat disk cap).  The
+    /// **uncut** end keeps the *original* boundary (which may be a miter
+    /// ellipse) so the shared junction edge with a kept neighbour face is
+    /// preserved вЂ” without this the shell would open up at every truncated
+    /// filament that still joins a surviving connector.
     AxialTruncated {
         axis_start: Point3,
         axis_end: Point3,
         radius: f64,
+        start: FaceBoundary,
+        end: FaceBoundary,
     },
     /// Polygonal flat face (e.g. chord face of a PartialCylinder).
     Polygon { plane: Plane3, points: Vec<Point3> },
@@ -227,10 +237,28 @@ fn process_solid(brep: &BRep, solid_id: SolidId, plane: &ClipPlane) -> SolidOutc
                 radius,
                 axis_dir,
             } => {
+                // The cut end gets a fresh plain circle (it pairs with the new
+                // flat disk cap below).  The uncut end keeps its *original*
+                // boundary curve so the shared junction edge with any surviving
+                // neighbour face (e.g. a kept connector's miter ellipse) is
+                // preserved вЂ” otherwise the shell opens up exactly at the
+                // truncated filament ends.
+                let cut_circle = |centre: Point3| {
+                    FaceBoundary::Circle(cadcore_geom::Circle3::new(centre, axis_dir, radius))
+                };
+                let (start_bound, end_bound) = if kept_end_at_plane {
+                    // axis_end is the cut end; axis_start is original/untouched.
+                    (start.clone(), cut_circle(new_end))
+                } else {
+                    // axis_start is the cut end; axis_end is original/untouched.
+                    (cut_circle(new_start), end.clone())
+                };
                 new_faces.push(FaceTemplate::AxialTruncated {
                     axis_start: new_start,
                     axis_end: new_end,
                     radius,
+                    start: start_bound,
+                    end: end_bound,
                 });
                 // Add flat disk cap at the cut end (replacing the original hemisphere).
                 // Cap normal points OUTWARD = away from the kept solid:
@@ -521,6 +549,8 @@ fn materialise_solid(brep: &mut BRep, parts: NewSolidParts) {
                 axis_start,
                 axis_end,
                 radius,
+                start,
+                end,
             } => {
                 let axis_vec = axis_end - axis_start;
                 let length = axis_vec.length();
@@ -536,15 +566,7 @@ fn materialise_solid(brep: &mut BRep, parts: NewSolidParts) {
                     outer_loop: loop_id,
                     inner_loops: vec![],
                     shell: cadcore_topo::ShellId::default(),
-                    extent: FaceExtent::Cylinder {
-                        length,
-                        start: FaceBoundary::Circle(cadcore_geom::Circle3::new(
-                            axis_start, axis_dir, radius,
-                        )),
-                        end: FaceBoundary::Circle(cadcore_geom::Circle3::new(
-                            axis_end, axis_dir, radius,
-                        )),
-                    },
+                    extent: FaceExtent::Cylinder { length, start, end },
                 })
             }
             FaceTemplate::Polygon { plane, points } => {

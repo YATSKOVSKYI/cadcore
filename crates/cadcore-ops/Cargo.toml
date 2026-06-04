@@ -13,6 +13,6 @@ keywords     = ["cad", "brep", "sweep", "geometry", "3d"]
 categories   = ["science"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math", version = "0.1.19" }
-cadcore-geom = { path = "../cadcore-geom", version = "0.1.19" }
-cadcore-topo = { path = "../cadcore-topo", version = "0.1.19" }
+cadcore-math = { path = "../cadcore-math", version = "0.1.20" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.1.20" }
+cadcore-topo = { path = "../cadcore-topo", version = "0.1.20" }
