@@ -45,6 +45,16 @@ pub(crate) enum StepCurveKey {
         semi_minor_micro: i64,
         normal: [i64; 3],
     },
+    /// Canonical arc edge key: v_start ≤ v_end lexicographically so that
+    /// ArcEdge(A→B) and ArcEdge(B→A) map to the same entry.
+    ArcEdge {
+        v_start:      [i64; 3],
+        v_end:        [i64; 3],
+        center:       [i64; 3],
+        radius_micro: i64,
+        axis:         [i64; 3],
+        x_ref:        [i64; 3],
+    },
 }
 
 pub(crate) fn point_key(p: Point3) -> [i64; 3] {
@@ -53,6 +63,35 @@ pub(crate) fn point_key(p: Point3) -> [i64; 3] {
         (p.y * 100_000.0).round() as i64,
         (p.z * 100_000.0).round() as i64,
     ]
+}
+
+/// Quantise a unit direction vector to 4 decimal places (±10 000 units).
+/// No sign normalisation — the raw direction is significant for arc geometry.
+pub(crate) fn dir_key(v: UnitVec3) -> [i64; 3] {
+    let vec = v.as_vec();
+    [
+        (vec.x * 10_000.0).round() as i64,
+        (vec.y * 10_000.0).round() as i64,
+        (vec.z * 10_000.0).round() as i64,
+    ]
+}
+
+/// Build a direction-agnostic `ArcEdge` key: whichever of `v_start_pos` /
+/// `v_end_pos` is lexicographically smaller becomes the canonical `v_start`.
+pub(crate) fn arc_edge_key(
+    v_start_pos:  [i64; 3],
+    v_end_pos:    [i64; 3],
+    center:       [i64; 3],
+    radius_micro: i64,
+    axis:         [i64; 3],
+    x_ref:        [i64; 3],
+) -> StepCurveKey {
+    let (v_s, v_e) = if v_start_pos <= v_end_pos {
+        (v_start_pos, v_end_pos)
+    } else {
+        (v_end_pos, v_start_pos)
+    };
+    StepCurveKey::ArcEdge { v_start: v_s, v_end: v_e, center, radius_micro, axis, x_ref }
 }
 
 /// Mutable counter + output buffer, shared across all entity emission calls.

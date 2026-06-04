@@ -75,6 +75,36 @@ pub enum FaceExtent {
         /// The polygon vertices in counter-clockwise order.
         points: Vec<Point3>,
     },
+    /// Rounded-rectangle cap face (end cap of a `build_solid_rounded_box_xz` solid).
+    /// The boundary consists of 4 LINE + 4 CIRCLE arc edges in analytic STEP form.
+    RoundedRectCap {
+        /// Minimum X of the rectangle.
+        xmin: f64,
+        /// Maximum X of the rectangle.
+        xmax: f64,
+        /// Minimum Z of the rectangle.
+        zmin: f64,
+        /// Maximum Z of the rectangle.
+        zmax: f64,
+        /// Corner arc radius.
+        radius: f64,
+        /// Y coordinate of this cap.
+        y: f64,
+        /// `true` = back cap (outward +Y); `false` = front cap (outward −Y).
+        plus_y: bool,
+    },
+    /// Quarter-cylinder corner face of a `build_solid_rounded_box_xz` solid.
+    /// The boundary is 2 analytic CIRCLE arcs + 2 LINE longitudinal edges in STEP.
+    CylinderArcFace {
+        /// Length along the cylinder axis.
+        length: f64,
+        /// Arc start angle (radians, CCW from `arc_ref_dir`).
+        arc_start_angle: f64,
+        /// Arc end angle (radians).
+        arc_end_angle: f64,
+        /// Reference direction for angle = 0.
+        arc_ref_dir: UnitVec3,
+    },
 }
 
 /// Closed curve used as a face boundary.
