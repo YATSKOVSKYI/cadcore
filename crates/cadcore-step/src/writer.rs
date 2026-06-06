@@ -1523,9 +1523,9 @@ mod tests {
 
 fn normal_key(v: UnitVec3) -> [i64; 3] {
     let vec = v.as_vec();
-    let mut x = (vec.x * 10.0).round() as i64;
-    let mut y = (vec.y * 10.0).round() as i64;
-    let mut z = (vec.z * 10.0).round() as i64;
+    let mut x = (vec.x * 1_000_000.0).round() as i64;
+    let mut y = (vec.y * 1_000_000.0).round() as i64;
+    let mut z = (vec.z * 1_000_000.0).round() as i64;
     if x != 0 {
         if x < 0 {
             x = -x;
