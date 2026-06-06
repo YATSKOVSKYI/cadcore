@@ -1,5 +1,7 @@
 # cadcore
 
+![cadcore banner](https://raw.githubusercontent.com/YATSKOVSKYI/cadcore/master/banner.png)
+
 **A High-Performance, Pure-Rust CAD Geometry Kernel.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -142,4 +144,4 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 ## Contributions & Support
 
-Contributions, bug reports, and pull requests are welcome! If you have questions or want to discuss integration into your CAD/CAM pipeline, feel free to open an issue or pull request in the [GitHub Repository](https://github.com/YATSKOVSKYI/cadcore).
+Contributions, bug reports, and pull requests are welcome! If you have questions, want to discuss integration into your CAD/CAM pipeline, or have commercial/partnership queries, feel free to reach out to Dmytro Yatskovskyi at [dmytroyatskovskyi@outlook.com](mailto:dmytroyatskovskyi@outlook.com) or open an issue/pull request in the [GitHub Repository](https://github.com/YATSKOVSKYI/cadcore).

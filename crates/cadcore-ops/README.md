@@ -71,6 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## License
+## License & Contact
 
 Licensed under the **MIT License** (see [LICENSE](../../LICENSE)). Free for commercial and non-commercial application.
+
+For questions, support, or custom integrations, please contact Dmytro Yatskovskyi at [dmytroyatskovskyi@outlook.com](mailto:dmytroyatskovskyi@outlook.com).

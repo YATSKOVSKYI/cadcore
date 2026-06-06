@@ -1,5 +1,7 @@
 # cadcore
 
+![cadcore banner](https://raw.githubusercontent.com/YATSKOVSKYI/cadcore/master/banner.png)
+
 **The Single-Entry Facade Crate for the Pure-Rust CAD Geometry Kernel.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -83,6 +85,8 @@ This facade re-exports the following modular building blocks:
 
 ---
 
-## License
+## License & Contact
 
 Licensed under the **MIT License** (see [LICENSE](../../LICENSE)). Free for commercial and non-commercial application.
+
+For questions, support, or custom integrations, please contact Dmytro Yatskovskyi at [dmytroyatskovskyi@outlook.com](mailto:dmytroyatskovskyi@outlook.com).

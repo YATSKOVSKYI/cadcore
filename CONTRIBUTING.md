@@ -15,7 +15,7 @@ Thank you for your interest in cadcore!
 
 - New public API surface (open an issue first)
 - Changes to the B-Rep data model
-- Commercial use cases — contact dmytroyatskovskiy@gmail.com
+- Commercial queries or partnerships — contact dmytroyatskovskyi@outlook.com
 
 ## How to contribute
 
@@ -36,4 +36,4 @@ Thank you for your interest in cadcore!
 ## License
 
 By contributing, you agree that your contributions will be licensed under the
-[PolyForm Noncommercial License 1.0.0](LICENSE).
+[MIT License](LICENSE).
