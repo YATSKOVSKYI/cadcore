@@ -1,76 +1,73 @@
 # cadcore-topo
 
+**Compile-Time Safe, Arena-Based B-Rep Topology for CAD Kernels.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![crates.io](https://img.shields.io/crates/v/cadcore-topo)](https://crates.io/crates/cadcore-topo)
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](../../LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](https://www.rust-lang.org/)
 
-Arena-based B-Rep topology for the [cadcore](https://crates.io/crates/cadcore) CAD kernel.
+`cadcore-topo` implements the Boundary Representation (B-Rep) topological database for the `cadcore` kernel. 
 
-Provides the full **Solid → Shell → Face → Loop → CoEdge → Edge → Vertex** hierarchy with typed stable IDs backed by [`slotmap`](https://crates.io/crates/slotmap).
+Instead of traditional C-style pointer structures (which lead to memory leaks or segmentation faults), `cadcore-topo` stores all topological elements in flat, typed arenas backed by [`slotmap`](https://crates.io/crates/slotmap).
 
 ---
 
-## Topology hierarchy
+## The Topological B-Rep Hierarchy
 
 ```
 Solid
- └─ Shell  (outer surface + optional inner voids)
+ └─ Shell  (outer surface + optional inner void shells)
      └─ Face  (bounded region of a surface)
-         └─ Loop  (outer boundary + optional inner holes)
-             └─ CoEdge  (directed use of an edge)
-                 └─ Edge  (curve segment between two vertices)
-                     └─ Vertex  (3-D point)
+         └─ Loop  (outer boundary loop + optional inner hole loops)
+             └─ CoEdge  (directed edge occurrence)
+                 └─ Edge  (curve segment bounded by two vertices)
+                     └─ Vertex  (point in 3D space)
 ```
 
-Every entity is stored in its own typed arena inside `BRep`. IDs are distinct Rust types — the compiler prevents passing a `FaceId` where a `VertexId` is expected.
+---
+
+## Why cadcore-topo?
+
+1.  **Strict Compile-Time Safety:** Every topological ID is a distinct Rust type (`SolidId`, `FaceId`, `EdgeId`, `VertexId`). The compiler makes it impossible to accidentally pass a `FaceId` into a function expecting an `EdgeId`.
+2.  **No Dangling Pointers:** Topological references are verified index lookups, completely eliminating pointer corruption issues common in legacy C++ kernels.
+3.  **High-Performance Access:** Flat arrays under the hood ensure cache-friendly lookups and high memory efficiency.
+4.  **Serialization Ready:** BRep graphs can be easily serialized/deserialized since they use index IDs rather than memory addresses.
 
 ---
 
 ## Usage
 
+Add `cadcore-topo` to your `Cargo.toml`:
+
 ```toml
 [dependencies]
-cadcore-topo = "0.1"
+cadcore-topo = "0.1.22"
 ```
 
 ```rust
 use cadcore_topo::{BRep, Vertex, VertexId};
 use cadcore_math::Point3;
 
-let mut brep = BRep::new();
+fn main() {
+    let mut brep = BRep::new();
 
-// Add a vertex
-let v: VertexId = brep.add_vertex(Vertex {
-    point: Point3::new(1.0, 2.0, 3.0),
-});
+    // 1. Add vertices to the topological database
+    let v1: VertexId = brep.add_vertex(Vertex {
+        point: Point3::new(0.0, 0.0, 0.0),
+    });
+    let v2: VertexId = brep.add_vertex(Vertex {
+        point: Point3::new(10.0, 0.0, 0.0),
+    });
 
-// Query a vertex by ID
-let pt = brep[v].point;
+    // 2. Query vertices and count stats
+    let pt1 = brep[v1].point;
+    let stats = brep.stats();
 
-// Topology statistics
-let stats = brep.stats();
-println!("vertices={} edges={} faces={} solids={}",
-    stats.vertices, stats.edges, stats.faces, stats.solids);
-```
-
-In practice you build `BRep` via high-level ops (see [`cadcore-ops`](https://crates.io/crates/cadcore-ops)) rather than manually.
-
----
-
-## Part of cadcore
-
-For the full kernel (sweep + STEP export), use the [`cadcore`](https://crates.io/crates/cadcore) facade:
-
-```toml
-[dependencies]
-cadcore = "0.1"
+    println!("B-Rep contains {} vertices, {} faces.", stats.vertices, stats.faces);
+}
 ```
 
 ---
 
 ## License
 
-[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
-
-Free for research, education, and non-commercial use.
-Commercial licensing: **dmytroyatskovskiy@gmail.com**
+Licensed under the **MIT License** (see [LICENSE](../../LICENSE)). Free for commercial and non-commercial application.

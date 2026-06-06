@@ -1,79 +1,70 @@
 # cadcore-math
 
+**Type-Safe, High-Performance 3D Math Primitives for CAD Kernels.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![crates.io](https://img.shields.io/crates/v/cadcore-math)](https://crates.io/crates/cadcore-math)
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](../../LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](https://www.rust-lang.org/)
 
-Fundamental math primitives for the [cadcore](https://crates.io/crates/cadcore) CAD kernel.
+`cadcore-math` provides the mathematical foundation for the `cadcore` CAD kernel. It is designed to be extremely fast, robust, and zero-allocation, utilizing const-generic arithmetic.
 
-**Zero external dependencies.** Everything in `cadcore` is built on top of this crate.
+**Zero external dependencies. Pure Rust.**
 
 ---
 
-## Types
+## Key Features
+
+*   **Type Safety at the Compiler Level:** Points (`Point3`) and vectors (`Vec3` and `UnitVec3`) are separate types. The compiler will not let you accidentally add two coordinates or confuse a point location with a direction vector.
+*   **Enforced Unit Vectors:** `UnitVec3` guarantees length `1.0` at construction, preventing normalization errors during geometric computations.
+*   **Orthonormal Frames:** Built-in `Frame3` makes local-to-world coordinate transformations simple and mathematically exact.
+*   **High Performance:** Fully optimized for double-precision float (`f64`) operations.
+
+---
+
+## Math Types
 
 | Type | Description |
 |---|---|
-| `Point3` | Location in 3-D space (mm) |
-| `Vec3` | Free vector — direction + magnitude |
-| `UnitVec3` | Unit-length vector, enforced at construction |
-| `Mat3` | 3×3 column-major matrix (rotation, linear maps) |
-| `Frame3` | Right-handed orthonormal frame (origin + 3 axes) |
-| `Transform3` | Rigid-body transform: rotation + translation |
-| `Interval` | Closed real interval `[lo, hi]` |
-
-Constants: `EPS`, `PI`, `TAU`.
+| `Point3` | A location in 3D space (measured in millimeters) |
+| `Vec3` | A free vector (direction and magnitude) |
+| `UnitVec3` | A normalized unit vector (guaranteed direction) |
+| `Mat3` | Column-major 3x3 matrix (rotations, linear maps) |
+| `Frame3` | Right-handed orthonormal frame (origin + Z, X, Y axes) |
+| `Transform3` | Rigid-body transform (rotation + translation) |
+| `Interval` | A closed real interval `[lo, hi]` for parameter bounds |
 
 ---
 
 ## Usage
 
+Add `cadcore-math` to your `Cargo.toml`:
+
 ```toml
 [dependencies]
-cadcore-math = "0.1"
+cadcore-math = "0.1.22"
 ```
 
 ```rust
-use cadcore_math::{Point3, Vec3, UnitVec3, Mat3, Frame3};
+use cadcore_math::{Point3, Vec3, UnitVec3, Frame3};
 
-// Build a right-handed frame from an origin and a Z axis
-let origin = Point3::new(1.0, 2.0, 0.0);
-let axis   = UnitVec3::try_from_vec(Vec3::new(0.0, 0.0, 1.0)).unwrap();
-let frame  = Frame3::from_origin_z(origin, axis);
+fn main() {
+    // Define an origin and a Z-axis direction vector
+    let origin = Point3::new(1.0, 2.0, 3.0);
+    let z_dir  = UnitVec3::try_from_vec(Vec3::new(0.0, 0.0, 1.0)).unwrap();
 
-// Vector arithmetic
-let a = Vec3::new(1.0, 0.0, 0.0);
-let b = Vec3::new(0.0, 1.0, 0.0);
-let c = a.cross(b);       // (0, 0, 1)
-let d = a.dot(b);         // 0.0
+    // Construct an orthonormal coordinate frame
+    let frame  = Frame3::from_origin_z(origin, z_dir);
 
-// 3×3 rotation matrix
-let rot = Mat3::rotation_z(std::f64::consts::FRAC_PI_2);  // 90° around Z
-let v   = rot * Vec3::new(1.0, 0.0, 0.0);                 // (0, 1, 0)
+    // Transform points between local and world coordinates
+    let world_pt = Point3::new(4.0, 5.0, 6.0);
+    let local_pt = frame.to_local_point(world_pt);
+    let back_pt  = frame.to_world_point(local_pt);
 
-// Interval utilities
-use cadcore_math::Interval;
-let i = Interval::new(0.0, 10.0);
-assert!(i.contains(5.0));
-let (lo, hi) = i.lerp_pair(0.25, 0.75);  // 2.5, 7.5
-```
-
----
-
-## Part of cadcore
-
-This crate is a building block. If you need the full kernel (sweep, STEP export), use the [`cadcore`](https://crates.io/crates/cadcore) facade instead:
-
-```toml
-[dependencies]
-cadcore = "0.1"
+    assert!((world_pt - back_pt).length() < 1e-10);
+}
 ```
 
 ---
 
 ## License
 
-[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
-
-Free for research, education, and non-commercial use.
-Commercial licensing: **dmytroyatskovskiy@gmail.com**
+Licensed under the **MIT License** (see [LICENSE](../../LICENSE)). Free for commercial and non-commercial application.

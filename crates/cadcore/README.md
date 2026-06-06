@@ -1,22 +1,32 @@
 # cadcore
 
+**The Single-Entry Facade Crate for the Pure-Rust CAD Geometry Kernel.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![crates.io](https://img.shields.io/crates/v/cadcore)](https://crates.io/crates/cadcore)
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](../../LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](https://www.rust-lang.org/)
 
-**A pure-Rust CAD geometry kernel.**
+`cadcore` is a unified facade crate that re-exports all sub-crates of the `cadcore` CAD kernel under a single namespace. 
 
-Zero C++ dependencies. No OpenCASCADE. No global state. Fully parallelisable.
-
-This crate is the **facade** — it re-exports everything from all cadcore sub-crates under a single dependency.
+Instead of adding five different crates to your `Cargo.toml`, you only need to add `cadcore`. It compiles down to a lightweight, thread-safe, and dependency-free library for mathematically exact 3D geometry.
 
 ---
 
-## Quick start
+## Features
+
+*   **Exact Analytic Representation:** Curves (Line, Circle, Ellipse) and Surfaces (Plane, Cylinder, Sphere, Torus) map directly to STEP entities. Zero polygonal approximations in the core representation.
+*   **Safe B-Rep Topology:** Strongly-typed entity IDs using slotmaps. Safe against memory corruptions and logical mismatched ID bugs.
+*   **$O(N)$ Filament Sweep:** Build watertight B-Rep tubes along polyline paths in linear time without relying on heavy Boolean union operations.
+*   **Direct STEP Export:** Generate high-precision, manifold closed shell STEP AP203/AP214 files directly from code.
+
+---
+
+## Quick Start
+
+Add `cadcore` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cadcore = "0.1"
+cadcore = "0.1.22"
 ```
 
 ```rust
@@ -30,101 +40,49 @@ use cadcore::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let waypoints = vec![
         Point3::new( 0.0, 0.0, 0.0),
-        Point3::new(10.0, 0.0, 0.0),
-        Point3::new(10.0, 8.0, 0.0),
-        Point3::new( 0.0, 8.0, 0.0),
+        Point3::new(15.0, 0.0, 0.0),
+        Point3::new(15.0, 5.0, 1.0),
     ];
 
     let mut brep = BRep::new();
-    sweep_circle_along_polyline(&mut brep, &waypoints, 0.2, &SweepOptions::default())?;
+    let opts = SweepOptions::default();
+    
+    // Sweep a circle profile along the path
+    sweep_circle_along_polyline(&mut brep, &waypoints, 0.3, &opts)?;
 
-    let step = brep_to_step(&brep)?;
-    std::fs::write("scaffold_leg.step", &step)?;
+    // Generate STEP string content
+    let step_data = brep_to_step(&brep)?;
+    std::fs::write("scaffold.step", &step_data)?;
+
     Ok(())
 }
 ```
 
 ---
 
-## What cadcore provides
+## Sub-crate Ecosystem
 
-| Feature | Detail |
-|---|---|
-| **Exact analytic geometry** | Planes, cylinders, spheres, toruses — no mesh approximation |
-| **Arena-based B-Rep topology** | `Solid → Shell → Face → Loop → Edge → Vertex` with typed stable IDs |
-| **O(N) filament sweep** | Build a solid from a polyline path without Boolean union |
-| **Pure-Rust STEP AP203 export** | Direct analytic STEP entities — opens in FreeCAD, CATIA, SolidWorks, Rhino |
+This facade re-exports the following modular building blocks:
 
----
-
-## Architecture
-
-```
-cadcore/
-├── crates/
-│   ├── cadcore-math    — Point3, Vec3, UnitVec3, Mat3, Frame3, Transform3, Interval
-│   ├── cadcore-geom    — Line3, Circle3, Ellipse3 / Plane3, CylSurf, TorusSurf, SphereSurf
-│   ├── cadcore-topo    — BRep arena: Solid, Shell, Face, Loop, CoEdge, Edge, Vertex
-│   ├── cadcore-ops     — sweep_circle_along_polyline (O(N) analytic construction)
-│   ├── cadcore-step    — STEP AP203 writer (pure Rust)
-│   └── cadcore         — this facade crate
-```
-
-### Dependency graph
-
-```
-cadcore-math  (no deps)
-     ↑
-cadcore-geom
-     ↑
-cadcore-topo
-     ↑
-cadcore-ops ──────────────────┐
-     ↑                        ↓
-cadcore-step          cadcore (facade)
-```
-
----
-
-## Crates
-
-| Crate | crates.io | Description |
+| Module | Crate Name | Purpose |
 |---|---|---|
-| [`cadcore-math`](https://crates.io/crates/cadcore-math) | [![](https://img.shields.io/crates/v/cadcore-math)](https://crates.io/crates/cadcore-math) | Math primitives (zero deps) |
-| [`cadcore-geom`](https://crates.io/crates/cadcore-geom) | [![](https://img.shields.io/crates/v/cadcore-geom)](https://crates.io/crates/cadcore-geom) | Analytic curves and surfaces |
-| [`cadcore-topo`](https://crates.io/crates/cadcore-topo) | [![](https://img.shields.io/crates/v/cadcore-topo)](https://crates.io/crates/cadcore-topo) | B-Rep arena topology |
-| [`cadcore-ops`](https://crates.io/crates/cadcore-ops) | [![](https://img.shields.io/crates/v/cadcore-ops)](https://crates.io/crates/cadcore-ops) | Geometric operations |
-| [`cadcore-step`](https://crates.io/crates/cadcore-step) | [![](https://img.shields.io/crates/v/cadcore-step)](https://crates.io/crates/cadcore-step) | STEP AP203 writer |
+| `cadcore::math` | [`cadcore-math`](https://crates.io/crates/cadcore-math) | Math primitives (points, vectors, transforms). Zero dependencies. |
+| `cadcore::geom` | [`cadcore-geom`](https://crates.io/crates/cadcore-geom) | Curves, surfaces, and analytic geometry calculations. |
+| `cadcore::topo` | [`cadcore-topo`](https://crates.io/crates/cadcore-topo) | Arena-backed Boundary Representation (B-Rep) topological database. |
+| `cadcore::ops` | [`crates/cadcore-ops`](https://crates.io/crates/cadcore-ops) | High-level sweep construction and half-space trimming solvers. |
+| `cadcore::step` | [`crates/cadcore-step`](https://crates.io/crates/cadcore-step) | Native STEP AP203 writer. |
 
 ---
 
-## Why not OCCT?
+## Why cadcore is the Best Choice
 
-| | OCCT | cadcore |
-|---|---|---|
-| Language | C++ (FFI required) | Pure Rust |
-| Boolean union for N paths | O(N²) fuse | O(N) analytic construction |
-| STEP export | Temp file + parse back | Direct string serialisation |
-| Binary size | ~200 MB prebuilt | < 1 MB |
-| Windows install | Complex setup | `cargo add cadcore` |
-
----
-
-## Roadmap
-
-- [ ] Full edge-loop stitching (co-edge topology between adjacent faces)
-- [ ] Miter-plane joints (sharp corners)
-- [ ] STEP import (AP203 / AP214 reader)
-- [ ] 3MF export
-- [ ] Offset surface operations (wall thickness)
-- [ ] Parallel multi-path sweep
-- [ ] WASM target (browser-side CAD)
+1.  **Pure Rust:** Say goodbye to complex C++ link errors, dll dependencies, and compilation issues. `cargo add` and build instantly.
+2.  **WebAssembly Native:** Runs in browser client applications for real-time CAD model generation and downloads.
+3.  **Engineered for Speed:** Building swept paths (tubes, rods, filaments) takes $O(N)$ linear time instead of $O(N^2)$ in traditional solid modelers.
+4.  **No Global State:** Safe to run in parallel in multi-threaded environments.
 
 ---
 
 ## License
 
-[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
-
-Free for research, education, personal projects, and non-commercial use.
-For commercial licensing, contact **dmytroyatskovskiy@gmail.com**.
+Licensed under the **MIT License** (see [LICENSE](../../LICENSE)). Free for commercial and non-commercial application.

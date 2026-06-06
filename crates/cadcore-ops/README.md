@@ -1,28 +1,44 @@
 # cadcore-ops
 
-[![crates.io](https://img.shields.io/crates/v/cadcore-ops)](https://crates.io/crates/cadcore-ops)
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](../../LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](https://www.rust-lang.org/)
+**High-Level Analytic B-Rep Operations and Sweep Solvers.**
 
-Geometric operations for the [cadcore](https://crates.io/crates/cadcore) CAD kernel — analytic B-Rep construction without Boolean operations.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![crates.io](https://img.shields.io/crates/v/cadcore-ops)](https://crates.io/crates/cadcore-ops)
+
+`cadcore-ops` contains the core geometric algorithms of the `cadcore` kernel. It features a custom linear-time sweep solver that builds mathematically exact B-Rep solids directly from polyline paths without relying on expensive, failure-prone Boolean union operations.
 
 ---
 
-## Operations
+## The O(N) Sweep Advantage
 
-### `sweep_circle_along_polyline`
+When modeling long tubes, pipes, or 3D-printing filaments, legacy C++ CAD kernels (like OpenCASCADE) must build individual cylinder segments and fuse them together using Boolean operations. This results in $O(N^2)$ complexity, high memory overhead, and frequent failures at self-intersecting sharp bends.
 
-Sweeps a circular cross-section along a polyline path to produce an exact analytic B-Rep solid.
+`cadcore-ops` sweeps a circular profile along a path by analytically constructing:
+*   **2 planar end caps**
+*   **N-1 cylinder faces**
+*   **N-2 connector faces** (either G1-smooth torus fillets or exact elliptical miter joins)
 
-```
-2 end-cap planes  +  (N−1) cylinder segments  +  (N−2) torus fillets  =  O(N) total
-```
+This algorithm executes in **linear $O(N)$ time**, uses minimal memory, and guarantees a watertight manifold solid.
 
-No Boolean union. No mesh. Every surface is stored as an exact analytic entity.
+---
+
+## Key Operations
+
+### 🔄 `sweep_circle_along_polyline`
+Builds an exact analytic B-Rep solid by sweeping a circle of a given radius along a polyline. Ideal for structural framing, pipes, and 3D-printing toolpaths.
+
+### ✂️ `half_space_cut_brep`
+Applies sequential flat/oblique cutting planes to B-Rep solids, trimming cylinder segments laterally or axially and capping them with flat disks or partial disks. Excellent for modeling sub-spindle cuts, electrodes, and trimmed structural ends.
+
+---
+
+## Usage
+
+Add `cadcore-ops` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cadcore-ops = "0.1"
+cadcore-ops = "0.1.22"
 ```
 
 ```rust
@@ -30,63 +46,31 @@ use cadcore_topo::BRep;
 use cadcore_math::Point3;
 use cadcore_ops::{sweep_circle_along_polyline, SweepOptions};
 
-let waypoints = vec![
-    Point3::new( 0.0,  0.0, 0.0),
-    Point3::new(10.0,  0.0, 0.0),
-    Point3::new(10.0,  8.0, 0.0),
-    Point3::new( 0.0,  8.0, 0.0),
-];
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut brep = BRep::new();
+    let waypoints = vec![
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(10.0, 0.0, 0.0),
+        Point3::new(10.0, 10.0, 0.0),
+    ];
 
-let mut brep = BRep::new();
-let id = sweep_circle_along_polyline(
-    &mut brep,
-    &waypoints,
-    0.2,   // radius in mm
-    &SweepOptions {
-        fillet_corners: true,            // G1-smooth torus at each bend
-        name: Some("leg".to_string()),
-    },
-)?;
+    let opts = SweepOptions {
+        fillet_corners: true,            // G1-smooth torus corner fillets
+        corner_fillet_radius: 0.0,       // Defaults to profile radius
+        name: Some("filament".to_string()),
+    };
 
-let stats = brep.stats();
-// 4 waypoints → 3 cylinders + 2 torus fillets + 2 end caps = 7 faces
-```
-
----
-
-## SweepOptions
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `fillet_corners` | `bool` | `true` | Insert a `TorusSurf` fillet at each interior bend |
-| `name` | `Option<String>` | `None` | Name attached to the `Solid` entity in the B-Rep |
-
----
-
-## Complexity
-
-| Operation | OCCT Boolean fuse | cadcore sweep |
-|---|---|---|
-| N path segments | O(N²) | **O(N)** |
-| Output | Mesh (tessellation) | Exact analytic B-Rep |
-| STEP export | Round-trip via file | Direct string serialisation |
-
----
-
-## Part of cadcore
-
-For the full kernel (STEP export included), use the [`cadcore`](https://crates.io/crates/cadcore) facade:
-
-```toml
-[dependencies]
-cadcore = "0.1"
+    // 3 waypoints -> 2 cylinders + 1 torus fillet + 2 end caps = 5 faces
+    let solid_id = sweep_circle_along_polyline(&mut brep, &waypoints, 0.2, &opts)?;
+    
+    let stats = brep.stats();
+    assert_eq!(stats.faces, 5);
+    Ok(())
+}
 ```
 
 ---
 
 ## License
 
-[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
-
-Free for research, education, and non-commercial use.
-Commercial licensing: **dmytroyatskovskiy@gmail.com**
+Licensed under the **MIT License** (see [LICENSE](../../LICENSE)). Free for commercial and non-commercial application.
