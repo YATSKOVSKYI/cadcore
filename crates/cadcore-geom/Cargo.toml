@@ -13,4 +13,4 @@ keywords     = ["cad", "geometry", "brep", "surface", "curve"]
 categories   = ["science", "mathematics"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math", version = "0.1.21" }
+cadcore-math = { path = "../cadcore-math", version = "0.1.22" }

@@ -13,6 +13,6 @@ keywords     = ["cad", "brep", "topology", "geometry", "3d"]
 categories   = ["science", "data-structures"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math", version = "0.1.21" }
-cadcore-geom = { path = "../cadcore-geom", version = "0.1.21" }
+cadcore-math = { path = "../cadcore-math", version = "0.1.22" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.1.22" }
 slotmap      = "1"
