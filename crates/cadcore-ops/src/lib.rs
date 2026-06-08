@@ -4,6 +4,7 @@
 
 pub mod boolean;
 pub mod sweep;
+pub mod union;
 
 pub use sweep::{
     analytic_path_from_polyline_samples, build_solid_box,
@@ -16,3 +17,4 @@ pub use sweep::{
 };
 
 pub use boolean::half_space_cut_brep;
+pub use union::union_solids;

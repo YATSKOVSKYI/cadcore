@@ -93,6 +93,15 @@ pub enum FaceExtent {
         /// `true` = back cap (outward +Y); `false` = front cap (outward −Y).
         plus_y: bool,
     },
+    /// **Analytic Boolean union output** — a face whose boundary is given by
+    /// explicit B-Rep topology (`Face::outer_loop` + `Face::inner_loops` →
+    /// CoEdges → Edges), NOT by a closed-form template.
+    ///
+    /// The STEP writer emits this face by walking the real CoEdge/Edge arenas
+    /// (`emit_trimmed_face_bounds`), sharing each EDGE_CURVE between the two
+    /// faces that meet at it.  The carrier surface (`Face::geom`) stays analytic
+    /// (CYLINDRICAL_SURFACE / PLANE); only the trim loops are explicit.
+    Trimmed,
     /// Quarter-cylinder corner face of a `build_solid_rounded_box_xz` solid.
     /// The boundary is 2 analytic CIRCLE arcs + 2 LINE longitudinal edges in STEP.
     CylinderArcFace {
@@ -136,6 +145,13 @@ pub enum EdgeGeom {
     Circle(Circle3),
     /// An elliptic arc (e.g. miter intersection of cylinder and plane).
     Ellipse(Ellipse3),
+    /// A free-form polyline / degree-1 spline curve.
+    ///
+    /// Used for tolerance-sampled surface–surface intersection curves produced
+    /// by the analytic Boolean **union** (e.g. the cylinder∩cylinder quartic at
+    /// a woodpile crossing).  Points run from the edge's `v_start` to `v_end`.
+    /// Emitted to STEP as a `POLYLINE` bounded curve.
+    Polyline(Vec<Point3>),
 }
 
 /// An undirected topological edge.
