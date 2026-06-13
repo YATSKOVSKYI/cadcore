@@ -25,6 +25,8 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod entities;
+mod nurbs;
+mod pcurve;
 mod writer;
 
 pub use entities::StepError;

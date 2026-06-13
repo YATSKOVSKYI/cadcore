@@ -11,6 +11,7 @@ dependencies = [
  "cadcore-ops",
  "cadcore-step",
  "cadcore-topo",
+ "cadcore-union",
 ]
 
 [[package]]
@@ -31,6 +32,7 @@ dependencies = [
  "cadcore-geom",
  "cadcore-math",
  "cadcore-topo",
+ "cadcore-union",
 ]
 
 [[package]]
@@ -50,6 +52,16 @@ dependencies = [
  "cadcore-geom",
  "cadcore-math",
  "slotmap",
+]
+
+[[package]]
+name = "cadcore-union"
+version = "0.1.22"
+dependencies = [
+ "cadcore-geom",
+ "cadcore-math",
+ "cadcore-step",
+ "cadcore-topo",
 ]
 
 [[package]]

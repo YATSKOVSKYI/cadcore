@@ -5,6 +5,7 @@ members  = [
     "crates/cadcore-geom",
     "crates/cadcore-topo",
     "crates/cadcore-ops",
+    "crates/cadcore-union",
     "crates/cadcore-step",
     "crates/cadcore",
 ]

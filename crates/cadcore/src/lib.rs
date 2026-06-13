@@ -62,6 +62,11 @@ pub mod ops {
 }
 
 /// Re-export of `cadcore-step`.
+/// Boolean-union engine (validation gates, refinement oracle, pipeline).
+pub mod union {
+    pub use cadcore_union::*;
+}
+
 pub mod step {
     pub use cadcore_step::*;
 }

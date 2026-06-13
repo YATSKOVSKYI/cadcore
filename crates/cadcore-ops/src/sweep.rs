@@ -999,7 +999,7 @@ pub fn build_solid_rounded_box_xz(
 
     // Collect all (geom, normal_flag, extent) triples, then bulk-insert.
     struct FaceSpec {
-        geom:   FaceGeom,
+        geom: FaceGeom,
         normal: FaceNormal,
         extent: FaceExtent,
     }
@@ -1010,7 +1010,7 @@ pub fn build_solid_rounded_box_xz(
     let poly_spec = |pts: Vec<Point3>, n: UnitVec3| -> FaceSpec {
         let plane = Plane3::from_origin_normal(pts[0], n);
         FaceSpec {
-            geom:   FaceGeom::Plane(plane),
+            geom: FaceGeom::Plane(plane),
             normal: FaceNormal::Same,
             extent: FaceExtent::Polygon { points: pts },
         }
@@ -1018,39 +1018,81 @@ pub fn build_solid_rounded_box_xz(
 
     // ── 1. Back cap (Y = ymax, outward +Y) ───────────────────────────────────
     specs.push(FaceSpec {
-        geom:   FaceGeom::Plane(Plane3::from_origin_normal(Point3::new(0.0, ymax, 0.0), UnitVec3::Y)),
+        geom: FaceGeom::Plane(Plane3::from_origin_normal(
+            Point3::new(0.0, ymax, 0.0),
+            UnitVec3::Y,
+        )),
         normal: FaceNormal::Same,
-        extent: FaceExtent::RoundedRectCap { xmin, xmax, zmin, zmax, radius: r, y: ymax, plus_y: true },
+        extent: FaceExtent::RoundedRectCap {
+            xmin,
+            xmax,
+            zmin,
+            zmax,
+            radius: r,
+            y: ymax,
+            plus_y: true,
+        },
     });
 
     // ── 2. Front cap (Y = ymin, outward −Y) ──────────────────────────────────
     specs.push(FaceSpec {
-        geom:   FaceGeom::Plane(Plane3::from_origin_normal(Point3::new(0.0, ymin, 0.0), -UnitVec3::Y)),
+        geom: FaceGeom::Plane(Plane3::from_origin_normal(
+            Point3::new(0.0, ymin, 0.0),
+            -UnitVec3::Y,
+        )),
         normal: FaceNormal::Same,
-        extent: FaceExtent::RoundedRectCap { xmin, xmax, zmin, zmax, radius: r, y: ymin, plus_y: false },
+        extent: FaceExtent::RoundedRectCap {
+            xmin,
+            xmax,
+            zmin,
+            zmax,
+            radius: r,
+            y: ymin,
+            plus_y: false,
+        },
     });
 
     // ── 3–6. Flat side faces ─────────────────────────────────────────────────
     // Bottom (Z = zmin, outward −Z)
-    specs.push(poly_spec(vec![
-        Point3::new(xmin + r, ymin, zmin), Point3::new(xmin + r, ymax, zmin),
-        Point3::new(xmax - r, ymax, zmin), Point3::new(xmax - r, ymin, zmin),
-    ], -UnitVec3::Z));
+    specs.push(poly_spec(
+        vec![
+            Point3::new(xmin + r, ymin, zmin),
+            Point3::new(xmin + r, ymax, zmin),
+            Point3::new(xmax - r, ymax, zmin),
+            Point3::new(xmax - r, ymin, zmin),
+        ],
+        -UnitVec3::Z,
+    ));
     // Top (Z = zmax, outward +Z)
-    specs.push(poly_spec(vec![
-        Point3::new(xmax - r, ymin, zmax), Point3::new(xmax - r, ymax, zmax),
-        Point3::new(xmin + r, ymax, zmax), Point3::new(xmin + r, ymin, zmax),
-    ], UnitVec3::Z));
+    specs.push(poly_spec(
+        vec![
+            Point3::new(xmax - r, ymin, zmax),
+            Point3::new(xmax - r, ymax, zmax),
+            Point3::new(xmin + r, ymax, zmax),
+            Point3::new(xmin + r, ymin, zmax),
+        ],
+        UnitVec3::Z,
+    ));
     // Left (X = xmin, outward −X)
-    specs.push(poly_spec(vec![
-        Point3::new(xmin, ymin, zmax - r), Point3::new(xmin, ymax, zmax - r),
-        Point3::new(xmin, ymax, zmin + r), Point3::new(xmin, ymin, zmin + r),
-    ], -UnitVec3::X));
+    specs.push(poly_spec(
+        vec![
+            Point3::new(xmin, ymin, zmax - r),
+            Point3::new(xmin, ymax, zmax - r),
+            Point3::new(xmin, ymax, zmin + r),
+            Point3::new(xmin, ymin, zmin + r),
+        ],
+        -UnitVec3::X,
+    ));
     // Right (X = xmax, outward +X)
-    specs.push(poly_spec(vec![
-        Point3::new(xmax, ymin, zmin + r), Point3::new(xmax, ymax, zmin + r),
-        Point3::new(xmax, ymax, zmax - r), Point3::new(xmax, ymin, zmax - r),
-    ], UnitVec3::X));
+    specs.push(poly_spec(
+        vec![
+            Point3::new(xmax, ymin, zmin + r),
+            Point3::new(xmax, ymax, zmin + r),
+            Point3::new(xmax, ymax, zmax - r),
+            Point3::new(xmax, ymin, zmax - r),
+        ],
+        UnitVec3::X,
+    ));
 
     // ── 7–10. Quarter-cylinder corner faces (CCW-from-+Y order: BR→TR→TL→BL) ─
     //
@@ -1068,10 +1110,10 @@ pub fn build_solid_rounded_box_xz(
     // TL  +Z   (xmin+r,zmax)   (xmin, zmax−r)
     // BL  −X   (xmin,  zmin+r) (xmin+r,zmin)
     let corner_data: [(f64, f64, UnitVec3, UnitVec3); 4] = [
-        (xmax - r, zmin + r, -UnitVec3::Z, -UnitVec3::X),  // BR: ref=−Z, right=Y×(−Z)=−X
-        (xmax - r, zmax - r,  UnitVec3::X, -UnitVec3::Z),  // TR: ref=+X, right=Y×X=−Z
-        (xmin + r, zmax - r,  UnitVec3::Z,  UnitVec3::X),  // TL: ref=+Z, right=Y×Z=+X
-        (xmin + r, zmin + r, -UnitVec3::X,  UnitVec3::Z),  // BL: ref=−X, right=Y×(−X)=+Z
+        (xmax - r, zmin + r, -UnitVec3::Z, -UnitVec3::X), // BR: ref=−Z, right=Y×(−Z)=−X
+        (xmax - r, zmax - r, UnitVec3::X, -UnitVec3::Z),  // TR: ref=+X, right=Y×X=−Z
+        (xmin + r, zmax - r, UnitVec3::Z, UnitVec3::X),   // TL: ref=+Z, right=Y×Z=+X
+        (xmin + r, zmin + r, -UnitVec3::X, UnitVec3::Z),  // BL: ref=−X, right=Y×(−X)=+Z
     ];
 
     for (cx, cz, arc_ref, right) in corner_data {
@@ -1085,12 +1127,12 @@ pub fn build_solid_rounded_box_xz(
             radius: r,
         };
         specs.push(FaceSpec {
-            geom:   FaceGeom::Cylinder(cyl),
+            geom: FaceGeom::Cylinder(cyl),
             normal: FaceNormal::Same,
             extent: FaceExtent::CylinderArcFace {
                 length: len_y,
                 arc_start_angle: 0.0,
-                arc_end_angle:  -std::f64::consts::FRAC_PI_2,
+                arc_end_angle: -std::f64::consts::FRAC_PI_2,
                 arc_ref_dir: arc_ref,
             },
         });
@@ -1121,7 +1163,10 @@ pub fn build_solid_rounded_box_xz(
             f.shell = shell_id;
         }
     }
-    let solid_id = brep.add_solid(Solid { shells: vec![shell_id], name });
+    let solid_id = brep.add_solid(Solid {
+        shells: vec![shell_id],
+        name,
+    });
     if let Some(sh) = brep.shells.get_mut(shell_id) {
         sh.solid = solid_id;
     }
@@ -1379,11 +1424,18 @@ pub fn build_solid_rounded_box(
     };
 
     // Top face — CCW when viewed from +Z
-    let top: Vec<Point3> = profile.iter().map(|&[x, y]| Point3::new(x, y, zmax)).collect();
+    let top: Vec<Point3> = profile
+        .iter()
+        .map(|&[x, y]| Point3::new(x, y, zmax))
+        .collect();
     add_poly(top, UnitVec3::Z);
 
     // Bottom face — CW when viewed from +Z (outward normal -Z)
-    let bot: Vec<Point3> = profile.iter().rev().map(|&[x, y]| Point3::new(x, y, zmin)).collect();
+    let bot: Vec<Point3> = profile
+        .iter()
+        .rev()
+        .map(|&[x, y]| Point3::new(x, y, zmin))
+        .collect();
     add_poly(bot, -UnitVec3::Z);
 
     // Side faces — one quad per polygon edge
@@ -1403,8 +1455,8 @@ pub fn build_solid_rounded_box(
         if len < 1.0e-9 {
             continue;
         }
-        let normal = UnitVec3::try_from_vec(Vec3::new(dy / len, -dx / len, 0.0))
-            .unwrap_or(UnitVec3::X);
+        let normal =
+            UnitVec3::try_from_vec(Vec3::new(dy / len, -dx / len, 0.0)).unwrap_or(UnitVec3::X);
         add_poly(vec![p0, p1, p2, p3], normal);
     }
 
@@ -1444,10 +1496,10 @@ fn rounded_rect_profile_2d(
     use std::f64::consts::{FRAC_PI_2, PI};
     // (center_x, center_y, start_angle) for SE → NE → NW → SW
     let arcs: [([f64; 2], f64); 4] = [
-        ([xmax - r, ymin + r], -FRAC_PI_2),   // SE: 270° → 360°
-        ([xmax - r, ymax - r], 0.0),           // NE: 0°   → 90°
-        ([xmin + r, ymax - r], FRAC_PI_2),    // NW: 90°  → 180°
-        ([xmin + r, ymin + r], PI),            // SW: 180° → 270°
+        ([xmax - r, ymin + r], -FRAC_PI_2), // SE: 270° → 360°
+        ([xmax - r, ymax - r], 0.0),        // NE: 0°   → 90°
+        ([xmin + r, ymax - r], FRAC_PI_2),  // NW: 90°  → 180°
+        ([xmin + r, ymin + r], PI),         // SW: 180° → 270°
     ];
     let mut pts = Vec::with_capacity(4 * n_arc);
     for ([cx, cy], start_a) in &arcs {
@@ -2132,7 +2184,11 @@ mod tests {
         let mut brep_s = BRep::new();
         build_solid_box(&mut brep_s, 0.0, 10.0, 0.0, 5.0, 0.0, 2.0, None).unwrap();
         assert_eq!(brep_r.solids.len(), brep_s.solids.len());
-        assert_eq!(brep_r.faces.len(), brep_s.faces.len(), "zero-radius rounded box must match sharp box face count");
+        assert_eq!(
+            brep_r.faces.len(),
+            brep_s.faces.len(),
+            "zero-radius rounded box must match sharp box face count"
+        );
     }
 
     /// Face count: top + bottom + 4*N_ARC side quads (N_ARC = 8 → 32 sides).
@@ -2159,8 +2215,14 @@ mod tests {
                 if !all_top && !all_bot {
                     // Side face quads span both z values
                     let zs: Vec<f64> = points.iter().map(|p| p.z).collect();
-                    assert!(zs.iter().any(|&z| (z - zmax).abs() < 1e-9), "side face must touch zmax");
-                    assert!(zs.iter().any(|&z| z.abs() < 1e-9), "side face must touch zmin");
+                    assert!(
+                        zs.iter().any(|&z| (z - zmax).abs() < 1e-9),
+                        "side face must touch zmax"
+                    );
+                    assert!(
+                        zs.iter().any(|&z| z.abs() < 1e-9),
+                        "side face must touch zmin"
+                    );
                 }
             }
         }
@@ -2203,8 +2265,14 @@ mod tests {
         let r = 0.2_f64;
         let profile = rounded_rect_profile_2d(xmin, xmax, ymin, ymax, r, 8);
         for [px, py] in &profile {
-            assert!(*px >= xmin - 1e-9 && *px <= xmax + 1e-9, "X out of bounds: {px}");
-            assert!(*py >= ymin - 1e-9 && *py <= ymax + 1e-9, "Y out of bounds: {py}");
+            assert!(
+                *px >= xmin - 1e-9 && *px <= xmax + 1e-9,
+                "X out of bounds: {px}"
+            );
+            assert!(
+                *py >= ymin - 1e-9 && *py <= ymax + 1e-9,
+                "Y out of bounds: {py}"
+            );
         }
     }
 
@@ -2237,22 +2305,36 @@ mod tests {
             }
         }
         // Allow a small number of nearly-tangent triangles at edges/corners.
-        assert!(wrong_normals < 10, "{wrong_normals} faces had inward-pointing normals");
+        assert!(
+            wrong_normals < 10,
+            "{wrong_normals} faces had inward-pointing normals"
+        );
     }
 
     /// All side faces must have exactly 4 polygon points (quads).
     #[test]
     fn rounded_box_side_faces_are_quads() {
         let mut brep = BRep::new();
-        build_solid_rounded_box(&mut brep, 0.0, 20.0, -0.5, 0.0, 0.0, 3.0, 0.2, Some("elec".into())).unwrap();
+        build_solid_rounded_box(
+            &mut brep,
+            0.0,
+            20.0,
+            -0.5,
+            0.0,
+            0.0,
+            3.0,
+            0.2,
+            Some("elec".into()),
+        )
+        .unwrap();
         let mut cap_count = 0;
         let mut side_count = 0;
         for face in brep.faces.values() {
             if let FaceExtent::Polygon { ref points } = face.extent {
                 match points.len() {
                     n if n > 4 => cap_count += 1,
-                    4          => side_count += 1,
-                    _          => panic!("unexpected polygon size {}", points.len()),
+                    4 => side_count += 1,
+                    _ => panic!("unexpected polygon size {}", points.len()),
                 }
             }
         }
@@ -2267,8 +2349,11 @@ mod tests {
     fn rounded_box_xz_face_count() {
         let mut brep = BRep::new();
         build_solid_rounded_box_xz(&mut brep, 0.0, 20.0, -0.5, 0.0, 0.0, 3.0, 0.3, None).unwrap();
-        assert_eq!(brep.faces.len(), 10,
-            "expected 10 faces (2 RoundedRectCap + 4 Polygon sides + 4 CylinderArcFace)");
+        assert_eq!(
+            brep.faces.len(),
+            10,
+            "expected 10 faces (2 RoundedRectCap + 4 Polygon sides + 4 CylinderArcFace)"
+        );
         assert_eq!(brep.solids.len(), 1);
     }
 
@@ -2285,18 +2370,20 @@ mod tests {
     fn rounded_box_xz_analytic_face_types() {
         let mut brep = BRep::new();
         build_solid_rounded_box_xz(&mut brep, 0.0, 20.0, -0.5, 0.0, 0.0, 2.0, 0.4, None).unwrap();
-        let mut caps = 0usize; let mut polys = 0usize; let mut cyls = 0usize;
+        let mut caps = 0usize;
+        let mut polys = 0usize;
+        let mut cyls = 0usize;
         for face in brep.faces.values() {
             match &face.extent {
-                FaceExtent::RoundedRectCap { .. } => caps  += 1,
-                FaceExtent::Polygon { .. }         => polys += 1,
-                FaceExtent::CylinderArcFace { .. } => cyls  += 1,
+                FaceExtent::RoundedRectCap { .. } => caps += 1,
+                FaceExtent::Polygon { .. } => polys += 1,
+                FaceExtent::CylinderArcFace { .. } => cyls += 1,
                 other => panic!("unexpected extent {:?}", other),
             }
         }
-        assert_eq!(caps,  2, "expected 2 RoundedRectCap faces");
+        assert_eq!(caps, 2, "expected 2 RoundedRectCap faces");
         assert_eq!(polys, 4, "expected 4 flat Polygon faces");
-        assert_eq!(cyls,  4, "expected 4 CylinderArcFace corners");
+        assert_eq!(cyls, 4, "expected 4 CylinderArcFace corners");
     }
 
     /// XZ-variant: cap face Y-coordinates are exactly ymin / ymax.
@@ -2305,16 +2392,26 @@ mod tests {
         let (ymin, ymax) = (-0.5_f64, 0.0_f64);
         let mut brep = BRep::new();
         build_solid_rounded_box_xz(&mut brep, 0.0, 20.0, ymin, ymax, 0.0, 3.0, 0.3, None).unwrap();
-        let cap_ys: Vec<f64> = brep.faces.values()
+        let cap_ys: Vec<f64> = brep
+            .faces
+            .values()
             .filter_map(|f| {
                 if let FaceExtent::RoundedRectCap { y, .. } = f.extent {
                     Some(y)
-                } else { None }
+                } else {
+                    None
+                }
             })
             .collect();
         assert_eq!(cap_ys.len(), 2, "expected exactly 2 cap faces");
-        assert!(cap_ys.iter().any(|&y| (y - ymin).abs() < 1e-9), "no cap at ymin={ymin}");
-        assert!(cap_ys.iter().any(|&y| (y - ymax).abs() < 1e-9), "no cap at ymax={ymax}");
+        assert!(
+            cap_ys.iter().any(|&y| (y - ymin).abs() < 1e-9),
+            "no cap at ymin={ymin}"
+        );
+        assert!(
+            cap_ys.iter().any(|&y| (y - ymax).abs() < 1e-9),
+            "no cap at ymax={ymax}"
+        );
     }
 
     /// XZ-variant: planar face normals point outward from the solid centroid.
@@ -2322,17 +2419,27 @@ mod tests {
     fn rounded_box_xz_normals_point_outward() {
         let (xmin, xmax, ymin, ymax, zmin, zmax) = (0.0_f64, 20.0, -0.5, 0.0, 0.0, 3.0);
         let mut brep = BRep::new();
-        build_solid_rounded_box_xz(&mut brep, xmin, xmax, ymin, ymax, zmin, zmax, 0.4, None).unwrap();
-        let center = Point3::new((xmin+xmax)*0.5, (ymin+ymax)*0.5, (zmin+zmax)*0.5);
+        build_solid_rounded_box_xz(&mut brep, xmin, xmax, ymin, ymax, zmin, zmax, 0.4, None)
+            .unwrap();
+        let center = Point3::new(
+            (xmin + xmax) * 0.5,
+            (ymin + ymax) * 0.5,
+            (zmin + zmax) * 0.5,
+        );
         let mut wrong = 0usize;
         for face in brep.faces.values() {
             if let FaceGeom::Plane(ref plane) = face.geom {
                 // Sample point on the plane — use plane origin.
                 let dot = plane.normal().dot_vec(plane.frame.origin - center);
-                if dot <= 0.0 { wrong += 1; }
+                if dot <= 0.0 {
+                    wrong += 1;
+                }
             }
         }
-        assert_eq!(wrong, 0, "{wrong} XZ electrode plane faces had inward normals");
+        assert_eq!(
+            wrong, 0,
+            "{wrong} XZ electrode plane faces had inward normals"
+        );
     }
 
     /// XZ-variant: side quads must have all 4 Y-coords within [ymin, ymax].
@@ -2347,8 +2454,10 @@ mod tests {
                     let ys: Vec<f64> = points.iter().map(|p| p.y).collect();
                     let has_ymin = ys.iter().any(|&y| (y - ymin).abs() < 1e-9);
                     let has_ymax = ys.iter().any(|&y| (y - ymax).abs() < 1e-9);
-                    assert!(has_ymin && has_ymax,
-                        "side quad Y coords {ys:?} don't span [{ymin}, {ymax}]");
+                    assert!(
+                        has_ymin && has_ymax,
+                        "side quad Y coords {ys:?} don't span [{ymin}, {ymax}]"
+                    );
                 }
             }
         }

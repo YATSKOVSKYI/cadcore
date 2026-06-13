@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: validate_step <file.step>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: validate_step <file.step>");
     let step = std::fs::read_to_string(&path).expect("read step");
 
     // ec_id -> Vec<(oe_id, sense)>
@@ -17,9 +19,21 @@ fn main() {
             continue;
         }
         let ec = parts[parts.len() - 2].trim().trim_start_matches('#');
-        let sense = parts[parts.len() - 1].trim().trim_end_matches(';').to_string();
+        let sense = parts[parts.len() - 1]
+            .trim()
+            .trim_end_matches(';')
+            .to_string();
         let ec_id: usize = ec.parse().ok().unwrap_or(0);
-        let oe_id: usize = line.trim().split('=').next().unwrap_or("").trim().trim_start_matches('#').parse().ok().unwrap_or(0);
+        let oe_id: usize = line
+            .trim()
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches('#')
+            .parse()
+            .ok()
+            .unwrap_or(0);
         if ec_id > 0 && oe_id > 0 {
             uses.entry(ec_id).or_default().push((oe_id, sense));
         }
@@ -29,7 +43,13 @@ fn main() {
         .lines()
         .filter_map(|l| {
             if l.contains("= EDGE_CURVE") {
-                l.trim().split('=').next()?.trim().trim_start_matches('#').parse().ok()
+                l.trim()
+                    .split('=')
+                    .next()?
+                    .trim()
+                    .trim_start_matches('#')
+                    .parse()
+                    .ok()
             } else {
                 None
             }

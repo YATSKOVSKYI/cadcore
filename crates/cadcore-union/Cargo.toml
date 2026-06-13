@@ -1,5 +1,5 @@
 [package]
-name         = "cadcore"
+name             = "cadcore-union"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
@@ -8,14 +8,14 @@ homepage.workspace   = true
 license.workspace    = true
 rust-version.workspace = true
 readme       = "README.md"
-description  = "Pure-Rust CAD geometry kernel - B-Rep topology, analytic surfaces, O(N) filament sweep, STEP AP203 export. No OCCT, no C++."
-keywords     = ["cad", "brep", "step", "geometry", "3d-printing"]
-categories   = ["science", "graphics"]
+description  = "Industrial Boolean-union engine for the cadcore CAD kernel - staged pipeline, analytic intersection oracle, refinement to emitted geometry, in-process validation gates"
+keywords     = ["cad", "brep", "boolean", "union", "geometry"]
+categories   = ["science"]
 
 [dependencies]
 cadcore-math = { path = "../cadcore-math", version = "0.1.22" }
 cadcore-geom = { path = "../cadcore-geom", version = "0.1.22" }
 cadcore-topo = { path = "../cadcore-topo", version = "0.1.22" }
-cadcore-ops  = { path = "../cadcore-ops",  version = "0.1.22" }
-cadcore-union = { path = "../cadcore-union", version = "0.1.22" }
+
+[dev-dependencies]
 cadcore-step = { path = "../cadcore-step", version = "0.1.22" }
