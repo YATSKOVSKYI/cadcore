@@ -166,12 +166,33 @@ impl<'b> Assembler<'b> {
 
     fn vertex(&mut self, p: Point3) -> VertexId {
         let k = pt_key(p, self.tol);
-        if let Some(&v) = self.verts.get(&k) {
-            return v;
+        // Neighbour-checking weld: a point within `tol` of an existing vertex
+        // can round into an ADJACENT grid cell, so scan the 27 cells around `k`
+        // and reuse any vertex within `tol`.  Without this, two faces' versions
+        // of a shared point (≈ a few 1e-4 apart at a curve's seam) straddle a
+        // cell boundary and fail to merge → unshared slivers.
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if let Some(&v) = self.verts.get(&PtKey(k.0 + dx, k.1 + dy, k.2 + dz)) {
+                        if (self.brep.vertices[v].point - p).length() < self.tol {
+                            return v;
+                        }
+                    }
+                }
+            }
         }
         let v = self.brep.add_vertex(cadcore_topo::Vertex { point: p });
         self.verts.insert(k, v);
         v
+    }
+
+    /// Snap a point to its welded vertex's canonical position, so two faces
+    /// that compute a shared point slightly differently emit IDENTICAL
+    /// polylines (and therefore identical edge keys → one shared edge).
+    fn snap(&mut self, p: Point3) -> Point3 {
+        let v = self.vertex(p);
+        self.brep.vertices[v].point
     }
 
     /// Get-or-create the shared edge for a 3-D polyline; returns the co-edge
@@ -229,8 +250,16 @@ impl<'b> Assembler<'b> {
         });
         let mut coedges: Vec<CoEdgeId> = Vec::with_capacity(steps.len());
         for step in steps {
-            // lift this step's uv polyline to 3-D in traversal order
-            let poly3: Vec<Point3> = step.pts.iter().map(|&(u, v)| domain.lift(u, v)).collect();
+            // lift this step's uv polyline to 3-D, snapping each point to its
+            // welded vertex so a shared edge is byte-identical on both faces,
+            // then drop consecutive duplicates the snap may create.
+            let mut poly3: Vec<Point3> = Vec::with_capacity(step.pts.len());
+            for &(u, v) in &step.pts {
+                let p = self.snap(domain.lift(u, v));
+                if poly3.last().map_or(true, |&q| (q - p).length() > 1e-12) {
+                    poly3.push(p);
+                }
+            }
             if poly3.len() < 2 {
                 continue;
             }

@@ -60,10 +60,82 @@ pub fn intersect_faces(a: &BRep, fa: FaceId, b: &BRep, fb: FaceId) -> Vec<SsiCur
             };
             torus_cyl(&tor, lo, hi, &cy)
         }
-        // Remaining curved pairs (torus×plane, torus×torus): to be added.
-        // Returning empty here means "no imprint yet" — safe, just incomplete.
+        (FaceGeom::Torus(_), FaceGeom::Torus(_)) => {
+            let (Some((ta, alo, ahi)), Some((tb, blo, bhi))) = (torus_arc(a, fa), torus_arc(b, fb))
+            else {
+                return Vec::new();
+            };
+            torus_torus(&ta, alo, ahi, &tb, blo, bhi)
+        }
+        (FaceGeom::Plane(pl), FaceGeom::Torus(_)) if std::env::var("CADCORE_PT").is_ok() => {
+            let Some((tor, lo, hi)) = torus_arc(b, fb) else { return Vec::new() };
+            plane_torus(pl, region_polygon(a, fa), &tor, lo, hi)
+        }
+        (FaceGeom::Torus(_), FaceGeom::Plane(pl)) if std::env::var("CADCORE_PT").is_ok() => {
+            let Some((tor, lo, hi)) = torus_arc(a, fa) else { return Vec::new() };
+            plane_torus(pl, region_polygon(b, fb), &tor, lo, hi)
+        }
+        // Remaining curved pair: none left for the scaffold primitives.
         _ => Vec::new(),
     }
+}
+
+/// Torus×Torus intersection via the tracer, seeded by sampling torus A's arc
+/// surface and refining onto both tori.  Exact, smooth closed loops shared by
+/// both faces; de-duplicated by centroid.
+fn torus_torus(
+    ta: &TorusSurf,
+    alo: f64,
+    ahi: f64,
+    tb: &TorusSurf,
+    blo: f64,
+    bhi: f64,
+) -> Vec<SsiCurve> {
+    use crate::geom::intersect::{intersection_point_near, trace_closed_loop, TraceOptions};
+    use crate::geom::refine::AnalyticSurface;
+    let sa = AnalyticSurface::Torus(*ta);
+    let sb = AnalyticSurface::Torus(*tb);
+    // Two doubly-curved tori make the cyclic-projection corrector less stable
+    // than torus×cylinder; a smaller step keeps the predictor near the curve.
+    let opts = TraceOptions { step: 0.02, ..TraceOptions::default() };
+    let mut out: Vec<SsiCurve> = Vec::new();
+    // de-dup signature: (centroid, mean radius from centroid).  Two COAXIAL
+    // intersection circles share a centroid (on the axis) but differ in radius,
+    // so centroid alone would wrongly merge them.
+    let mut sigs: Vec<(Point3, f64)> = Vec::new();
+    // sample torus A's surface over its arc × full minor circle for seeds.
+    let m = 48;
+    let n = 32;
+    for i in 0..=m {
+        let theta = alo + (ahi - alo) * (i as f64 / m as f64);
+        for j in 0..n {
+            let phi = std::f64::consts::TAU * (j as f64 / n as f64);
+            let p = ta.point_at(theta, phi);
+            if sb.distance(p) > 0.5 * ta.minor_radius {
+                continue; // far from torus B — not near an intersection
+            }
+            let Some(seed) = intersection_point_near(&sa, &sb, p, 1e-12) else { continue };
+            let Some(curve) = trace_closed_loop(&sa, &sb, seed, &opts) else { continue };
+            if curve.points.len() < 3 {
+                continue;
+            }
+            let c = curve.points.iter().fold(Point3::new(0.0, 0.0, 0.0), |a, &q| {
+                a + (q - Point3::new(0.0, 0.0, 0.0)) * (1.0 / curve.points.len() as f64)
+            });
+            let mr = curve.points.iter().map(|&q| (q - c).length()).sum::<f64>() / curve.points.len() as f64;
+            let tol = 0.5 * ta.minor_radius;
+            if sigs.iter().any(|&(q, r)| (q - c).length() < tol && (r - mr).abs() < tol) {
+                continue;
+            }
+            sigs.push((c, mr));
+            // Clip the traced loop to BOTH tori's θ-arcs: a crossing keeps the
+            // whole closed loop, while coaxial/stacked tori meet in a circle
+            // that wraps the full major angle — each θ-arc face keeps only an
+            // open arc of it.
+            out.extend(clip_loop_to_arcs(&curve.points, ta, alo, ahi, tb, blo, bhi));
+        }
+    }
+    out
 }
 
 /// Torus×Cylinder intersection.  Marching squares locates each loop and seeds
@@ -113,6 +185,123 @@ fn torus_cyl(tor: &TorusSurf, theta_lo: f64, theta_hi: f64, cy: &CylSurf) -> Vec
     out
 }
 
+/// Plane×Torus intersection (an end cap cutting a neighbouring torus tube):
+/// trace the planar section of the torus, clipped to the torus's θ-arc AND the
+/// cap's disk polygon.  Open arcs where it exits either.
+fn plane_torus(plane: &Plane3, poly: Option<Vec<Point3>>, tor: &TorusSurf, lo: f64, hi: f64) -> Vec<SsiCurve> {
+    use crate::geom::intersect::{intersection_point_near, trace_closed_loop, TraceOptions};
+    use crate::geom::refine::AnalyticSurface;
+    let Some(poly) = poly else { return Vec::new() };
+    let sa = AnalyticSurface::Plane(*plane);
+    let sb = AnalyticSurface::Torus(*tor);
+    let opts = TraceOptions { step: 0.02, ..TraceOptions::default() };
+    let to_uv = |q: Point3| {
+        let w = q - plane.frame.origin;
+        (plane.frame.x.dot_vec(w), plane.frame.y.dot_vec(w))
+    };
+    let poly2: Vec<(f64, f64)> = poly.iter().map(|&q| to_uv(q)).collect();
+    let theta_t = |p: Point3| {
+        let w = p - tor.frame.origin;
+        tor.frame.y.dot_vec(w).atan2(tor.frame.x.dot_vec(w))
+    };
+    let in_arc = |th: f64| (th - lo).rem_euclid(std::f64::consts::TAU) <= (hi - lo) + 1e-9;
+
+    let mut out: Vec<SsiCurve> = Vec::new();
+    let mut sigs: Vec<(Point3, f64)> = Vec::new();
+    let m = 64;
+    let nn = 48;
+    for i in 0..=m {
+        let theta = lo + (hi - lo) * (i as f64 / m as f64);
+        for j in 0..nn {
+            let phi = std::f64::consts::TAU * (j as f64 / nn as f64);
+            let p = tor.point_at(theta, phi);
+            if sa.distance(p) > 0.3 * tor.minor_radius || !point_in_polygon_2d(&poly2, to_uv(p)) {
+                continue;
+            }
+            let Some(seed) = intersection_point_near(&sa, &sb, p, 1e-12) else { continue };
+            let Some(curve) = trace_closed_loop(&sa, &sb, seed, &opts) else { continue };
+            if curve.points.len() < 3 {
+                continue;
+            }
+            let c = curve.points.iter().fold(Point3::new(0.0, 0.0, 0.0), |a, &q| a + (q - Point3::new(0.0, 0.0, 0.0)) * (1.0 / curve.points.len() as f64));
+            let mr = curve.points.iter().map(|&q| (q - c).length()).sum::<f64>() / curve.points.len() as f64;
+            let tol = 0.5 * tor.minor_radius;
+            if sigs.iter().any(|&(q, r)| (q - c).length() < tol && (r - mr).abs() < tol) {
+                continue;
+            }
+            sigs.push((c, mr));
+            // clip the traced section to the torus θ-arc AND the cap disk.
+            let n = curve.points.len();
+            let inside: Vec<bool> = curve.points.iter().map(|&p| in_arc(theta_t(p)) && point_in_polygon_2d(&poly2, to_uv(p))).collect();
+            if inside.iter().all(|&b| b) {
+                out.push(SsiCurve { points: curve.points, closed: true });
+                continue;
+            }
+            if inside.iter().all(|&b| !b) {
+                continue;
+            }
+            let Some(start) = (0..n).find(|&k| inside[k] && !inside[(k + n - 1) % n]) else { continue };
+            let mut cur: Vec<Point3> = Vec::new();
+            for k in 0..=n {
+                let idx = (start + k) % n;
+                if inside[idx] {
+                    cur.push(curve.points[idx]);
+                } else if cur.len() >= 2 {
+                    out.push(SsiCurve { points: std::mem::take(&mut cur), closed: false });
+                } else {
+                    cur.clear();
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Keep the part of a closed loop where both tori's major angle θ lies in their
+/// arc.  Fully-inside ⇒ one closed curve; otherwise the inside runs as open
+/// arcs.
+fn clip_loop_to_arcs(
+    pts: &[Point3],
+    ta: &TorusSurf,
+    alo: f64,
+    ahi: f64,
+    tb: &TorusSurf,
+    blo: f64,
+    bhi: f64,
+) -> Vec<SsiCurve> {
+    let theta = |t: &TorusSurf, p: Point3| {
+        let w = p - t.frame.origin;
+        t.frame.y.dot_vec(w).atan2(t.frame.x.dot_vec(w))
+    };
+    let in_arc = |th: f64, lo: f64, hi: f64| (th - lo).rem_euclid(std::f64::consts::TAU) <= (hi - lo) + 1e-9;
+    let inside_p = |p: Point3| in_arc(theta(ta, p), alo, ahi) && in_arc(theta(tb, p), blo, bhi);
+    let n = pts.len();
+    let inside: Vec<bool> = pts.iter().map(|&p| inside_p(p)).collect();
+    if inside.iter().all(|&b| b) {
+        return vec![SsiCurve { points: pts.to_vec(), closed: true }];
+    }
+    if inside.iter().all(|&b| !b) {
+        return Vec::new();
+    }
+    let start = (0..n).find(|&i| inside[i] && !inside[(i + n - 1) % n]);
+    let Some(start) = start else { return Vec::new() };
+    let mut arcs = Vec::new();
+    let mut cur: Vec<Point3> = Vec::new();
+    for k in 0..=n {
+        let i = (start + k) % n;
+        if inside[i] {
+            cur.push(pts[i]);
+        } else if !cur.is_empty() {
+            if cur.len() >= 2 {
+                arcs.push(SsiCurve { points: std::mem::take(&mut cur), closed: false });
+            } else {
+                cur.clear();
+            }
+        }
+    }
+    arcs
+}
+
 /// The torus arc of a face: `(TorusSurf, theta_lo, theta_hi)` from the
 /// `TorusFillet` template or — for a `Trimmed` torus — its loop vertices.
 fn torus_arc(brep: &BRep, fid: FaceId) -> Option<(TorusSurf, f64, f64)> {
@@ -123,6 +312,10 @@ fn torus_arc(brep: &BRep, fid: FaceId) -> Option<(TorusSurf, f64, f64)> {
         surf.frame.y.dot_vec(w).atan2(surf.frame.x.dot_vec(w))
     };
     if let FaceExtent::TorusFillet { start_circle, end_circle } = &f.extent {
+        // full torus (start == end circle) ⇒ θ ∈ [0, 2π].
+        if (start_circle.frame.origin - end_circle.frame.origin).length() < 1e-6 {
+            return Some((*surf, 0.0, std::f64::consts::TAU));
+        }
         let lo = theta_of(start_circle.frame.origin);
         let mut hi = theta_of(end_circle.frame.origin);
         hi += std::f64::consts::TAU * ((lo - hi) / std::f64::consts::TAU).round();
@@ -151,6 +344,11 @@ fn cyl_cyl(ca: CylSurf, len_a: Option<f64>, cb: CylSurf, len_b: Option<f64>) -> 
     let (Some(len_a), Some(len_b)) = (len_a, len_b) else {
         return Vec::new();
     };
+    // PARALLEL tubes (filaments lying on each other): the surfaces meet in two
+    // straight RULING lines, not a closed loop — the tracer would find nothing.
+    if ca.axis().dot(cb.axis()).abs() > 1.0 - 1e-7 {
+        return parallel_cyl_cyl(&ca, len_a, &cb, len_b);
+    }
     use crate::geom::composite::{closed_loops_between, CompositeTube};
     use crate::geom::intersect::TraceOptions;
     let ta = CompositeTube::new().with_leg(ca, len_a);
@@ -160,6 +358,30 @@ fn cyl_cyl(ca: CylSurf, len_a: Option<f64>, cb: CylSurf, len_b: Option<f64>) -> 
         .filter(|c| c.points.len() >= 3)
         .map(|c| SsiCurve { points: c.points, closed: true })
         .collect()
+}
+
+/// Two parallel overlapping cylinders → the two ruling lines, each clipped to
+/// the axial overlap of both bands.  Open segments (run rim-to-rim when the
+/// bands coincide), shared by both faces.
+fn parallel_cyl_cyl(ca: &CylSurf, len_a: f64, cb: &CylSurf, len_b: f64) -> Vec<SsiCurve> {
+    let axis = ca.axis();
+    let mut out = Vec::new();
+    for line in cadcore_geom::cyl_cyl_parallel_lines(ca, cb) {
+        // axial coord on each cylinder of the line at t=0, slope is 1 along axis.
+        // axial coord on each cylinder is (offset + t); valid t keeps both in
+        // their band: t ∈ [max(−a0,−b0), min(len_a−a0, len_b−b0)].
+        let a0 = axis.dot_vec(line.origin - ca.frame.origin);
+        let b0 = ca.axis().dot_vec(line.origin - cb.frame.origin);
+        let lo = (-a0).max(-b0);
+        let hi = (len_a - a0).min(len_b - b0);
+        if hi - lo > 1e-9 {
+            out.push(SsiCurve {
+                points: vec![line.origin + axis.as_vec() * lo, line.origin + axis.as_vec() * hi],
+                closed: false,
+            });
+        }
+    }
+    out
 }
 
 /// The cylinder band of a face: a [`CylSurf`] whose `frame.origin` sits at the
@@ -212,8 +434,23 @@ fn cyl_band(brep: &BRep, fid: FaceId) -> Option<(CylSurf, f64)> {
 /// outer loop (so the **output of a previous union** — `FaceExtent::Trimmed`
 /// planar faces — can feed the next union: the algebra closes).
 fn region_polygon(brep: &BRep, fid: FaceId) -> Option<Vec<Point3>> {
-    if let FaceExtent::Polygon { points } = &brep.faces[fid].extent {
-        return Some(points.clone());
+    let f = &brep.faces[fid];
+    match (&f.geom, &f.extent) {
+        (_, FaceExtent::Polygon { points }) => return Some(points.clone()),
+        // A disk cap (no real loops): sample its boundary circle as a polygon
+        // so it can clip a plane×cylinder conic (e.g. a stacked tube's end cap
+        // cutting the neighbouring tube).
+        (FaceGeom::Plane(pl), FaceExtent::Disk { radius }) => {
+            return Some(
+                (0..48)
+                    .map(|k| {
+                        let a = std::f64::consts::TAU * k as f64 / 48.0;
+                        pl.frame.origin + (pl.frame.x * a.cos() + pl.frame.y * a.sin()) * *radius
+                    })
+                    .collect(),
+            );
+        }
+        _ => {}
     }
     // walk the outer loop into a 3-D polygon
     let f = &brep.faces[fid];
@@ -317,32 +554,52 @@ fn plane_cylinder(
     };
     let conic = cadcore_geom::cyl_plane_intersection(cyl, plane);
     let pts: Vec<Point3> = match &conic {
-        CylPlaneCurve::Circle(c) => (0..64).map(|i| c.point_at(i as f64 / 64.0 * std::f64::consts::TAU)).collect(),
-        CylPlaneCurve::Ellipse(e) => (0..64).map(|i| e.point_at(i as f64 / 64.0 * std::f64::consts::TAU)).collect(),
+        CylPlaneCurve::Circle(c) => (0..96).map(|i| c.point_at(i as f64 / 96.0 * std::f64::consts::TAU)).collect(),
+        CylPlaneCurve::Ellipse(e) => (0..96).map(|i| e.point_at(i as f64 / 96.0 * std::f64::consts::TAU)).collect(),
         // Lines (plane ∥ axis) — deferred.
         _ => return Vec::new(),
     };
-    // every sample must lie inside the planar polygon …
     let to_uv = |q: Point3| {
         let w = q - plane.frame.origin;
         (plane.frame.x.dot_vec(w), plane.frame.y.dot_vec(w))
     };
     let poly2: Vec<(f64, f64)> = poly.iter().map(|&q| to_uv(q)).collect();
-    if !pts.iter().all(|&p| point_in_polygon_2d(&poly2, to_uv(p))) {
-        return Vec::new(); // conic crosses the polygon boundary — partial arc, deferred
-    }
-    // … and within the cylinder's axial band.
     let axis = cyl.axis();
-    if !pts
+    // a sample is "in" when it lies inside the plane polygon AND the cyl band.
+    let inside: Vec<bool> = pts
         .iter()
-        .all(|&p| {
+        .map(|&p| {
             let v = axis.dot_vec(p - cyl.frame.origin);
-            v >= -1e-9 && v <= length + 1e-9
+            v >= -1e-9 && v <= length + 1e-9 && point_in_polygon_2d(&poly2, to_uv(p))
         })
-    {
-        return Vec::new();
+        .collect();
+    if inside.iter().all(|&b| b) {
+        return vec![SsiCurve { points: pts, closed: true }]; // fully contained loop
     }
-    vec![SsiCurve { points: pts, closed: true }]
+    if inside.iter().all(|&b| !b) {
+        return Vec::new(); // no overlap
+    }
+    // PARTIAL: keep the maximal runs of in-samples as open arcs (the conic
+    // clipped to the polygon / band — e.g. a stacked tube's end cap cutting its
+    // neighbour).  The shared sample points weld on both faces.
+    let n = pts.len();
+    let start = (0..n).find(|&i| inside[i] && !inside[(i + n - 1) % n]);
+    let Some(start) = start else { return Vec::new() };
+    let mut arcs = Vec::new();
+    let mut cur: Vec<Point3> = Vec::new();
+    for k in 0..=n {
+        let i = (start + k) % n;
+        if inside[i] {
+            cur.push(pts[i]);
+        } else if !cur.is_empty() {
+            if cur.len() >= 2 {
+                arcs.push(SsiCurve { points: std::mem::take(&mut cur), closed: false });
+            } else {
+                cur.clear();
+            }
+        }
+    }
+    arcs
 }
 
 /// Solve the linear system of three plane equations `ni·x = di` for x.

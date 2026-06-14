@@ -61,9 +61,11 @@ pub fn arrange_and_classify_with(
     inside_other: &dyn Fn(Point3) -> bool,
 ) -> Vec<ClassifiedCell> {
     // A plane has no periodic axis → use the plain (non-periodic) DCEL, so
-    // boundary circles are NOT split by a phantom seam (which would fragment
-    // a cap differently from its mating cylinder rim → unshared edges).
-    let plane = matches!(domain, FaceDomain::Plane { .. });
+    // boundary circles are NOT split by a phantom seam.  A full-donut TorusBand
+    // is likewise treated non-periodically: it is cut at BOTH the θ-seam and
+    // the φ-seam into a [0,2π]² rectangle whose seam edges weld (a 2-periodic
+    // surface can't be handled by the single-seam periodic DCEL).
+    let plane = matches!(domain, FaceDomain::Plane { .. } | FaceDomain::TorusBand { .. });
     let (periodic_axis, period) = domain.periodic_axis();
     let open = domain.open_range();
 

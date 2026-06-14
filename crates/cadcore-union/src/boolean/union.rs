@@ -97,13 +97,20 @@ pub fn union_n(solids: &[(&BRep, &[FaceId])], knit: f64) -> Option<(BRep, ShellI
         }
     }
 
+    // Triple-point registry: weld the ENDPOINTS of all SSI curves so that
+    // several curves meeting at a triple point (two surfaces ∩ a cap plane —
+    // e.g. a ruling line and an end-cap arc on parallel tubes) share the exact
+    // same vertex.  Otherwise their endpoints differ by the sampling jitter,
+    // the DCEL leaves dangling edges, and the face never splits.
+    snap_ssi_endpoints(&mut ssi, 0.03);
+
     // imprint + classify (outside EVERY other solid) + stitch, one assembler.
     let mut out = BRep::new();
     // Weld tolerance: merges the residual seam-interpolation noise that
     // `build_periodic_u` leaves at a curve's high-curvature turns (up to a few
     // 1e-4 where two periodic carriers meet, e.g. torus×cylinder), while
     // staying far below the curves' real sample spacing (~1e-2).
-    let weld = knit.clamp(1e-4, 1e-2);
+    let weld = knit.clamp(5e-4, 1e-2);
     let mut asm = Assembler::new(&mut out, weld);
     for i in 0..n {
         let (bi, fi) = solids[i];
@@ -177,19 +184,155 @@ fn emit_solid_faces(
             }
         }
 
+        // A full-donut TorusBand is arranged non-periodically in θ, so every
+        // chain's θ must be continuous (no atan2 ±π jump): unwrap each chain's
+        // u onto the branch nearest its previous point.
+        if matches!(domain, FaceDomain::TorusBand { .. }) {
+            let tau = std::f64::consts::TAU;
+            for ch in &mut chains {
+                for i in 1..ch.pts.len() {
+                    let du = ch.pts[i].0 - ch.pts[i - 1].0;
+                    ch.pts[i].0 -= tau * (du / tau).round();
+                    let dv = ch.pts[i].1 - ch.pts[i - 1].1;
+                    ch.pts[i].1 -= tau * (dv / tau).round();
+                }
+                // An SSI loop that wraps the full ring (every θ, with φ = v(θ) —
+                // coaxial stack: constant v; offset stack: a varying band) is a
+                // chord spanning the [0,2π]² rectangle left→right.  Whichever way
+                // it was traced, rebuild it as v(u) sampled cleanly on u∈[0,2π]
+                // so it touches BOTH θ-seams (welds) and carries the true φ.
+                if ch.tag >= 1000 {
+                    let umin = ch.pts.iter().cloned().fold(f64::MAX, |m, p| m.min(p.0));
+                    let umax = ch.pts.iter().cloned().fold(f64::MIN, |m, p| m.max(p.0));
+                    if umax - umin >= tau - 0.25 {
+                        ch.pts = resample_fullwrap_chord(&ch.pts, 96);
+                    }
+                }
+            }
+        }
+
+        if std::env::var("CADCORE_DUMP_CHAINS").is_ok() && matches!(domain, FaceDomain::TorusBand { .. }) {
+            for ch in &chains {
+                let us: Vec<f64> = ch.pts.iter().map(|p| p.0).collect();
+                let vs: Vec<f64> = ch.pts.iter().map(|p| p.1).collect();
+                let closed = ch.pts.len() >= 2 && (ch.pts[0].0 - ch.pts[ch.pts.len()-1].0).abs() < 1e-6 && (ch.pts[0].1 - ch.pts[ch.pts.len()-1].1).abs() < 1e-6;
+                eprintln!("  chain tag={} n={} closed={} u[{:.2}..{:.2}] v[{:.2}..{:.2}]", ch.tag, ch.pts.len(), closed,
+                    us.iter().cloned().fold(f64::MAX, f64::min), us.iter().cloned().fold(f64::MIN, f64::max),
+                    vs.iter().cloned().fold(f64::MAX, f64::min), vs.iter().cloned().fold(f64::MIN, f64::max));
+            }
+        }
+
         let cells = arrange_and_classify_with(&domain, &chains, 1e-3, inside_other);
         if std::env::var("CADCORE_DUMP_UNION").is_ok() {
-            let kind = match &f.geom {
-                FaceGeom::Plane(_) => "plane", FaceGeom::Cylinder(_) => "cyl",
-                FaceGeom::Torus(_) => "TORUS", FaceGeom::Sphere(_) => "sphere",
-            };
-            eprintln!("face {:?} {}: ssi={} cells={} kept={}", fid, kind,
-                ssi.get(&fid).map(|v| v.len()).unwrap_or(0), cells.len(),
-                cells.iter().filter(|c| c.keep).count());
+            let k = match &f.geom { FaceGeom::Plane(_) => "plane", FaceGeom::Cylinder(_) => "cyl", FaceGeom::Torus(_) => "TORUS", FaceGeom::Sphere(_) => "sph" };
+            eprintln!("face {:?} {}: bchains={} ssi={} cells={} kept={}", fid, k,
+                chains.len() - ssi.get(&fid).map(|v| v.len()).unwrap_or(0),
+                ssi.get(&fid).map(|v| v.len()).unwrap_or(0), cells.len(), cells.iter().filter(|c| c.keep).count());
         }
         for cell in cells {
             if cell.keep {
                 asm.emit_cell(&domain, f.geom.clone(), f.normal, &cell);
+            }
+        }
+    }
+}
+
+/// Resample a θ-wrapping SSI loop (uv points, u already unwrapped) into a clean
+/// chord on `u ∈ [0, 2π]` carrying the true `v = φ(u)`.  The loop wraps θ once
+/// (possibly traced backwards or in a shifted ±2π window); we fold u back into a
+/// single period, sort, and linearly interpolate `v` at a uniform u-grid with a
+/// periodic wrap so both endpoints land exactly on the θ-seams (u=0 and u=2π)
+/// with the same v — making the chord weld to both seam edges of the rectangle.
+fn resample_fullwrap_chord(pts: &[(f64, f64)], n: usize) -> Vec<(f64, f64)> {
+    let tau = std::f64::consts::TAU;
+    let mut s: Vec<(f64, f64)> = pts.iter().map(|&(u, v)| (u.rem_euclid(tau), v)).collect();
+    s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    s.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9);
+    if s.len() < 2 {
+        let v = pts.iter().map(|p| p.1).sum::<f64>() / pts.len().max(1) as f64;
+        return (0..=n).map(|k| (k as f64 / n as f64 * tau, v)).collect();
+    }
+    // Extend by one wrapped sample on each side so u=0 and u=2π are bracketed.
+    let first = *s.first().unwrap();
+    let last = *s.last().unwrap();
+    let mut ext = Vec::with_capacity(s.len() + 2);
+    ext.push((last.0 - tau, last.1));
+    ext.extend_from_slice(&s);
+    ext.push((first.0 + tau, first.1));
+    (0..=n)
+        .map(|k| {
+            let u = k as f64 / n as f64 * tau;
+            let mut v = ext[0].1;
+            for w in ext.windows(2) {
+                if u >= w[0].0 - 1e-12 && u <= w[1].0 + 1e-12 {
+                    let d = w[1].0 - w[0].0;
+                    let t = if d.abs() < 1e-12 { 0.0 } else { (u - w[0].0) / d };
+                    v = w[0].1 + t * (w[1].1 - w[0].1);
+                    break;
+                }
+            }
+            (u, v)
+        })
+        .collect()
+}
+
+/// Weld the endpoints of every SSI curve (across ALL solids' faces) onto a
+/// shared set of representative points within `tol`.  Curves that meet at a
+/// triple point then carry the IDENTICAL endpoint, so the per-face DCEL
+/// connects them instead of leaving dangling edges.
+fn snap_ssi_endpoints(ssi: &mut [HashMap<FaceId, Vec<SsiCurve>>], tol: f64) {
+    // 1) gather every endpoint, tagged exact (from a 2-point curve — a straight
+    //    ruling line whose ends ARE the true triple points) or approximate
+    //    (from a sampled arc).
+    let mut pts: Vec<(Point3, bool)> = Vec::new();
+    for map in ssi.iter() {
+        for curves in map.values() {
+            for c in curves.iter() {
+                if c.points.len() >= 2 {
+                    let exact = c.points.len() == 2;
+                    pts.push((c.points[0], exact));
+                    pts.push((*c.points.last().unwrap(), exact));
+                }
+            }
+        }
+    }
+    if pts.is_empty() {
+        return;
+    }
+    // 2) build representatives DETERMINISTICALLY, preferring EXACT endpoints so
+    //    sampled arc ends snap onto the true triple points (not vice versa).
+    pts.sort_by(|a, b| {
+        (!a.1, a.0.x, a.0.y, a.0.z)
+            .partial_cmp(&(!b.1, b.0.x, b.0.y, b.0.z))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut reps: Vec<Point3> = Vec::new();
+    for &(p, _) in &pts {
+        if !reps.iter().any(|&r| (r - p).length() < tol) {
+            reps.push(p);
+        }
+    }
+    // 3) snap each curve endpoint to its nearest representative within tol.
+    let nearest = |p: Point3| -> Point3 {
+        reps.iter()
+            .copied()
+            .filter(|&r| (r - p).length() < tol)
+            .min_by(|&u, &v| {
+                (u - p)
+                    .length()
+                    .partial_cmp(&(v - p).length())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(p)
+    };
+    for map in ssi.iter_mut() {
+        for curves in map.values_mut() {
+            for c in curves.iter_mut() {
+                let m = c.points.len();
+                if m >= 2 {
+                    c.points[0] = nearest(c.points[0]);
+                    c.points[m - 1] = nearest(c.points[m - 1]);
+                }
             }
         }
     }
@@ -314,6 +457,13 @@ fn face_domain(brep: &BRep, fid: FaceId) -> Option<FaceDomain> {
             Some(FaceDomain::CylinderBand { surf: shifted, length: hi - lo })
         }
         (FaceGeom::Torus(surf), ext) => {
+            // FULL torus (a donut): start_circle == end_circle ⇒ θ wraps the
+            // whole 2π — use the θ-periodic, φ-open band.
+            if let FaceExtent::TorusFillet { start_circle, end_circle } = ext {
+                if (start_circle.frame.origin - end_circle.frame.origin).length() < 1e-6 {
+                    return Some(FaceDomain::TorusBand { surf: *surf });
+                }
+            }
             let theta_of = |p: Point3| {
                 let w = p - surf.frame.origin;
                 surf.frame.y.dot_vec(w).atan2(surf.frame.x.dot_vec(w))
@@ -445,6 +595,26 @@ fn synthesize_boundary(brep: &BRep, fid: FaceId, domain: &FaceDomain) -> Vec<Vec
             } else {
                 Vec::new()
             }
+        }
+        // FULL torus (TorusBand, non-periodic [0,2π]²): cut at BOTH seams.
+        // φ-seam = outer-equator circle at v=0 and v=2π; θ-seam = the minor
+        // circle at u=0 and u=2π.  Each seam's two copies are the SAME 3-D
+        // circle, so they weld and close the donut in both θ and φ.
+        FaceExtent::TorusFillet { start_circle, end_circle }
+            if (start_circle.frame.origin - end_circle.frame.origin).length() < 1e-6 =>
+        {
+            // Built DIRECTLY in (θ,φ) so all four rectangle corners are the
+            // single 3-D seam point (θ=0,φ=0) and align exactly.  φ-seam = the
+            // φ=0/2π circles (constant v); θ-seam = the θ=0/2π circles (const u).
+            let tau = std::f64::consts::TAU;
+            let thetas: Vec<f64> = (0..=96).map(|k| k as f64 / 96.0 * tau).collect();
+            let phis: Vec<f64> = (0..=64).map(|k| k as f64 / 64.0 * tau).collect();
+            vec![
+                thetas.iter().map(|&th| (th, 0.0)).collect(),
+                thetas.iter().map(|&th| (th, tau)).collect(),
+                phis.iter().map(|&ph| (0.0, ph)).collect(),
+                phis.iter().map(|&ph| (tau, ph)).collect(),
+            ]
         }
         _ => Vec::new(),
     }

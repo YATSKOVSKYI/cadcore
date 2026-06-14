@@ -467,6 +467,10 @@ fn union_filament_elbow_exports_manifold_step() {
         faces
     }
 
+    // Pass-through case (crosser hits a LEG, elbow carried whole): this is the
+    // OCC-valid torus example.  The torus-CUT case is watertight at the B-Rep
+    // level (`union_cylinder_cuts_torus_elbow`) but its windowed B-spline torus
+    // is not yet emittable by the STEP writer ("Unorientable" inner loop).
     let fil = Filament::serpentine(
         &[Point3::new(-2.0, 0.0, 0.0), Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 2.0, 0.0)],
         0.3, 0.5,
@@ -491,6 +495,137 @@ fn union_filament_elbow_exports_manifold_step() {
     assert!(step.contains("CLOSED_SHELL"));
     assert!(step.contains("TOROIDAL_SURFACE") || step.contains("B_SPLINE_SURFACE"), "elbow torus emitted");
     println!("union filament+elbow with crosser: {} bytes (OCC-valid; see note)", step.len());
+
+    // torus-CUT variant (crosser through the elbow): watertight B-Rep, but the
+    // windowed B-spline torus is "Unorientable" in OCC — staged for inspection.
+    let th = 0.5 * (fil.elbows[0].theta_lo + fil.elbows[0].theta_hi);
+    let tor = fil.elbows[0].surf;
+    let ring = tor.frame.origin + (tor.frame.x * th.cos() + tor.frame.y * th.sin()) * tor.major_radius;
+    let mut bc = BRep::new();
+    let fbc = capped_cylinder(&mut bc, Point3::new(ring.x, ring.y, -1.0), UnitVec3::Z, 0.2, 2.0);
+    let (outc, _s) = union(&a, &fa, &bc, &fbc, 1e-6);
+    let stepc = cadcore_step::brep_to_step(&outc).expect("write step");
+    let outpc = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../repro/newengine_union_cut_elbow.step");
+    let _ = std::fs::write(&outpc, &stepc);
+    assert!(stepc.contains("CLOSED_SHELL"));
+    println!("union CUT elbow: {} bytes (watertight B-Rep; torus face Unorientable in OCC)", stepc.len());
+}
+
+#[test]
+fn union_torus_on_torus_exports_step() {
+    use cadcore_geom::{Circle3, Plane3, TorusSurf};
+    use cadcore_topo::{FaceId, Shell};
+    use cadcore_union::arrange::assembly::Assembler;
+    use cadcore_union::boolean::union;
+    use std::f64::consts::FRAC_PI_2;
+
+    fn capped_torus_arc(brep: &mut BRep, tor: TorusSurf, lo: f64, hi: f64) -> Vec<FaceId> {
+        let minor = |theta: f64| -> (Circle3, UnitVec3) {
+            let (s, c) = theta.sin_cos();
+            let ring = tor.frame.x * c + tor.frame.y * s;
+            let centre = tor.frame.origin + ring * tor.major_radius;
+            let tangent = UnitVec3::try_from_vec(tor.frame.x.as_vec() * -s + tor.frame.y.as_vec() * c).unwrap();
+            (Circle3::new(centre, tangent, tor.minor_radius), tangent)
+        };
+        let (clo, tlo) = minor(lo);
+        let (chi, thi) = minor(hi);
+        let mut asm = Assembler::new(brep, 1e-7);
+        asm.emit_torus_fillet(tor, clo, chi);
+        asm.emit_disk_cap(Plane3::from_origin_normal(clo.frame.origin, UnitVec3::try_from_vec(tlo.as_vec() * -1.0).unwrap()), clo);
+        asm.emit_disk_cap(Plane3::from_origin_normal(chi.frame.origin, thi), chi);
+        let faces = asm.faces().to_vec();
+        let shell = brep.add_shell(Shell { faces: faces.clone(), is_outer: true, solid: Default::default() });
+        for &f in &faces { brep.faces[f].shell = shell; }
+        faces
+    }
+
+    let r = 0.8 / 2_f64.sqrt();
+    let mut a = BRep::new();
+    let fa = capped_torus_arc(&mut a, TorusSurf::new(Point3::new(0.0, 0.0, 0.0), UnitVec3::Z, 0.8, 0.3), 0.0, FRAC_PI_2);
+    let mut b = BRep::new();
+    let fb = capped_torus_arc(&mut b, TorusSurf::new(Point3::new(-r, r + 0.8, 0.18), UnitVec3::X, 0.8, 0.3), FRAC_PI_2 - 1.0, FRAC_PI_2 + 1.0);
+
+    let (out, _shell) = union(&a, &fa, &b, &fb, 1e-6);
+    let step = cadcore_step::brep_to_step(&out).expect("write step");
+    assert!(step.contains("CLOSED_SHELL"));
+    let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../repro/newengine_union_torus_on_torus.step");
+    let _ = std::fs::write(&outp, &step);
+    println!("union torus-on-torus: {} bytes", step.len());
+}
+
+#[test]
+fn union_stacked_donuts_exports_step() {
+    use cadcore_geom::{Circle3, TorusSurf};
+    use cadcore_topo::{Face, FaceExtent, FaceGeom, FaceId, FaceNormal, Shell};
+    use cadcore_union::boolean::union;
+
+    // A full donut (no caps): one toroidal face whose θ-seam circle is shared
+    // (start_circle == end_circle), so θ wraps the whole ring.
+    fn donut(brep: &mut BRep, tor: TorusSurf) -> Vec<FaceId> {
+        let ring = tor.frame.x;
+        let centre = tor.frame.origin + ring * tor.major_radius;
+        let mc = Circle3::new(centre, tor.frame.y, tor.minor_radius);
+        let face = brep.add_face(Face {
+            geom: FaceGeom::Torus(tor), normal: FaceNormal::Same,
+            outer_loop: Default::default(), inner_loops: Vec::new(), shell: Default::default(),
+            extent: FaceExtent::TorusFillet { start_circle: mc, end_circle: mc },
+        });
+        let shell = brep.add_shell(Shell { faces: vec![face], is_outer: true, solid: Default::default() });
+        brep.faces[face].shell = shell;
+        vec![face]
+    }
+
+    // Two coaxial donuts stacked along Z, tubes overlapping (gap 0.4 < 2·0.3).
+    let mut a = BRep::new();
+    let fa = donut(&mut a, TorusSurf::new(Point3::new(0.0, 0.0, 0.0), UnitVec3::Z, 0.8, 0.3));
+    let mut b = BRep::new();
+    let fb = donut(&mut b, TorusSurf::new(Point3::new(0.0, 0.0, 0.4), UnitVec3::Z, 0.8, 0.3));
+
+    let (out, _shell) = union(&a, &fa, &b, &fb, 1e-6);
+    let step = cadcore_step::brep_to_step(&out).expect("write step");
+    assert!(step.contains("CLOSED_SHELL"));
+    let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../repro/newengine_union_stacked_donuts.step");
+    let _ = std::fs::write(&outp, &step);
+    println!("union stacked donuts: {} bytes", step.len());
+}
+
+#[test]
+fn union_parallel_cylinders_exports_step() {
+    use cadcore_geom::{Circle3, Plane3};
+    use cadcore_topo::{Face, FaceBoundary, FaceExtent, FaceGeom, FaceId, FaceNormal, Shell, Solid};
+    use cadcore_union::boolean::union;
+
+    fn capped_cylinder(brep: &mut BRep, base: Point3, axis: UnitVec3, r: f64, len: f64) -> Vec<FaceId> {
+        let surf = CylSurf::new(base, axis, r);
+        let top = base + axis.as_vec() * len;
+        let lateral = brep.add_face(Face {
+            geom: FaceGeom::Cylinder(surf), normal: FaceNormal::Same,
+            outer_loop: Default::default(), inner_loops: Vec::new(), shell: Default::default(),
+            extent: FaceExtent::Cylinder { length: len, start: FaceBoundary::Circle(Circle3::new(base, axis, r)), end: FaceBoundary::Circle(Circle3::new(top, axis, r)) },
+        });
+        let cap0 = brep.add_face(Face { geom: FaceGeom::Plane(Plane3::from_origin_normal(base, UnitVec3::try_from_vec(axis.as_vec() * -1.0).unwrap())), normal: FaceNormal::Same, outer_loop: Default::default(), inner_loops: Vec::new(), shell: Default::default(), extent: FaceExtent::Disk { radius: r } });
+        let cap1 = brep.add_face(Face { geom: FaceGeom::Plane(Plane3::from_origin_normal(top, axis)), normal: FaceNormal::Same, outer_loop: Default::default(), inner_loops: Vec::new(), shell: Default::default(), extent: FaceExtent::Disk { radius: r } });
+        let faces = vec![lateral, cap0, cap1];
+        let shell = brep.add_shell(Shell { faces: faces.clone(), is_outer: true, solid: Default::default() });
+        let solid = brep.add_solid(Solid { shells: vec![shell], name: Some("cyl".into()) });
+        brep.shells[shell].solid = solid;
+        for &f in &faces { brep.faces[f].shell = shell; }
+        faces
+    }
+
+    let mut a = BRep::new();
+    let fa = capped_cylinder(&mut a, Point3::new(-2.0, 0.0, 0.0), UnitVec3::X, 0.3, 4.0);
+    let mut b = BRep::new();
+    let fb = capped_cylinder(&mut b, Point3::new(-1.5, 0.0, 0.4), UnitVec3::X, 0.3, 4.0);
+    let (out, _shell) = union(&a, &fa, &b, &fb, 1e-6);
+    let step = cadcore_step::brep_to_step(&out).expect("write step");
+    assert!(step.contains("CLOSED_SHELL"));
+    let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../repro/newengine_union_parallel_cylinders.step");
+    let _ = std::fs::write(&outp, &step);
+    println!("union parallel cylinders: {} bytes", step.len());
 }
 
 #[test]

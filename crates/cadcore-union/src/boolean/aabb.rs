@@ -79,6 +79,22 @@ pub fn face_aabb(brep: &BRep, face: FaceId) -> Aabb {
     let mut bb = Aabb::empty();
     let f = &brep.faces[face];
 
+    // A torus arc's loops are only its END circles — they do NOT bound the
+    // SWEEP of the tube between them, so a crosser meeting the arc mid-span
+    // would be missed by the broad phase.  Sample the whole arc surface.
+    if let FaceGeom::Torus(t) = &f.geom {
+        if let Some((lo, hi)) = torus_theta_range(brep, face, t) {
+            for i in 0..=24 {
+                let theta = lo + (hi - lo) * (i as f64 / 24.0);
+                for j in 0..16 {
+                    let phi = std::f64::consts::TAU * (j as f64 / 16.0);
+                    bb.expand(t.point_at(theta, phi));
+                }
+            }
+            return bb;
+        }
+    }
+
     // 1) real loop vertices, if any.
     let mut had_loop = false;
     let mut loops = Vec::new();
@@ -112,6 +128,52 @@ pub fn face_aabb(brep: &BRep, face: FaceId) -> Aabb {
     // 2) fall back to the analytic extent template.
     extent_aabb(&f.geom, &f.extent, &mut bb);
     bb
+}
+
+/// The θ-arc range of a torus face, from its `TorusFillet` template circles or
+/// from its loop vertices (a Trimmed torus).
+fn torus_theta_range(brep: &BRep, face: FaceId, t: &cadcore_geom::TorusSurf) -> Option<(f64, f64)> {
+    let theta_of = |p: Point3| {
+        let w = p - t.frame.origin;
+        t.frame.y.dot_vec(w).atan2(t.frame.x.dot_vec(w))
+    };
+    let f = &brep.faces[face];
+    if let FaceExtent::TorusFillet { start_circle, end_circle } = &f.extent {
+        if (start_circle.frame.origin - end_circle.frame.origin).length() < 1e-6 {
+            return Some((0.0, std::f64::consts::TAU)); // full torus
+        }
+        let lo = theta_of(start_circle.frame.origin);
+        let mut hi = theta_of(end_circle.frame.origin);
+        hi += std::f64::consts::TAU * ((lo - hi) / std::f64::consts::TAU).round();
+        return Some(if lo <= hi { (lo, hi) } else { (hi, lo) });
+    }
+    // Trimmed torus: unwrap loop-vertex θ onto the first sample's branch.
+    let mut ids = vec![f.outer_loop];
+    ids.extend(f.inner_loops.iter().copied());
+    let mut base = None;
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for lid in ids {
+        let Some(lp) = brep.loops.get(lid) else { continue };
+        if brep.coedges.get(lp.start).is_none() {
+            continue;
+        }
+        let mut c = lp.start;
+        loop {
+            let ce = &brep.coedges[c];
+            for p in sample_edge(brep, ce.edge) {
+                let raw = theta_of(p);
+                let b = *base.get_or_insert(raw);
+                let th = raw + std::f64::consts::TAU * ((b - raw) / std::f64::consts::TAU).round();
+                lo = lo.min(th);
+                hi = hi.max(th);
+            }
+            c = ce.next;
+            if c == lp.start {
+                break;
+            }
+        }
+    }
+    (hi > lo).then_some((lo, hi))
 }
 
 /// Sample an edge's curve into a few world-space points (endpoints + interior

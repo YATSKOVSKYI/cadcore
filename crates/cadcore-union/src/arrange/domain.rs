@@ -28,6 +28,14 @@ pub enum FaceDomain {
         /// Ring-arc end (signed sweep from `theta_lo`).
         theta_hi: f64,
     },
+    /// Full-donut torus band: u = ring angle θ (periodic, 2π), v = minor-circle
+    /// angle φ in `[0, 2π]` (the "open" axis, bounded by the φ-seam — itself a
+    /// shared circle, so the band closes).  The mirror of [`Self::TorusPatch`]:
+    /// here θ wraps and φ is cut, which is what stacked donuts need.
+    TorusBand {
+        /// Carrier surface.
+        surf: TorusSurf,
+    },
     /// Flat plane: u/v are the in-plane Cartesian coordinates (no periodic
     /// axis).  Used for end-cap disks.
     Plane {
@@ -68,6 +76,15 @@ impl FaceDomain {
                 let phi = h.atan2(a - surf.major_radius);
                 (theta, phi)
             }
+            FaceDomain::TorusBand { surf } => {
+                let w = p - surf.frame.origin;
+                let theta = surf.frame.y.dot_vec(w).atan2(surf.frame.x.dot_vec(w));
+                let h = surf.frame.z.dot_vec(w);
+                let q = w - surf.frame.z.as_vec() * h;
+                let a = q.length();
+                let phi = h.atan2(a - surf.major_radius).rem_euclid(std::f64::consts::TAU);
+                (theta, phi)
+            }
             FaceDomain::Plane { plane, .. } => {
                 let w = p - plane.frame.origin;
                 (plane.frame.x.dot_vec(w), plane.frame.y.dot_vec(w))
@@ -88,6 +105,13 @@ impl FaceDomain {
                 ring + ring_dir * (surf.minor_radius * v.cos())
                     + surf.frame.z.as_vec() * (surf.minor_radius * v.sin())
             }
+            FaceDomain::TorusBand { surf } => {
+                // u = θ (periodic), v = φ (open)
+                let ring_dir = surf.frame.x * u.cos() + surf.frame.y * u.sin();
+                let ring = surf.frame.origin + ring_dir * surf.major_radius;
+                ring + ring_dir * (surf.minor_radius * v.cos())
+                    + surf.frame.z.as_vec() * (surf.minor_radius * v.sin())
+            }
             FaceDomain::Plane { plane, .. } => {
                 plane.frame.origin + plane.frame.x * u + plane.frame.y * v
             }
@@ -100,6 +124,7 @@ impl FaceDomain {
         match self {
             FaceDomain::CylinderBand { .. } => (0, std::f64::consts::TAU),
             FaceDomain::TorusPatch { .. } => (1, std::f64::consts::TAU),
+            FaceDomain::TorusBand { .. } => (0, std::f64::consts::TAU), // u = θ wraps
             // a plane has no periodic axis; report a huge non-period so the
             // DCEL seam never triggers within the working rectangle.
             FaceDomain::Plane { half_extent, .. } => (0, 4.0 * half_extent),
@@ -119,6 +144,7 @@ impl FaceDomain {
                     (*theta_hi, *theta_lo)
                 }
             }
+            FaceDomain::TorusBand { .. } => (0.0, std::f64::consts::TAU), // v = φ
             FaceDomain::Plane { half_extent, .. } => (-half_extent, *half_extent),
         }
     }

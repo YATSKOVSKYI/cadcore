@@ -143,6 +143,41 @@ fn settle(a: &dyn Projectable, b: &dyn Projectable, start: Point3, tol: f64) -> 
         .then_some(p2)
 }
 
+/// Newton corrector onto the intersection curve: each step moves `p` along the
+/// span of the two surface normals, solving the 2×2 system that zeroes both
+/// signed distances simultaneously.  Far more robust than alternating
+/// projection between two doubly-curved surfaces (e.g. torus×torus), where the
+/// cyclic scheme oscillates and diverges.
+fn newton_to_curve(
+    a: &dyn Projectable,
+    b: &dyn Projectable,
+    p: Point3,
+    tol: f64,
+    iters: usize,
+) -> Option<Point3> {
+    let mut q = p;
+    for _ in 0..iters {
+        let (na, nb) = (a.normal_p(q)?, b.normal_p(q)?);
+        let pa = a.project_p(q);
+        let pb = b.project_p(q);
+        let da = (q - pa).dot(na);
+        let db = (q - pb).dot(nb);
+        let c = na.dot(nb);
+        let denom = 1.0 - c * c;
+        if denom.abs() < 1e-9 {
+            return None; // surfaces locally tangent — no well-posed step
+        }
+        let x = (-da + c * db) / denom;
+        let y = (c * da - db) / denom;
+        let delta = na * x + nb * y;
+        q = q + delta;
+        if delta.length() < tol.max(1e-14) {
+            break;
+        }
+    }
+    (a.distance_p(q) < 1e-9 && b.distance_p(q) < 1e-9).then_some(q)
+}
+
 /// Trace the intersection curve of `a` and `b` through `seed`.
 ///
 /// `clip` lets the caller bound the trace to a region of interest (axial
@@ -198,14 +233,16 @@ pub fn trace_dyn(
         let predictor = p + t * step_eff;
         let (mut q, residual) = refine_point_dyn(predictor, &[a, b], opts.tol, 60);
         if residual > opts.tol.max(1e-12) * 100.0 {
-            // cyclic projection limit-cycles near composite member junctions
-            // — settle with the damped iteration before giving up
-            match settle(a, b, predictor, opts.tol) {
-                Some(q2) => q = q2,
-                None => {
-                    end = TraceEnd::Diverged;
-                    break;
-                }
+            // cyclic projection limit-cycles between two curved surfaces — try
+            // the Newton corrector (robust for torus×torus), then the damped
+            // settle, before giving up.
+            if let Some(qn) = newton_to_curve(a, b, predictor, opts.tol, 40) {
+                q = qn;
+            } else if let Some(q2) = settle(a, b, predictor, opts.tol) {
+                q = q2;
+            } else {
+                end = TraceEnd::Diverged;
+                break;
             }
         }
         if !clip(q) {

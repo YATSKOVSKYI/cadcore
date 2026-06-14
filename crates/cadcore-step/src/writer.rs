@@ -186,9 +186,16 @@ impl<'a> StepWriter<'a> {
                 // A trimmed-to-an-arc TOROIDAL_SURFACE bounded only by its two
                 // minor end-circles is ambiguous (90°/270° band).  Emit the
                 // exact rational-NURBS patch spanning only the real arc instead,
-                // which removes the ambiguity.  Fall back to TOROIDAL_SURFACE if
-                // the arc range can't be recovered from the boundary.
-                if let Some((lo, hi)) = self.torus_arc_range(face) {
+                // which removes the ambiguity.
+                //
+                // EXCEPTION — a torus with WINDOW holes (a crosser cut it): the
+                // explicit loop topology already removes the ambiguity, and the
+                // NURBS patch's numerically-inverted window pcurves come out
+                // "Unorientable" in OCC/SolidWorks.  Emit the exact analytic
+                // TOROIDAL_SURFACE instead; its native (θ,φ) pcurves are exact.
+                if torus_is_toroidal(face) {
+                    emit_torus(ctx, t)
+                } else if let Some((lo, hi)) = self.torus_arc_range(face) {
                     let patch = torus_patch_nurbs(t, lo, hi);
                     emit_rational_bspline_surface(ctx, &patch)
                 } else {
@@ -965,11 +972,21 @@ impl<'a> StepWriter<'a> {
                             pcurves.push(emit_pcurve(ctx, surf_id, c2d)?);
                         }
                         FaceGeom::Torus(t) => {
-                            // Elbow face: reconstruct the same NURBS patch the
-                            // surface was emitted as, then invert each 3D point to
-                            // its (u,v) so the elbow side of the shared trim edge
-                            // also carries an explicit pcurve.
-                            if let Some((lo, hi)) = self.torus_arc_range(face) {
+                            if torus_is_toroidal(face) {
+                                // Windowed torus emitted as analytic
+                                // TOROIDAL_SURFACE: pcurve is native (θ,φ),
+                                // unwrapped for continuity across the seams.
+                                if let Some((lo, hi)) = self.torus_arc_range(face) {
+                                    let mut uv: Vec<(f64, f64)> =
+                                        pts.iter().map(|&p| torus_uv_in_band(t, p, lo, hi)).collect();
+                                    unwrap_torus_pcurve(&mut uv);
+                                    let c2d = emit_polyline2d(ctx, &uv)?;
+                                    pcurves.push(emit_pcurve(ctx, surf_id, c2d)?);
+                                }
+                            } else if let Some((lo, hi)) = self.torus_arc_range(face) {
+                                // Elbow face: reconstruct the same NURBS patch the
+                                // surface was emitted as, then invert each 3D
+                                // point to its (u,v) for the shared trim edge.
                                 let patch = torus_patch_nurbs(t, lo, hi);
                                 let uv: Vec<(f64, f64)> =
                                     pts.iter().map(|&p| patch.project_point(p)).collect();
@@ -2201,6 +2218,30 @@ fn unwrap_loop_uv(uv: &mut [(f64, f64)], per_u: bool, per_v: bool) {
                 uv[i].1 += 2.0 * std::f64::consts::PI;
             }
         }
+    }
+}
+
+/// Whether a torus face should be emitted as an analytic `TOROIDAL_SURFACE`
+/// (with native (θ,φ) pcurves) rather than the rational-NURBS arc patch: true
+/// when it has been cut into windows, where the NURBS patch's numerically
+/// inverted pcurves are unreliable and OCC reports "Unorientable".
+fn torus_is_toroidal(face: &cadcore_topo::Face) -> bool {
+    // Any *cut* torus (Trimmed extent) carries native (θ,φ) loops, so emit it
+    // analytically — whether it was windowed (inner loops) or sliced into a
+    // φ-band by a coaxial stack (outer loop only).  The plain scaffold fillet
+    // keeps FaceExtent::TorusFillet and still rides the rational-NURBS patch.
+    matches!(face.extent, FaceExtent::Trimmed)
+}
+
+/// Make a torus pcurve continuous: unwrap each point's (θ,φ) onto the branch
+/// nearest the previous point, so periodic jumps don't tear the 2-D curve.
+fn unwrap_torus_pcurve(uv: &mut [(f64, f64)]) {
+    let tau = 2.0 * std::f64::consts::PI;
+    for i in 1..uv.len() {
+        let du = uv[i].0 - uv[i - 1].0;
+        uv[i].0 -= tau * (du / tau).round();
+        let dv = uv[i].1 - uv[i - 1].1;
+        uv[i].1 -= tau * (dv / tau).round();
     }
 }
 
