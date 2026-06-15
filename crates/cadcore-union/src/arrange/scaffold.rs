@@ -15,6 +15,7 @@ use cadcore_topo::{BRep, Shell, ShellId, Solid};
 
 use super::assembly::Assembler;
 use super::filament::{ElbowSeg, LegSeg};
+use crate::boolean::Aabb;
 use crate::geom::composite::{closed_loops_between, CompositeTube};
 use crate::geom::intersect::TraceOptions;
 
@@ -108,6 +109,25 @@ pub fn fuse_scaffold(brep: &mut BRep, filaments: &[Filament]) -> ShellId {
         })
         .collect();
 
+    // Per-leg axis-aligned bounding box (segment endpoints, padded by the tube
+    // radius) — the broad phase: two legs can only intersect if their boxes
+    // overlap, so we skip the (expensive, fine-step) SSI trace for the vast
+    // majority of non-crossing leg pairs.  Without this cull `fuse_scaffold`
+    // is O(legs²) traces and does not scale to a real multi-layer scaffold
+    // (hundreds of legs → tens of thousands of traces).
+    let leg_box = |l: &LegSeg| -> Aabb {
+        let a = l.surf.frame.origin;
+        let b = a + l.surf.axis().as_vec() * l.length;
+        let mut bb = Aabb::empty();
+        bb.expand(a);
+        bb.expand(b);
+        bb.pad(l.surf.radius)
+    };
+    let leg_boxes: Vec<Vec<Aabb>> = filaments
+        .iter()
+        .map(|f| f.legs.iter().map(leg_box).collect())
+        .collect();
+
     // windows[fi][li] = crossing loops on leg (fi,li) with legs of OTHER
     // filaments.  Traced ONCE per leg-pair; both sides imprint the SAME points.
     let mut windows: Vec<Vec<Vec<Vec<Point3>>>> = filaments
@@ -118,6 +138,9 @@ pub fn fuse_scaffold(brep: &mut BRep, filaments: &[Filament]) -> ShellId {
         for fj in (fi + 1)..nf {
             for li in 0..filaments[fi].legs.len() {
                 for lj in 0..filaments[fj].legs.len() {
+                    if !leg_boxes[fi][li].overlaps(&leg_boxes[fj][lj]) {
+                        continue; // broad-phase reject: boxes disjoint → no crossing
+                    }
                     for c in closed_loops_between(
                         &leg_tubes[fi][li],
                         &leg_tubes[fj][lj],
@@ -297,5 +320,62 @@ mod tests {
         assert!(report.manifold_violations.is_empty(), "manifold");
         assert!(report.distance_violations.is_empty(),
             "distance max {:.2}um", report.max_edge_deviation * 1e3);
+    }
+
+    /// One serpentine filament covering an `n×n` mm area along `axis_x`
+    /// (true = legs run along X, weaving in Y), at height `z`, pitch `p`.
+    fn weave(span: f64, p: f64, z: f64, along_x: bool, r: f64, fillet: f64) -> Filament {
+        let mut verts = Vec::new();
+        let mut k = 0;
+        let mut a = 0.0;
+        while a <= span + 1e-9 {
+            let (lo, hi) = if k % 2 == 0 { (0.0, span) } else { (span, 0.0) };
+            for &t in &[lo, hi] {
+                let pt = if along_x {
+                    Point3::new(t, a, z)
+                } else {
+                    Point3::new(a, t, z)
+                };
+                verts.push(pt);
+            }
+            a += p;
+            k += 1;
+        }
+        Filament::serpentine(&verts, r, fillet)
+    }
+
+    /// Scaling guard: a realistic 4-layer woven scaffold (≈ the app's 5×5×4
+    /// model) must fuse in well under the broad-phase-less O(legs²) blow-up.
+    /// With the leg-AABB cull this is sub-second; without it, it hangs.
+    #[test]
+    fn four_layer_weave_fuses_fast_and_watertight() {
+        let r = 0.275;
+        let span = 50.0; // big span → many crossings (≈ the app's dense scaffold)
+        let p = 1.0;
+        let fillet = 0.25; // < p/2 so the short connector legs stay positive-length
+        let layers = vec![
+            weave(span, p, 0.0, true, r, fillet),
+            weave(span, p, 0.35, false, r, fillet),
+            weave(span, p, 0.70, true, r, fillet),
+            weave(span, p, 1.05, false, r, fillet),
+        ];
+        let total_legs: usize = layers.iter().map(|f| f.legs.len()).sum();
+        let t0 = std::time::Instant::now();
+        let mut brep = BRep::new();
+        let shell = fuse_scaffold(&mut brep, &layers);
+        let fuse_ms = t0.elapsed().as_millis();
+        println!(
+            "4-layer weave: {} legs, {} faces, fuse {} ms",
+            total_legs,
+            brep.shells[shell].faces.len(),
+            fuse_ms,
+        );
+        assert_eq!(open_edges(&brep, shell), 0, "watertight");
+
+        let mut cfg = UnionConfig::default();
+        cfg.wires_strict = true;
+        let mut diag = Diagnostics::new();
+        let report = validate_shell(&brep, shell, &cfg, &mut diag);
+        assert!(report.manifold_violations.is_empty(), "manifold");
     }
 }

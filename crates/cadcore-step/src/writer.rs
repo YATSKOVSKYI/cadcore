@@ -193,7 +193,7 @@ impl<'a> StepWriter<'a> {
                 // NURBS patch's numerically-inverted window pcurves come out
                 // "Unorientable" in OCC/SolidWorks.  Emit the exact analytic
                 // TOROIDAL_SURFACE instead; its native (θ,φ) pcurves are exact.
-                if torus_is_toroidal(face) {
+                if self.torus_is_toroidal(face) {
                     emit_torus(ctx, t)
                 } else if let Some((lo, hi)) = self.torus_arc_range(face) {
                     let patch = torus_patch_nurbs(t, lo, hi);
@@ -203,6 +203,39 @@ impl<'a> StepWriter<'a> {
                 }
             }
         }
+    }
+
+    /// Whether a torus face should be emitted as a native analytic
+    /// `TOROIDAL_SURFACE` (with (θ,φ) pcurves) rather than as a rational-NURBS
+    /// arc patch.
+    ///
+    /// Two cases qualify:
+    /// * `FaceExtent::Trimmed` — windowed / φ-band sliced cut torus.  Its
+    ///   explicit loop topology removes the 90°/270° band ambiguity.
+    /// * `FaceExtent::TorusFillet` **with real loop topology** — a cadcore-union
+    ///   scaffold elbow built by `emit_torus_fillet`, whose two minor
+    ///   end-circles are real `circle_loop`s carrying analytic torus pcurves
+    ///   (u = θ_end lines) that pin the band.
+    ///
+    /// A `TorusFillet` whose loops are **placeholders** (empty — cadcore-ops's
+    /// rounded-corner sweep emits these) does NOT qualify: the analytic bounds
+    /// path needs real CoEdge/Edge topology to weld the face manifold, so those
+    /// faces must fall back to the NURBS patch template.
+    fn torus_is_toroidal(&self, face: &cadcore_topo::Face) -> bool {
+        match &face.extent {
+            FaceExtent::Trimmed => true,
+            FaceExtent::TorusFillet { .. } => self.face_has_real_loops(face),
+            _ => false,
+        }
+    }
+
+    /// True when the face's outer loop resolves to at least one real CoEdge —
+    /// i.e. it carries genuine B-Rep topology rather than a placeholder loop
+    /// (`CoEdgeId::default()` with no coedges).
+    fn face_has_real_loops(&self, face: &cadcore_topo::Face) -> bool {
+        self.brep
+            .loop_coedges(face.outer_loop)
+            .is_some_and(|c| !c.is_empty())
     }
 
     /// Recover the major-angle arc range `(theta_lo, theta_hi)` of a torus-elbow
@@ -542,13 +575,17 @@ impl<'a> StepWriter<'a> {
                 };
                 // Analytic-union faces carry explicit B-Rep topology; walk the
                 // real CoEdge/Edge arenas instead of a closed-form template.  A
-                // scaffold elbow (TorusFillet) also has explicit minor-circle
-                // loops, so it rides the same analytic path (its circles then get
-                // torus pcurves that pin the θ-band on the TOROIDAL_SURFACE).
-                let bounds = if matches!(
-                    face.extent,
-                    FaceExtent::Trimmed | FaceExtent::TorusFillet { .. }
-                ) {
+                // cadcore-union scaffold elbow (TorusFillet built by
+                // `emit_torus_fillet`) also has explicit minor-circle loops, so
+                // it rides the same analytic path (its circles then get torus
+                // pcurves that pin the θ-band on the TOROIDAL_SURFACE).  A
+                // cadcore-ops rounded-corner TorusFillet, by contrast, carries
+                // only placeholder loops — `face_has_real_loops` is false there,
+                // so it falls back to the closed-form NURBS template below.
+                let analytic_bounds = matches!(face.extent, FaceExtent::Trimmed)
+                    || (matches!(face.extent, FaceExtent::TorusFillet { .. })
+                        && self.face_has_real_loops(face));
+                let bounds = if analytic_bounds {
                     self.emit_trimmed_face_bounds(ctx, face, &pc)?
                 } else {
                     emit_face_bounds(ctx, face)?
@@ -992,7 +1029,7 @@ impl<'a> StepWriter<'a> {
                             pcurves.push(emit_pcurve(ctx, surf_id, c2d)?);
                         }
                         FaceGeom::Torus(t) => {
-                            if torus_is_toroidal(face) {
+                            if self.torus_is_toroidal(face) {
                                 // Windowed torus emitted as analytic
                                 // TOROIDAL_SURFACE: pcurve is native (θ,φ),
                                 // unwrapped for continuity across the seams.
@@ -1151,7 +1188,7 @@ impl<'a> StepWriter<'a> {
                     // Likewise: analytic only when the circle is a genuine
                     // major/minor circle of THIS torus.
                     FaceGeom::Torus(_) => {
-                        !torus_is_toroidal(fc) || !self.torus_circle_is_analytic(fc, c)
+                        !self.torus_is_toroidal(fc) || !self.torus_circle_is_analytic(fc, c)
                     }
                     _ => true,
                 })
@@ -1237,7 +1274,7 @@ impl<'a> StepWriter<'a> {
                             let s = if unwrap_pi(u1 - u0) >= 0.0 { 1.0 } else { -1.0 };
                             emit_line2d(ctx, u0, v0, s, 0.0)?
                         }
-                        FaceGeom::Torus(t) if torus_is_toroidal(face) => {
+                        FaceGeom::Torus(t) if self.torus_is_toroidal(face) => {
                             // A circle on the torus is either a minor φ-circle
                             // (u≈const, v=φ) or a major-θ arc (u=θ, v≈const).
                             // Sample (u,v) at θ=0 and a small δ to find which
@@ -2404,17 +2441,7 @@ fn cyl_circle_is_analytic(cyl: &cadcore_geom::CylSurf, c: &cadcore_geom::Circle3
     vmax - vmin < 1e-4 // constant axial ⇒ perpendicular cross-section
 }
 
-fn torus_is_toroidal(face: &cadcore_topo::Face) -> bool {
-    // Emit analytically (native (θ,φ) loops) for any cut torus (Trimmed —
-    // windowed or φ-band sliced) AND for a plain scaffold fillet
-    // (FaceExtent::TorusFillet): its two minor end-circles now carry analytic
-    // torus pcurves (u = θ_end lines) that pin the θ-band, so the analytic
-    // TOROIDAL_SURFACE is unambiguous — no rational-NURBS patch needed.
-    matches!(
-        face.extent,
-        FaceExtent::Trimmed | FaceExtent::TorusFillet { .. }
-    )
-}
+// (moved to a method on the writer — see `Writer::torus_is_toroidal`)
 
 /// Make a torus pcurve continuous: unwrap each point's (θ,φ) onto the branch
 /// nearest the previous point, so periodic jumps don't tear the 2-D curve.
