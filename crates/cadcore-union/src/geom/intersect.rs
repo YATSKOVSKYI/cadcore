@@ -22,7 +22,12 @@ use super::refine::{refine_point_dyn, AnalyticSurface, Projectable};
 /// Tracing options.
 #[derive(Debug, Clone, Copy)]
 pub struct TraceOptions {
-    /// Step length along the curve (mm).  Default `0.05`.
+    /// Nominal step length along the curve (mm).  Default `0.01`: the sampling
+    /// resolution of a surface–surface intersection.  Chosen so the chord
+    /// deviation of the emitted edge stays well under a CAD import tolerance for
+    /// mm-scale parts (`≈ step²/8R`), since this is the ONLY place both carriers
+    /// are available to refine each sample exactly onto the true curve.  The
+    /// corrector shortens it further through high-curvature waists.
     pub step: f64,
     /// Refinement convergence target (mm).  Default `1e-12`.
     pub tol: f64,
@@ -35,7 +40,7 @@ pub struct TraceOptions {
 impl Default for TraceOptions {
     fn default() -> Self {
         Self {
-            step: 0.05,
+            step: 0.01,
             tol: 1e-12,
             max_points: 4096,
             tangency_eps: 1e-5,

@@ -25,6 +25,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod entities;
+mod interp;
 mod nurbs;
 mod pcurve;
 mod writer;

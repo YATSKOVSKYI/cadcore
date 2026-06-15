@@ -173,7 +173,7 @@ impl RationalBSplineSurface {
 ///
 /// Includes the standard half-open-interval convention plus the right-endpoint
 /// fix so `N` of the last function is 1 at `u == knots.last()`.
-fn bspline_basis(i: usize, p: usize, u: f64, knots: &[f64]) -> f64 {
+pub(crate) fn bspline_basis(i: usize, p: usize, u: f64, knots: &[f64]) -> f64 {
     let m = knots.len() - 1;
     // Right-endpoint special case.
     if i == m - p - 1 && (u - knots[m]).abs() < 1e-12 {

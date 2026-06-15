@@ -486,18 +486,18 @@ fn union_filament_elbow_exports_manifold_step() {
     let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../repro/newengine_union_filament_elbow.step");
     let _ = std::fs::write(&outp, &step);
-    // NOTE: the torus elbow emits as a B_SPLINE_SURFACE, whose edges are
-    // SURFACE_CURVEs carrying orientation in their pcurve `same_sense` flags —
-    // NOT in the ORIENTED_EDGE direction.  The text `manifold_check` only
-    // inspects ORIENTED_EDGE `.T./.F.` and so reports false same-sense pairs on
-    // those edges; OCC (FreeCADCmd out/validate.py) reads this file as a single
-    // valid closed solid (volume ≈ 1.24, 0 invalid of 9 faces).
+    // Pass-through elbow: the carried-whole elbow torus now emits as an analytic
+    // TOROIDAL_SURFACE (its two minor end-circle loops pin the θ-band), so OCC is
+    // BOP-clean (max edge tolerance ~6e-5) instead of the old NURBS-patch gap.
     assert!(step.contains("CLOSED_SHELL"));
-    assert!(step.contains("TOROIDAL_SURFACE") || step.contains("B_SPLINE_SURFACE"), "elbow torus emitted");
-    println!("union filament+elbow with crosser: {} bytes (OCC-valid; see note)", step.len());
+    assert!(step.contains("TOROIDAL_SURFACE"), "elbow torus emitted analytically");
+    println!("union filament+elbow with crosser: {} bytes (OCC BOP-clean)", step.len());
 
-    // torus-CUT variant (crosser through the elbow): watertight B-Rep, but the
-    // windowed B-spline torus is "Unorientable" in OCC — staged for inspection.
+    // torus-CUT variant (crosser through the elbow): the cut elbow emits as an
+    // analytic TOROIDAL_SURFACE and is now OCC BOP-CLEAN (strict `solid.check`
+    // passes, max edge tolerance ~1.7e-4): the minor circles and the φ-seam are
+    // emitted as analytic CIRCLEs with native (θ,φ) line pcurves, and the
+    // transcendental crosser∩torus window is finely sampled.
     let th = 0.5 * (fil.elbows[0].theta_lo + fil.elbows[0].theta_hi);
     let tor = fil.elbows[0].surf;
     let ring = tor.frame.origin + (tor.frame.x * th.cos() + tor.frame.y * th.sin()) * tor.major_radius;
@@ -509,7 +509,9 @@ fn union_filament_elbow_exports_manifold_step() {
         .join("../../../repro/newengine_union_cut_elbow.step");
     let _ = std::fs::write(&outpc, &stepc);
     assert!(stepc.contains("CLOSED_SHELL"));
-    println!("union CUT elbow: {} bytes (watertight B-Rep; torus face Unorientable in OCC)", stepc.len());
+    assert!(stepc.contains("TOROIDAL_SURFACE"), "cut elbow emits analytic torus");
+    assert!(stepc.contains("CIRCLE("), "minor circles & φ-seam emit as analytic CIRCLEs");
+    println!("union CUT elbow: {} bytes (OCC BOP-clean, analytic TOROIDAL_SURFACE)", stepc.len());
 }
 
 #[test]
@@ -549,6 +551,10 @@ fn union_torus_on_torus_exports_step() {
     let (out, _shell) = union(&a, &fa, &b, &fb, 1e-6);
     let step = cadcore_step::brep_to_step(&out).expect("write step");
     assert!(step.contains("CLOSED_SHELL"));
+    // OCC BOP-clean (max edge tolerance ~3.9e-5): minor circles emit as analytic
+    // CIRCLEs; the angled torus∩torus arc — circular on neither torus — stays a
+    // finely-sampled polyline (it must, to keep a valid pcurve on both tori).
+    assert!(step.contains("CIRCLE("), "minor circles emit as analytic CIRCLEs");
     let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../repro/newengine_union_torus_on_torus.step");
     let _ = std::fs::write(&outp, &step);
@@ -586,6 +592,9 @@ fn union_stacked_donuts_exports_step() {
     let (out, _shell) = union(&a, &fa, &b, &fb, 1e-6);
     let step = cadcore_step::brep_to_step(&out).expect("write step");
     assert!(step.contains("CLOSED_SHELL"));
+    // OCC BOP-clean @1e-7: the coaxial intersection circles are exact major
+    // circles of each torus, so every edge emits as an analytic CIRCLE.
+    assert!(step.contains("CIRCLE("), "donut seams emit as analytic CIRCLEs");
     let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../repro/newengine_union_stacked_donuts.step");
     let _ = std::fs::write(&outp, &step);
@@ -728,4 +737,189 @@ fn scaffold_two_crossing_filaments_exports_manifold_step() {
         .join("../../../repro/newengine_scaffold_2filament.step");
     let _ = std::fs::write(&out, &step);
     println!("scaffold (2 crossing filaments): {} bytes", step.len());
+}
+
+/// One capped cylinder strand as its own solid (owned BRep + face ids).
+fn strand(base: Point3, axis: UnitVec3, r: f64, len: f64) -> (BRep, Vec<cadcore_topo::FaceId>) {
+    use cadcore_geom::{Circle3, Plane3};
+    use cadcore_topo::{Face, FaceBoundary, FaceExtent, FaceGeom, FaceNormal, Shell, Solid};
+    let mut brep = BRep::new();
+    let surf = CylSurf::new(base, axis, r);
+    let top = base + axis.as_vec() * len;
+    let lateral = brep.add_face(Face {
+        geom: FaceGeom::Cylinder(surf), normal: FaceNormal::Same,
+        outer_loop: Default::default(), inner_loops: Vec::new(), shell: Default::default(),
+        extent: FaceExtent::Cylinder { length: len,
+            start: FaceBoundary::Circle(Circle3::new(base, axis, r)),
+            end: FaceBoundary::Circle(Circle3::new(top, axis, r)) },
+    });
+    let cap0 = brep.add_face(Face {
+        geom: FaceGeom::Plane(Plane3::from_origin_normal(base, UnitVec3::try_from_vec(axis.as_vec() * -1.0).unwrap())),
+        normal: FaceNormal::Same, outer_loop: Default::default(), inner_loops: Vec::new(),
+        shell: Default::default(), extent: FaceExtent::Disk { radius: r } });
+    let cap1 = brep.add_face(Face {
+        geom: FaceGeom::Plane(Plane3::from_origin_normal(top, axis)),
+        normal: FaceNormal::Same, outer_loop: Default::default(), inner_loops: Vec::new(),
+        shell: Default::default(), extent: FaceExtent::Disk { radius: r } });
+    let faces = vec![lateral, cap0, cap1];
+    let shell = brep.add_shell(Shell { faces: faces.clone(), is_outer: true, solid: Default::default() });
+    let solid = brep.add_solid(Solid { shells: vec![shell], name: Some("strand".into()) });
+    brep.shells[shell].solid = solid;
+    for &f in &faces { brep.faces[f].shell = shell; }
+    (brep, faces)
+}
+
+/// Build an `nl`-layer woodpile scaffold (layers alternate X/Y, stacked in Z by
+/// `hl`), `ns` strands per layer at in-plane pitch `hp`, tube diameter `d`.
+/// Returns the per-strand owned solids.
+fn scaffold_solids(d: f64, hp: f64, hl: f64, ns: usize, nl: usize) -> Vec<(BRep, Vec<cadcore_topo::FaceId>)> {
+    let r = d / 2.0;
+    let span = (ns as f64 - 1.0) * hp + 2.0;
+    let mut out = Vec::new();
+    for layer in 0..nl {
+        let z = layer as f64 * hl;
+        for k in 0..ns {
+            let off = k as f64 * hp;
+            let (base, axis) = if layer % 2 == 0 {
+                (Point3::new(-1.0, off, z), UnitVec3::X)
+            } else {
+                (Point3::new(off, -1.0, z), UnitVec3::Y)
+            };
+            out.push(strand(base, axis, r, span));
+        }
+    }
+    out
+}
+
+#[test]
+fn scaffold_parametric_sweep_is_manifold() {
+    use cadcore_union::boolean::union_n;
+    // (diameter, in-plane pitch hp, layer height hl); hl < d so layers fuse.
+    let cases = [
+        (0.6_f64, 1.2_f64, 0.4_f64),
+        (0.5, 1.0, 0.35),
+        (0.8, 1.5, 0.5),
+        (0.4, 0.9, 0.28),
+        (0.7, 1.0, 0.45),
+    ];
+    for (d, hp, hl) in cases {
+        let solids = scaffold_solids(d, hp, hl, 3, 3);
+        let refs: Vec<(&BRep, &[cadcore_topo::FaceId])> =
+            solids.iter().map(|(b, f)| (b, f.as_slice())).collect();
+        let (out, _shell) = union_n(&refs, 1e-6)
+            .unwrap_or_else(|| panic!("scaffold union d={d} hp={hp} hl={hl} produced nothing"));
+        let step = cadcore_step::brep_to_step(&out)
+            .unwrap_or_else(|e| panic!("write step d={d} hp={hp} hl={hl}: {e:?}"));
+        let viol = manifold_check(&step);
+        assert!(
+            viol.is_empty(),
+            "d={d} hp={hp} hl={hl}: {} manifold violations e.g. {:?}",
+            viol.len(),
+            &viol[..viol.len().min(4)]
+        );
+        let name = format!("newengine_scaffold_d{:.0}_hp{:.0}_hl{:.0}.step",
+            d * 100.0, hp * 100.0, hl * 100.0);
+        let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../repro").join(&name);
+        let _ = std::fs::write(&outp, &step);
+        println!("scaffold d={d} hp={hp} hl={hl}: {} bytes -> {name}", step.len());
+    }
+}
+
+// KNOWN LIMITATION (over-compressed regime, 2·hl < d): when layers 0 and 2
+// (both X) overlap vertically, the engine must (a) union the COPLANAR end-cap
+// disks (each cap imprinted by the other's boundary circle, asymmetric, with the
+// lateral rims split at the two circle crossings) and (b) handle the parallel
+// lateral overlap (ruling lines) at the resulting triple points.  These are
+// degenerate-CSG cases not yet implemented; realistic scaffolds (2·hl ≥ d,
+// layer height = 0.5–0.8·d) do NOT hit them — see scaffold_parametric_sweep,
+// which is BOP-clean across diameters / pitches / layer heights.
+#[ignore = "over-compressed 2hl<d: coplanar-cap union + parallel-overlap not yet implemented"]
+#[test]
+fn scaffold_dense_triplepoints_is_manifold() {
+    use cadcore_union::boolean::union_n;
+    // DENSE: 2·hl < d, so layer 0 and layer 2 (both X) overlap vertically and a
+    // layer-1 (Y) strand crosses that overlap → genuine TRIPLE points where three
+    // strands meet.  This is the degenerate case the engine must handle for any
+    // diameter / pitch / layer height.
+    let cases = [
+        (0.6_f64, 1.0_f64, 0.25_f64), // 2hl=0.50 < 0.6
+        (0.8, 1.2, 0.30),             // 2hl=0.60 < 0.8
+        (0.5, 0.9, 0.20),             // 2hl=0.40 < 0.5
+        (0.7, 1.1, 0.28),             // 2hl=0.56 < 0.7
+    ];
+    for (d, hp, hl) in cases {
+        assert!(2.0 * hl < d, "case must overlap layers 0 and 2");
+        let solids = scaffold_solids(d, hp, hl, 1, 3);
+        let refs: Vec<(&BRep, &[cadcore_topo::FaceId])> =
+            solids.iter().map(|(b, f)| (b, f.as_slice())).collect();
+        let (out, _shell) = union_n(&refs, 1e-6)
+            .unwrap_or_else(|| panic!("dense scaffold union d={d} hp={hp} hl={hl} produced nothing"));
+        let step = cadcore_step::brep_to_step(&out)
+            .unwrap_or_else(|e| panic!("write step d={d} hp={hp} hl={hl}: {e:?}"));
+        let name = format!("newengine_scaffold_dense_d{:.0}_hl{:.0}.step", d * 100.0, hl * 100.0);
+        let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../repro").join(&name);
+        let _ = std::fs::write(&outp, &step);
+        let viol = manifold_check(&step);
+        println!("dense scaffold d={d} hp={hp} hl={hl}: {} bytes, {} manifold violations -> {name}", step.len(), viol.len());
+        assert!(
+            viol.is_empty(),
+            "dense d={d} hp={hp} hl={hl}: {} manifold violations e.g. {:?}",
+            viol.len(),
+            &viol[..viol.len().min(4)]
+        );
+    }
+}
+
+// KNOWN LIMITATION: the two coplanar end-cap disks (both at x=-1) overlap, and
+// COPLANAR overlapping plane faces are not yet unioned (plane_plane returns
+// empty for coincident planes).  All 84 unshared edges are cap arcs.  Fix =
+// coplanar-face union (imprint each cap with the other's boundary circle; split
+// the shared lateral rims at the two crossings).  Lateral ruling-line overlap is
+// fine; the caps are the blocker.
+#[ignore = "coplanar overlapping cap disks not yet unioned"]
+#[test]
+fn two_parallel_overlapping_cylinders_is_manifold() {
+    use cadcore_union::boolean::union_n;
+    // Two parallel X-cylinders (y=0) offset in Z by 0.4 < d=0.6 → they overlap
+    // in a lens; the intersection is two ruling LINES.  Must fuse watertight.
+    let (a, fa) = strand(Point3::new(-1.0, 0.0, 0.0), UnitVec3::X, 0.3, 4.0);
+    let (b, fb) = strand(Point3::new(-1.0, 0.0, 0.4), UnitVec3::X, 0.3, 4.0);
+    let refs = [(&a, fa.as_slice()), (&b, fb.as_slice())];
+    let (out, shell) = union_n(&refs, 1e-6).expect("parallel union");
+    // BRep-level diagnostic: which edges are used != 2 times, and where.
+    {
+        use std::collections::HashMap;
+        let mut uses: HashMap<cadcore_topo::EdgeId, usize> = HashMap::new();
+        for &fid in &out.shells[shell].faces {
+            let f = &out.faces[fid];
+            let mut ls = vec![f.outer_loop];
+            ls.extend(f.inner_loops.iter().copied());
+            for lid in ls {
+                if let Some(co) = out.loop_coedges(lid) {
+                    for c in co { *uses.entry(out.coedges[c].edge).or_insert(0) += 1; }
+                }
+            }
+        }
+        let mut bad: Vec<_> = uses.iter().filter(|(_, &n)| n != 2).collect();
+        bad.sort_by_key(|(e, _)| format!("{:?}", e));
+        eprintln!("DBG parallel: {} faces, {} edges, {} used!=2", out.shells[shell].faces.len(), uses.len(), bad.len());
+        for (e, n) in bad.iter().take(6) {
+            let ed = &out.edges[**e];
+            let p0 = out.vertices[ed.v_start].point;
+            let p1 = out.vertices[ed.v_end].point;
+            eprintln!("  edge used {}x: ({:.3},{:.3},{:.3})->({:.3},{:.3},{:.3}) geom={}", n,
+                p0.x,p0.y,p0.z, p1.x,p1.y,p1.z,
+                match &ed.geom { cadcore_topo::EdgeGeom::Line(_)=>"Line", cadcore_topo::EdgeGeom::Circle(_)=>"Circle",
+                    cadcore_topo::EdgeGeom::Ellipse(_)=>"Ellipse", cadcore_topo::EdgeGeom::Polyline(_)=>"Polyline" });
+        }
+    }
+    let step = cadcore_step::brep_to_step(&out).expect("step");
+    let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../repro/newengine_two_parallel.step");
+    let _ = std::fs::write(&outp, &step);
+    let viol = manifold_check(&step);
+    println!("two parallel: {} bytes, {} violations", step.len(), viol.len());
+    assert!(viol.is_empty(), "{} violations e.g. {:?}", viol.len(), &viol[..viol.len().min(4)]);
 }

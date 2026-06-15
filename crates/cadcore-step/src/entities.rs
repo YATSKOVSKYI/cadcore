@@ -401,7 +401,7 @@ fn param_context_2d(ctx: &mut Ctx) -> Result<usize, StepError> {
 }
 
 /// `CARTESIAN_POINT` with two coordinates (a `(u,v)` parameter point).
-fn emit_point2d(ctx: &mut Ctx, u: f64, v: f64) -> Result<usize, StepError> {
+pub(crate) fn emit_point2d(ctx: &mut Ctx, u: f64, v: f64) -> Result<usize, StepError> {
     let id = ctx.next_id();
     ctx.emit_raw(id, &format!("CARTESIAN_POINT('',({u:.10},{v:.10}))"))?;
     Ok(id)

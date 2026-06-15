@@ -59,6 +59,22 @@ pub fn union_n(solids: &[(&BRep, &[FaceId])], knit: f64) -> Option<(BRep, ShellI
         return None;
     }
 
+    // Each solid's curved lateral surface(s) — for splitting intersection curves
+    // at TRIPLE points where a third body's surface crosses them.
+    let solid_surfs: Vec<Vec<AnalyticSurface>> = solids
+        .iter()
+        .map(|(b, faces)| {
+            faces
+                .iter()
+                .filter_map(|&f| match &b.faces[f].geom {
+                    FaceGeom::Cylinder(s) => Some(AnalyticSurface::Cylinder(*s)),
+                    FaceGeom::Torus(s) => Some(AnalyticSurface::Torus(*s)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+
     // SSI per (solid index, face), each cross-solid pair traced ONCE and
     // pre-split identically for both faces it lies on.
     let mut ssi: Vec<HashMap<FaceId, Vec<SsiCurve>>> = vec![HashMap::new(); n];
@@ -66,6 +82,13 @@ pub fn union_n(solids: &[(&BRep, &[FaceId])], knit: f64) -> Option<(BRep, ShellI
         for j in (i + 1)..n {
             let (bi, fi) = solids[i];
             let (bj, fj) = solids[j];
+            // every OTHER body's lateral surface: where this (i,j) curve crosses
+            // one of them, all three meet → a triple point that must be a shared
+            // vertex on every curve through it.
+            let crossers: Vec<AnalyticSurface> = (0..n)
+                .filter(|&k| k != i && k != j)
+                .flat_map(|k| solid_surfs[k].iter().copied())
+                .collect();
             for (fa, fb) in candidate_pairs(bi, fi, bj, fj, knit) {
                 let curves = intersect_faces(bi, fa, bj, fb);
                 if curves.is_empty() {
@@ -82,15 +105,10 @@ pub fn union_n(solids: &[(&BRep, &[FaceId])], knit: f64) -> Option<(BRep, ShellI
                     }
                 }
                 for c in curves {
-                    if c.closed && !seams.is_empty() {
-                        for arc in presplit_loop(&c.points, &seams) {
-                            let piece = SsiCurve { points: arc, closed: false };
-                            ssi[i].entry(fa).or_default().push(piece.clone());
-                            ssi[j].entry(fb).or_default().push(piece);
-                        }
-                    } else {
-                        ssi[i].entry(fa).or_default().push(c.clone());
-                        ssi[j].entry(fb).or_default().push(c);
+                    for arc in split_curve(&c.points, c.closed, &seams, &crossers) {
+                        let piece = SsiCurve { points: arc, closed: false };
+                        ssi[i].entry(fa).or_default().push(piece.clone());
+                        ssi[j].entry(fb).or_default().push(piece);
                     }
                 }
             }
@@ -343,7 +361,115 @@ fn snap_ssi_endpoints(ssi: &mut [HashMap<FaceId, Vec<SsiCurve>>], tol: f64) {
 /// `φ=0` outer equator (`h=0 & a>R`).  Split points are refined onto ALL the
 /// carriers so they are exact shared vertices; both faces consume the SAME
 /// arcs ⇒ identical subdivision.
-fn presplit_loop(loop_pts: &[Point3], surfs: &[AnalyticSurface]) -> Vec<Vec<Point3>> {
+/// Signed distance of `p` to a crosser surface (0 ⇔ on it; sign = in/out).
+fn signed_dist(s: &AnalyticSurface, p: Point3) -> f64 {
+    match s {
+        AnalyticSurface::Cylinder(c) => {
+            let w = p - c.frame.origin;
+            let axial = c.axis().dot_vec(w);
+            let radial = (w - c.axis().as_vec() * axial).length();
+            radial - c.radius
+        }
+        AnalyticSurface::Torus(t) => {
+            let w = p - t.frame.origin;
+            let h = t.frame.z.dot_vec(w);
+            let a = (w - t.frame.z.as_vec() * h).length();
+            ((a - t.major_radius).powi(2) + h * h).sqrt() - t.minor_radius
+        }
+        AnalyticSurface::Plane(_) => f64::MAX,
+    }
+}
+
+/// Append cuts where the polyline TRANSVERSALLY crosses a third body's surface
+/// (the signed distance changes sign) — a triple point.  Each cut is refined
+/// onto the curve's carriers PLUS that surface, so it is an exact shared vertex
+/// every curve through the triple point converges to.  `nseg` segments are
+/// scanned (`n` for a closed loop, `n-1` for an open arc).
+fn add_crosser_cuts(
+    pts: &[Point3],
+    n: usize,
+    nseg: usize,
+    carriers: &[AnalyticSurface],
+    crossers: &[AnalyticSurface],
+    cuts: &mut Vec<(usize, f64, Point3)>,
+) {
+    use crate::geom::refine::refine_point;
+    for s in crossers {
+        let onto: Vec<AnalyticSurface> =
+            carriers.iter().chain(std::iter::once(s)).copied().collect();
+        for i in 0..nseg {
+            let p0 = pts[i];
+            let p1 = pts[(i + 1) % n];
+            let v0 = signed_dist(s, p0);
+            let v1 = signed_dist(s, p1);
+            if (v0 > 0.0) != (v1 > 0.0) && (v0 - v1).abs() > 1e-15 {
+                let t = v0 / (v0 - v1);
+                let approx = p0 + (p1 - p0) * t;
+                let (exact, _) = refine_point(approx, &onto, 1e-12, 40);
+                cuts.push((i, t, exact));
+            }
+        }
+    }
+}
+
+/// Split an SSI curve at all carrier seams (closed loops) and all third-body
+/// crossings (triple points), returning shared arcs.
+fn split_curve(
+    points: &[Point3],
+    closed: bool,
+    carriers: &[AnalyticSurface],
+    crossers: &[AnalyticSurface],
+) -> Vec<Vec<Point3>> {
+    if closed && !carriers.is_empty() {
+        presplit_loop(points, carriers, crossers)
+    } else {
+        presplit_open(points, carriers, crossers)
+    }
+}
+
+/// Split an OPEN arc at third-body crossings (triple points), linear walk.
+fn presplit_open(
+    points: &[Point3],
+    carriers: &[AnalyticSurface],
+    crossers: &[AnalyticSurface],
+) -> Vec<Vec<Point3>> {
+    let n = points.len();
+    if n < 2 {
+        return vec![points.to_vec()];
+    }
+    let mut cuts: Vec<(usize, f64, Point3)> = Vec::new();
+    add_crosser_cuts(points, n, n - 1, carriers, crossers, &mut cuts);
+    if cuts.is_empty() {
+        return vec![points.to_vec()];
+    }
+    cuts.sort_by(|a, b| (a.0, a.1).partial_cmp(&(b.0, b.1)).unwrap());
+    cuts.dedup_by(|b, a| (a.2 - b.2).length() < 1e-3);
+    let mut arcs: Vec<Vec<Point3>> = Vec::new();
+    let mut cur: Vec<Point3> = vec![points[0]];
+    let mut ci = 0usize;
+    for i in 0..(n - 1) {
+        while ci < cuts.len() && cuts[ci].0 == i {
+            cur.push(cuts[ci].2);
+            arcs.push(std::mem::take(&mut cur));
+            cur = vec![cuts[ci].2];
+            ci += 1;
+        }
+        let endp = points[i + 1];
+        if cur.last().map_or(true, |&q| (q - endp).length() > 1e-12) {
+            cur.push(endp);
+        }
+    }
+    if cur.len() >= 2 {
+        arcs.push(cur);
+    }
+    arcs
+}
+
+fn presplit_loop(
+    loop_pts: &[Point3],
+    surfs: &[AnalyticSurface],
+    crossers: &[AnalyticSurface],
+) -> Vec<Vec<Point3>> {
     use crate::geom::refine::refine_point;
     let n = loop_pts.len();
     if n < 3 {
@@ -351,6 +477,7 @@ fn presplit_loop(loop_pts: &[Point3], surfs: &[AnalyticSurface]) -> Vec<Vec<Poin
     }
     // (segment index, fraction along it) of each seam crossing → refined point.
     let mut cuts: Vec<(usize, f64, Point3)> = Vec::new();
+    add_crosser_cuts(loop_pts, n, n, surfs, crossers, &mut cuts);
     for s in surfs {
         // f(p) = signed coord whose zero (with the side guard) marks the seam.
         let seam_value = |p: Point3| -> (f64, bool) {

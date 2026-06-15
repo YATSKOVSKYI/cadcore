@@ -13,13 +13,13 @@ use cadcore_topo::{
 };
 
 use crate::entities::{
-    arc_edge_key, dir_key, emit_cylinder, emit_ellipse, emit_pcurve, emit_plane, emit_point,
-    emit_polyline2d, emit_polyline3d, emit_rational_bspline_surface, emit_sphere,
+    arc_edge_key, dir_key, emit_cylinder, emit_ellipse, emit_line2d, emit_pcurve, emit_plane,
+    emit_point, emit_polyline2d, emit_polyline3d, emit_rational_bspline_surface, emit_sphere,
     emit_surface_curve, emit_torus,
-    emit_unit_direction, emit_vertex_point, point_key, Ctx, StepCurveKey, StepError,
+    emit_unit_direction, emit_vector, emit_vertex_point, point_key, Ctx, StepCurveKey, StepError,
 };
 use crate::nurbs::torus_patch_nurbs;
-use crate::pcurve::cyl_pcurve;
+use crate::pcurve::{cyl_pcurve, cyl_uv};
 
 /// Per-shell context for pcurve emission: each face's emitted surface id, and
 /// the faces adjacent to each (topologically-shared) edge.
@@ -541,8 +541,14 @@ impl<'a> StepWriter<'a> {
                     FaceNormal::Reversed => ".F.",
                 };
                 // Analytic-union faces carry explicit B-Rep topology; walk the
-                // real CoEdge/Edge arenas instead of a closed-form template.
-                let bounds = if matches!(face.extent, FaceExtent::Trimmed) {
+                // real CoEdge/Edge arenas instead of a closed-form template.  A
+                // scaffold elbow (TorusFillet) also has explicit minor-circle
+                // loops, so it rides the same analytic path (its circles then get
+                // torus pcurves that pin the θ-band on the TOROIDAL_SURFACE).
+                let bounds = if matches!(
+                    face.extent,
+                    FaceExtent::Trimmed | FaceExtent::TorusFillet { .. }
+                ) {
                     self.emit_trimmed_face_bounds(ctx, face, &pc)?
                 } else {
                     emit_face_bounds(ctx, face)?
@@ -719,7 +725,9 @@ impl<'a> StepWriter<'a> {
                 _ => continue,
             };
             match &edge.geom {
-                EdgeGeom::Line(_) => push_shared_line(ctx, p_from, p_to, &mut oes)?,
+                EdgeGeom::Line(_) => {
+                    self.push_shared_line_pc(ctx, p_from, p_to, ce.edge, pc, &mut oes)?
+                }
                 EdgeGeom::Circle(c) => {
                     self.push_shared_arc_pc(ctx, c, p_from, p_to, ce.edge, pc, &mut oes)?;
                 }
@@ -931,13 +939,22 @@ impl<'a> StepWriter<'a> {
         let (ec_id, orig_start) = if let Some(&pair) = ctx.edge_cache.get(&key) {
             pair
         } else {
-            // 3D piecewise-linear edge curve (degree-1 B-spline; POLYLINE is
-            // dropped by SolidWorks' importer).
-            let pt_ids: Vec<usize> = pts
-                .iter()
-                .map(|p| emit_point(ctx, *p, "pl"))
-                .collect::<Result<_, _>>()?;
-            let pl = emit_polyline3d(ctx, &pt_ids)?;
+            // A sampled intersection curve is smooth: interpolate it with a
+            // degree-3 B-spline (deviation ≈h⁴ vs the chord's ≈h²) when it has
+            // ≥4 points; the pcurves below reuse its parameterisation so the
+            // SURFACE_CURVE stays consistent.  Short runs fall back to a degree-1
+            // curve (POLYLINE is dropped by SolidWorks' importer).
+            let cubic = crate::interp::emit_cubic_curve3d(ctx, pts)?;
+            let pl = match &cubic {
+                Some((id, _, _)) => *id,
+                None => {
+                    let pt_ids: Vec<usize> = pts
+                        .iter()
+                        .map(|p| emit_point(ctx, *p, "pl"))
+                        .collect::<Result<_, _>>()?;
+                    emit_polyline3d(ctx, &pt_ids)?
+                }
+            };
             // pcurve on each adjacent CYLINDER face (torus pcurves: Phase 5).
             let mut pcurves = Vec::new();
             if let Some(faces) = pc.edge_faces.get(&edge_id) {
@@ -968,7 +985,10 @@ impl<'a> StepWriter<'a> {
                                 }
                                 _ => cyl_pcurve(c, pts, Some(std::f64::consts::PI)),
                             };
-                            let c2d = emit_polyline2d(ctx, &uv)?;
+                            let c2d = match &cubic {
+                                Some((_, t, u)) => crate::interp::emit_cubic_curve2d(ctx, &uv, t, u)?,
+                                None => emit_polyline2d(ctx, &uv)?,
+                            };
                             pcurves.push(emit_pcurve(ctx, surf_id, c2d)?);
                         }
                         FaceGeom::Torus(t) => {
@@ -1025,6 +1045,78 @@ impl<'a> StepWriter<'a> {
     /// MIXED wires (notched boundaries, strips) must carry pcurves on the same
     /// branch as the wire's polylines — otherwise the importer projects them
     /// onto its own principal branch and the wire opens in parameter space.
+    /// Emit a straight edge.  A LINE between PLANE faces only is emitted bare
+    /// (OCC recomputes the trivial planar pcurves).  A straight edge that bounds
+    /// a CYLINDER (a generatrix) or any other curved/periodic surface needs a
+    /// pcurve on that surface, so it routes through the sampled-polyline path,
+    /// whose degree-1 pcurves match its parameterisation — the same proven path
+    /// used before analytic-edge recovery.
+    fn push_shared_line_pc(
+        &self,
+        ctx: &mut Ctx,
+        p_from: Point3,
+        p_to: Point3,
+        edge_id: EdgeId,
+        pc: &PcurveCtx,
+        oe_ids: &mut Vec<usize>,
+    ) -> Result<(), StepError> {
+        let needs_pcurve = pc.edge_faces.get(&edge_id).is_some_and(|faces| {
+            faces.iter().any(|&f| {
+                self.brep
+                    .faces
+                    .get(f)
+                    .is_some_and(|fc| !matches!(fc.geom, FaceGeom::Plane(_)))
+            })
+        });
+        if needs_pcurve {
+            return self.emit_polyline_edge_pc(ctx, edge_id, &[p_from, p_to], oe_ids, pc);
+        }
+        push_shared_line(ctx, p_from, p_to, oe_ids)
+    }
+
+    /// Whether `c` is a genuine major (constant φ) or minor (constant θ) circle
+    /// of this toroidal `face` — the only circles whose torus pcurve is a
+    /// straight line in (θ, φ).  Sampling the circle and checking that one torus
+    /// parameter stays constant rejects an intersection arc that is only
+    /// *locally* circular (e.g. where two tori meet), whose bogus line pcurve
+    /// would otherwise inflate the OCC edge tolerance.
+    fn torus_circle_is_analytic(&self, face: &cadcore_topo::Face, c: &cadcore_geom::Circle3) -> bool {
+        let FaceGeom::Torus(t) = &face.geom else {
+            return false;
+        };
+        let Some((lo, hi)) = self.torus_arc_range(face) else {
+            return false;
+        };
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let uvs: Vec<(f64, f64)> = [0.0, FRAC_PI_2, PI, 3.0 * FRAC_PI_2]
+            .iter()
+            .map(|&a| torus_uv_in_band(t, c.point_at(a), lo, hi))
+            .collect();
+        let circ_spread = |vals: &[f64]| -> f64 {
+            let (mut sx, mut sy) = (0.0, 0.0);
+            for &a in vals {
+                sx += a.cos();
+                sy += a.sin();
+            }
+            let mean = sy.atan2(sx);
+            vals.iter()
+                .map(|&a| {
+                    let mut d = a - mean;
+                    while d > PI {
+                        d -= 2.0 * PI;
+                    }
+                    while d < -PI {
+                        d += 2.0 * PI;
+                    }
+                    d.abs()
+                })
+                .fold(0.0_f64, f64::max)
+        };
+        let us: Vec<f64> = uvs.iter().map(|p| p.0).collect();
+        let vs: Vec<f64> = uvs.iter().map(|p| p.1).collect();
+        circ_spread(&us) < 1e-4 || circ_spread(&vs) < 1e-4
+    }
+
     fn push_shared_arc_pc(
         &self,
         ctx: &mut Ctx,
@@ -1035,6 +1127,43 @@ impl<'a> StepWriter<'a> {
         pc: &PcurveCtx,
         oe_ids: &mut Vec<usize>,
     ) -> Result<(), StepError> {
+        // An analytic CIRCLE needs an analytic pcurve whose parameter is the
+        // SAME angle θ on every adjacent surface (a STEP SURFACE_CURVE shares
+        // one parameter range across the 3-D curve and all pcurves).  A circle
+        // lying on a CYLINDER (a cross-section) or an analytic TOROIDAL_SURFACE
+        // (a minor φ-circle or a major-θ arc) maps to a straight 2-D LINE in
+        // (u,v); a PLANE leaves OCC to recompute the trivial pcurve.  For a
+        // SPHERE, or a torus still emitted as a NURBS arc patch (where the
+        // pcurve is not a straight line), fall back to the proven
+        // sampled-polyline path.  Both users of the shared edge see the same
+        // adjacent faces, so they take the same branch and weld into one
+        // EDGE_CURVE.
+        let needs_polyline = pc.edge_faces.get(&edge_id).is_some_and(|faces| {
+            faces.iter().any(|&f| {
+                self.brep.faces.get(f).is_some_and(|fc| match &fc.geom {
+                    FaceGeom::Plane(_) => false,
+                    // Analytic only when the circle is a genuine cross-section of
+                    // THIS cylinder.  A cyl∩cyl intersection arc (an ellipse for
+                    // equal radii) is locally near-circular, so the arrangement
+                    // can mis-fit a circle to a short segment; its bogus
+                    // cross-section pcurve would inflate the OCC edge tolerance.
+                    FaceGeom::Cylinder(cyl) => !cyl_circle_is_analytic(cyl, c),
+                    // Likewise: analytic only when the circle is a genuine
+                    // major/minor circle of THIS torus.
+                    FaceGeom::Torus(_) => {
+                        !torus_is_toroidal(fc) || !self.torus_circle_is_analytic(fc, c)
+                    }
+                    _ => true,
+                })
+            })
+        });
+        if needs_polyline {
+            // Reproduce the pre-analytic output EXACTLY for torus/sphere-adjacent
+            // arcs: emit the segment's own endpoints as a degree-1 edge with the
+            // surface's matching polyline pcurve.  (Re-sampling the arc here would
+            // perturb the shared geometry and reopen the shell.)
+            return self.emit_polyline_edge_pc(ctx, edge_id, &[p_from, p_to], oe_ids, pc);
+        }
         let (centre, axis, xref, r) = (c.frame.origin, c.frame.z, c.frame.x, c.radius);
         let v_from = emit_vertex_point(ctx, p_from)?;
         let v_to = emit_vertex_point(ctx, p_to)?;
@@ -1075,7 +1204,13 @@ impl<'a> StepWriter<'a> {
             writeln!(ctx.out, "#{ax} = AXIS2_PLACEMENT_3D('',#{cp},#{cn},#{cx});")?;
             let ci = ctx.next_id();
             writeln!(ctx.out, "#{ci} = CIRCLE('',#{ax},{:.10});", r)?;
-            // Explicit pcurves on every adjacent trimmed cylinder face.
+            // Analytic 2-D LINE pcurve per adjacent CYLINDER face.  A coaxial
+            // cross-section circle maps to u(θ)=u0+s·θ, v=v0 (s=±1 by axis
+            // alignment) — a straight line in (θ, axial) parameter space whose
+            // parameter is the circle's own angle θ, so it shares the edge's
+            // parameter range with the 3-D CIRCLE.  Plane faces are left bare:
+            // OCC recomputes the planar pcurve exactly and without periodicity
+            // ambiguity.
             let mut pcurves = Vec::new();
             if let Some(faces) = pc.edge_faces.get(&edge_id) {
                 for &f in faces {
@@ -1084,31 +1219,48 @@ impl<'a> StepWriter<'a> {
                     else {
                         continue;
                     };
-                    let FaceGeom::Cylinder(cyl) = &face.geom else {
-                        continue;
+                    let two_pi = std::f64::consts::PI * 2.0;
+                    let unwrap_pi = |mut d: f64| -> f64 {
+                        while d > std::f64::consts::PI {
+                            d -= two_pi;
+                        }
+                        while d <= -std::f64::consts::PI {
+                            d += two_pi;
+                        }
+                        d
                     };
-                    let Some(stored) = pc.wire_uv.get(&(f, edge_id)) else {
-                        continue;
+                    let c2d = match &face.geom {
+                        FaceGeom::Cylinder(cyl) => {
+                            // Cross-section circle → u(θ)=u0+s·θ, v=v0.
+                            let (u0, v0) = cyl_uv(cyl, c.point_at(0.0));
+                            let (u1, _) = cyl_uv(cyl, c.point_at(std::f64::consts::FRAC_PI_2));
+                            let s = if unwrap_pi(u1 - u0) >= 0.0 { 1.0 } else { -1.0 };
+                            emit_line2d(ctx, u0, v0, s, 0.0)?
+                        }
+                        FaceGeom::Torus(t) if torus_is_toroidal(face) => {
+                            // A circle on the torus is either a minor φ-circle
+                            // (u≈const, v=φ) or a major-θ arc (u=θ, v≈const).
+                            // Sample (u,v) at θ=0 and a small δ to find which
+                            // parameter the circle's angle θ drives, with unit
+                            // slope ±1 (the torus angle equals the circle angle
+                            // up to sign/offset), so the pcurve's parameter is θ.
+                            let Some((lo, hi)) = self.torus_arc_range(face) else {
+                                continue;
+                            };
+                            let (u0, v0) = torus_uv_in_band(t, c.point_at(0.0), lo, hi);
+                            let (u1, v1) = torus_uv_in_band(t, c.point_at(1e-3), lo, hi);
+                            let du = unwrap_pi(u1 - u0);
+                            let dv = unwrap_pi(v1 - v0);
+                            if du.abs() >= dv.abs() {
+                                let s = if du >= 0.0 { 1.0 } else { -1.0 };
+                                emit_line2d(ctx, u0, v0, s, 0.0)?
+                            } else {
+                                let s = if dv >= 0.0 { 1.0 } else { -1.0 };
+                                emit_line2d(ctx, u0, v0, 0.0, s)?
+                            }
+                        }
+                        _ => continue,
                     };
-                    if stored.len() < 2 {
-                        continue;
-                    }
-                    // Align the stored (face-traversal) chain to THIS edge's
-                    // 3D direction (p_from → p_to).
-                    let raw0 = crate::pcurve::cyl_uv(cyl, p_from);
-                    let near = |s: (f64, f64)| -> bool {
-                        let du = (s.0 - raw0.0).rem_euclid(2.0 * std::f64::consts::PI);
-                        (du < 1e-5 || du > 2.0 * std::f64::consts::PI - 1e-5)
-                            && (s.1 - raw0.1).abs() < 1e-5
-                    };
-                    let uv: Vec<(f64, f64)> = if near(stored[0]) {
-                        stored.clone()
-                    } else if near(*stored.last().unwrap()) {
-                        stored.iter().rev().copied().collect()
-                    } else {
-                        continue;
-                    };
-                    let c2d = emit_polyline2d(ctx, &uv)?;
                     pcurves.push(emit_pcurve(ctx, surf_id, c2d)?);
                 }
             }
@@ -2035,8 +2187,11 @@ fn push_shared_line(
         };
         let lp = emit_point(ctx, p_from, "rbl_p")?;
         let ld = emit_unit_direction(ctx, dir, "rbl_d")?;
+        // STEP `LINE` takes a VECTOR (direction + magnitude), NOT a bare
+        // DIRECTION — OCC access-violates on a LINE that references a DIRECTION.
+        let lv = emit_vector(ctx, ld, 1.0, "rbl_v")?;
         let li = ctx.next_id();
-        writeln!(ctx.out, "#{li} = LINE('',#{lp},#{ld});")?;
+        writeln!(ctx.out, "#{li} = LINE('',#{lp},#{lv});")?;
         let ec = ctx.next_id();
         writeln!(
             ctx.out,
@@ -2225,12 +2380,40 @@ fn unwrap_loop_uv(uv: &mut [(f64, f64)], per_u: bool, per_v: bool) {
 /// (with native (θ,φ) pcurves) rather than the rational-NURBS arc patch: true
 /// when it has been cut into windows, where the NURBS patch's numerically
 /// inverted pcurves are unreliable and OCC reports "Unorientable".
+/// Whether `c` is a genuine cross-section circle of `cyl` — perpendicular to the
+/// axis, radius = cylinder radius, centred on the axis — the only circle whose
+/// cylinder pcurve is a straight line u(θ)=u0+s·θ, v=const.  Sampling the FULL
+/// circle and checking every point lies on the cylinder (constant axial v,
+/// radial distance = cylinder radius) rejects an arc that is only LOCALLY
+/// circular (a mis-fit osculating circle of a cyl∩cyl ellipse), whose bogus line
+/// pcurve would inflate the OCC edge tolerance.
+fn cyl_circle_is_analytic(cyl: &cadcore_geom::CylSurf, c: &cadcore_geom::Circle3) -> bool {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let axis = cyl.axis();
+    let (mut vmin, mut vmax) = (f64::MAX, f64::MIN);
+    for &a in &[0.0, FRAC_PI_2, PI, 3.0 * FRAC_PI_2] {
+        let w = c.point_at(a) - cyl.frame.origin;
+        let v = axis.dot_vec(w); // axial coordinate
+        let radial = (w - axis.as_vec() * v).length();
+        if (radial - cyl.radius).abs() > 1e-4 {
+            return false; // point off the cylinder ⇒ not a cross-section
+        }
+        vmin = vmin.min(v);
+        vmax = vmax.max(v);
+    }
+    vmax - vmin < 1e-4 // constant axial ⇒ perpendicular cross-section
+}
+
 fn torus_is_toroidal(face: &cadcore_topo::Face) -> bool {
-    // Any *cut* torus (Trimmed extent) carries native (θ,φ) loops, so emit it
-    // analytically — whether it was windowed (inner loops) or sliced into a
-    // φ-band by a coaxial stack (outer loop only).  The plain scaffold fillet
-    // keeps FaceExtent::TorusFillet and still rides the rational-NURBS patch.
-    matches!(face.extent, FaceExtent::Trimmed)
+    // Emit analytically (native (θ,φ) loops) for any cut torus (Trimmed —
+    // windowed or φ-band sliced) AND for a plain scaffold fillet
+    // (FaceExtent::TorusFillet): its two minor end-circles now carry analytic
+    // torus pcurves (u = θ_end lines) that pin the θ-band, so the analytic
+    // TOROIDAL_SURFACE is unambiguous — no rational-NURBS patch needed.
+    matches!(
+        face.extent,
+        FaceExtent::Trimmed | FaceExtent::TorusFillet { .. }
+    )
 }
 
 /// Make a torus pcurve continuous: unwrap each point's (θ,φ) onto the branch
@@ -3254,9 +3437,9 @@ mod tests {
         let step = brep_to_step(&brep).expect("emit STEP");
         assert_eq!(count(&step, "ADVANCED_FACE"), 2);
         assert_eq!(
-            count(&step, "B_SPLINE_CURVE_WITH_KNOTS('',1,"),
+            count(&step, "B_SPLINE_CURVE_WITH_KNOTS('',3,"),
             1,
-            "single shared SSI curve (deg-1 b-spline)"
+            "single shared SSI curve, interpolated as a degree-3 B-spline"
         );
         assert_eq!(count(&step, "POLYLINE"), 0, "no POLYLINE entities");
         let uses = oriented_edge_uses(&step);

@@ -150,7 +150,10 @@ pub enum EdgeGeom {
     /// Used for tolerance-sampled surface–surface intersection curves produced
     /// by the analytic Boolean **union** (e.g. the cylinder∩cylinder quartic at
     /// a woodpile crossing).  Points run from the edge's `v_start` to `v_end`.
-    /// Emitted to STEP as a `POLYLINE` bounded curve.
+    /// Points run from the edge's `v_start` to `v_end`.  A run of ≥4 points is a
+    /// tolerance-sampled SMOOTH intersection curve and is emitted to STEP as a
+    /// degree-3 B-spline (low deviation at coarse spacing); 2–3 points stay a
+    /// degree-1 chord.
     Polyline(Vec<Point3>),
 }
 

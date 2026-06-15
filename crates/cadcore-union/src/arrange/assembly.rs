@@ -82,6 +82,215 @@ fn fit_circle(poly: &[Point3]) -> Option<Circle3> {
     Some(Circle3::new(centre, cadcore_math::UnitVec3::try_from_vec(axis)?, r))
 }
 
+/// An analytic shape recovered from a lifted 3-D polyline edge.
+///
+/// SSI curves and trimmed boundary arcs arrive as tolerance-sampled polylines.
+/// Emitting them verbatim makes the STEP writer produce degree-1 chord
+/// B-splines whose deviation from the true surface (the chord sagitta, up to
+/// ~0.2 mm here) inflates the OCC edge tolerance — which strict importers
+/// (Parasolid / SolidWorks) read as self-intersections.  Recovering the exact
+/// `Line` / `Circle` collapses that tolerance to ~1e-7.
+enum EdgeShape {
+    /// Collinear points → exact line segment.
+    Line,
+    /// Co-circular points → exact circular arc on this circle.
+    Arc(Circle3),
+    /// Genuinely free-form (transcendental SSI curve) — keep as a polyline.
+    Free,
+}
+
+#[inline]
+fn dot3(a: cadcore_math::Vec3, b: cadcore_math::Vec3) -> f64 {
+    a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+/// Circumcircle of three 3-D points: `(centre, axis, radius)`.  `None` when the
+/// points are (near-)collinear.
+fn circumcircle(a: Point3, b: Point3, c: Point3) -> Option<(Point3, cadcore_math::UnitVec3, f64)> {
+    let ab = b - a;
+    let ac = c - a;
+    let n = ab.cross(ac);
+    let n2 = dot3(n, n);
+    if n2 < 1e-24 {
+        return None; // collinear — no finite circle
+    }
+    // Vector from `a` to the circumcentre (Ericson, Real-Time Collision Detection).
+    let to_centre =
+        (n.cross(ab) * dot3(ac, ac) + ac.cross(n) * dot3(ab, ab)) * (1.0 / (2.0 * n2));
+    let centre = a + to_centre;
+    let axis = cadcore_math::UnitVec3::try_from_vec(n)?;
+    let r = to_centre.length();
+    Some((centre, axis, r))
+}
+
+/// Classify a lifted 3-D polyline as an exact `Line` or `Arc` when its points
+/// lie on one within `ftol`; otherwise `Free`.  `ftol` is tight so genuine
+/// transcendental SSI curves (which deviate macroscopically from any
+/// line/circle) are never mis-recovered.
+fn classify_edge(poly: &[Point3], ftol: f64) -> EdgeShape {
+    let n = poly.len();
+    if n < 2 {
+        return EdgeShape::Free;
+    }
+    let p0 = poly[0];
+    let pe = poly[n - 1];
+    let chord = pe - p0;
+    let chord_len = chord.length();
+
+    // ── Line: every point within ftol of the chord p0→pe (open edge only;
+    //    a closed loop has p0≈pe and cannot be a line). ──
+    if chord_len > 1e-9 {
+        if let Some(dir) = chord.try_normalize() {
+            let max_perp = poly
+                .iter()
+                .map(|&p| {
+                    let w = p - p0;
+                    let along = dot3(dir, w);
+                    (w - dir * along).length()
+                })
+                .fold(0.0_f64, f64::max);
+            if max_perp < ftol {
+                return EdgeShape::Line;
+            }
+        }
+    }
+
+    // ── Circle / arc: fit through three spread points, verify all. ──
+    if n >= 3 {
+        let (a, b, c) = (poly[0], poly[n / 2], poly[n - 1]);
+        if let Some((centre, axis, r)) = circumcircle(a, b, c) {
+            // Reject implausibly flat fits (huge radius from near-collinear
+            // points) — those are better served as a polyline / spline.
+            if r.is_finite() && r > 1e-9 && r < 1e6 {
+                let ok = poly.iter().all(|&p| {
+                    let radial = ((p - centre).length() - r).abs();
+                    let planar = dot3(axis.as_vec(), p - centre).abs();
+                    radial < ftol && planar < ftol
+                });
+                if ok {
+                    return EdgeShape::Arc(Circle3::new(centre, axis, r));
+                }
+            }
+        }
+    }
+
+    EdgeShape::Free
+}
+
+/// The analytic curve a run of same-`tag` segments was recovered to.  Every
+/// segment of the run is then emitted as a trimmed piece of this curve, keeping
+/// the original per-segment topology (and thus the watertight invariant) while
+/// upgrading degree-1 chord B-splines to exact LINE / CIRCLE geometry.
+#[derive(Clone, Copy)]
+enum RunCurve {
+    /// Run lies on this circle (full circle or arc) — segments become arcs.
+    Circle(Circle3),
+    /// Run is straight — segments become line segments.
+    Line,
+    /// Run is genuinely free-form — segments stay polylines.
+    Free,
+}
+
+/// Angle of `p` in `c`'s frame (radians).
+#[inline]
+fn circle_angle(c: &Circle3, p: Point3) -> f64 {
+    let w = p - c.frame.origin;
+    dot3(c.frame.y.as_vec(), w).atan2(dot3(c.frame.x.as_vec(), w))
+}
+
+/// For each step, the analytic curve of the same-`tag` run it belongs to.
+/// On a torus carrier, a run at (near-)constant φ is an arc of the MAJOR circle
+/// at that φ (the φ-seam / equator of the band); a run at constant θ is a minor
+/// circle.  Both are built EXACTLY from the torus geometry instead of fitting —
+/// which is the only way to recover the analytic arc from a 2-point seam segment
+/// (a point fit needs ≥3 spread points).  Returns `None` when the run varies in
+/// both θ and φ (a genuine transcendental imprint curve).
+fn torus_run_circle(domain: &FaceDomain, run_pts: &[Point3], ftol: f64) -> Option<Circle3> {
+    use std::f64::consts::{PI, TAU};
+    let surf = match domain {
+        FaceDomain::TorusPatch { surf, .. } | FaceDomain::TorusBand { surf } => surf,
+        _ => return None,
+    };
+    // The constructed circle must actually pass through EVERY run point — a short
+    // transcendental imprint segment can look locally constant-φ/θ yet not lie on
+    // the major/minor circle.  Verifying rejects those (they fall through to the
+    // fine-sampled polyline path).
+    let verify = |c: &Circle3| -> bool {
+        run_pts.iter().all(|&p| {
+            let w = p - c.frame.origin;
+            let planar = c.frame.z.dot_vec(w).abs();
+            let radial = (w - c.frame.z.as_vec() * c.frame.z.dot_vec(w)).length() - c.radius;
+            planar < ftol && radial.abs() < ftol
+        })
+    };
+    let uvs: Vec<(f64, f64)> = run_pts.iter().map(|&p| domain.uv(p)).collect();
+    let circ_mean = |angs: &[f64]| -> f64 {
+        let (mut sx, mut sy) = (0.0, 0.0);
+        for &a in angs {
+            sx += a.cos();
+            sy += a.sin();
+        }
+        sy.atan2(sx)
+    };
+    let spread = |angs: &[f64], mean: f64| -> f64 {
+        angs.iter()
+            .map(|&a| {
+                let mut d = a - mean;
+                while d > PI {
+                    d -= TAU;
+                }
+                while d < -PI {
+                    d += TAU;
+                }
+                d.abs()
+            })
+            .fold(0.0_f64, f64::max)
+    };
+    let thetas: Vec<f64> = uvs.iter().map(|p| p.0).collect();
+    let phis: Vec<f64> = uvs.iter().map(|p| p.1).collect();
+    let th_mean = circ_mean(&thetas);
+    let ph_mean = circ_mean(&phis);
+    let th_spread = spread(&thetas, th_mean);
+    let ph_spread = spread(&phis, ph_mean);
+    let flat = 1e-4;
+    if ph_spread < flat && th_spread > flat {
+        // constant φ → major circle (radius R + r·cosφ, centred on the axis at
+        // height r·sinφ, normal = torus axis).
+        let radius = surf.major_radius + surf.minor_radius * ph_mean.cos();
+        if radius <= 1e-9 {
+            return None;
+        }
+        let centre = surf.frame.origin + surf.frame.z * (surf.minor_radius * ph_mean.sin());
+        let c = Circle3::new(centre, surf.frame.z, radius);
+        return verify(&c).then_some(c);
+    }
+    if th_spread < flat && ph_spread > flat {
+        // constant θ → minor circle (radius r, centred on the ring, normal =
+        // ring tangent = ring_dir × axis).
+        let ring_dir = surf.frame.x * th_mean.cos() + surf.frame.y * th_mean.sin();
+        let centre = surf.frame.origin + ring_dir * surf.major_radius;
+        let axis = cadcore_math::UnitVec3::try_from_vec(ring_dir.cross(surf.frame.z.as_vec()))?;
+        let c = Circle3::new(centre, axis, surf.minor_radius);
+        return verify(&c).then_some(c);
+    }
+    None
+}
+
+/// Order of step indices for run-grouping: rotated so the loop starts at a tag
+/// boundary, ensuring a run that wraps past the loop's start index is grouped
+/// as ONE run.  Returns `0..n` when every step shares one tag (a single closed
+/// curve filling the whole loop).
+fn tag_run_order(steps: &[LoopStep]) -> Vec<usize> {
+    let n = steps.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    match (0..n).find(|&i| steps[i].tag != steps[(i + n - 1) % n].tag) {
+        Some(s) => (0..n).map(|k| (s + k) % n).collect(),
+        None => (0..n).collect(),
+    }
+}
+
 /// Midpoint of a polyline by arc length (independent of traversal sense).
 fn arc_midpoint(poly: &[Point3]) -> Point3 {
     let total: f64 = poly.windows(2).map(|w| (w[1] - w[0]).length()).sum();
@@ -199,6 +408,55 @@ impl<'b> Assembler<'b> {
     /// sense this user must traverse it with (`Same` for the first user,
     /// `Opposite` for the second).
     fn shared_edge(&mut self, poly3: &[Point3]) -> (EdgeId, CoEdgeSense) {
+        let geom = EdgeGeom::Polyline(poly3.to_vec());
+        self.shared_edge_geom(poly3, geom, 0.0, 1.0)
+    }
+
+    /// Emit one segment edge, trimmed onto its run's recovered analytic curve.
+    /// `poly3` is the segment's own (usually 2) lifted points; `rc` is the
+    /// curve fitted from the whole same-`tag` run it belongs to.
+    fn emit_step_edge(&mut self, poly3: &[Point3], rc: RunCurve) -> (EdgeId, CoEdgeSense) {
+        let from = poly3[0];
+        let to = *poly3.last().unwrap();
+        match rc {
+            RunCurve::Circle(c) => {
+                let t0 = circle_angle(&c, from);
+                let mut t1 = circle_angle(&c, to);
+                // a single segment subtends < π — unwrap the endpoint onto the
+                // short arc so `t_start..t_end` describes the real sweep.
+                let pi = std::f64::consts::PI;
+                while t1 - t0 > pi {
+                    t1 -= 2.0 * pi;
+                }
+                while t1 - t0 < -pi {
+                    t1 += 2.0 * pi;
+                }
+                self.shared_edge_geom(poly3, EdgeGeom::Circle(c), t0, t1)
+            }
+            RunCurve::Line => match (to - from).try_normalize() {
+                Some(dir) => {
+                    let len = (to - from).length();
+                    let udir = cadcore_math::UnitVec3::new_unchecked(dir);
+                    self.shared_edge_geom(poly3, EdgeGeom::Line(cadcore_geom::Line3::new(from, udir)), 0.0, len)
+                }
+                None => self.shared_edge(poly3),
+            },
+            RunCurve::Free => self.shared_edge(poly3),
+        }
+    }
+
+    /// Like [`shared_edge`] but stores an explicit `geom` and parameter range —
+    /// used to weld an analytic arc / line recovered from the lifted polyline.
+    /// Keying stays on the 3-D endpoints + arc midpoint, so the analytic edge
+    /// shares ONE `Edge` with a neighbour that presents the same byte-identical
+    /// points, regardless of which `EdgeGeom` form each chose.
+    fn shared_edge_geom(
+        &mut self,
+        poly3: &[Point3],
+        geom: EdgeGeom,
+        t_start: f64,
+        t_end: f64,
+    ) -> (EdgeId, CoEdgeSense) {
         let a = poly3[0];
         let b = *poly3.last().unwrap();
         // geometric arc midpoint by length — direction-agnostic, so the two
@@ -229,11 +487,11 @@ impl<'b> Assembler<'b> {
         let v_start = self.vertex(a);
         let v_end = self.vertex(b);
         let eid = self.brep.add_edge(Edge {
-            geom: EdgeGeom::Polyline(poly3.to_vec()),
+            geom,
             v_start,
             v_end,
-            t_start: 0.0,
-            t_end: 1.0,
+            t_start,
+            t_end,
             partner: None,
         });
         self.edges.insert(key, (eid, v_start));
@@ -248,11 +506,12 @@ impl<'b> Assembler<'b> {
             start: CoEdgeId::default(),
             face,
         });
-        let mut coedges: Vec<CoEdgeId> = Vec::with_capacity(steps.len());
+        // Lift every step's uv polyline to 3-D, snapping each point to its
+        // welded vertex so a shared edge is byte-identical on both faces, then
+        // drop consecutive duplicates the snap creates.  One entry per step,
+        // aligned with `steps`.
+        let mut step_poly: Vec<Vec<Point3>> = Vec::with_capacity(steps.len());
         for step in steps {
-            // lift this step's uv polyline to 3-D, snapping each point to its
-            // welded vertex so a shared edge is byte-identical on both faces,
-            // then drop consecutive duplicates the snap may create.
             let mut poly3: Vec<Point3> = Vec::with_capacity(step.pts.len());
             for &(u, v) in &step.pts {
                 let p = self.snap(domain.lift(u, v));
@@ -260,19 +519,28 @@ impl<'b> Assembler<'b> {
                     poly3.push(p);
                 }
             }
-            if poly3.len() < 2 {
-                continue;
-            }
-            // A full closed circle (a rim / junction circle that survived as one
-            // step) is welded by its centre/axis/radius via the analytic circle
-            // cache — rotation-invariant, so a cylinder rim and a torus minor
-            // circle split at different seams still share ONE edge.
-            let (edge, sense) = if let Some(c) = fit_circle(&poly3) {
-                self.shared_circle(c)
-            } else {
-                self.shared_edge(&poly3)
-            };
-            let ce = self.brep.add_coedge(CoEdge {
+            step_poly.push(poly3);
+        }
+
+        // The arrangement shatters every input chain into one `LoopStep` per
+        // 2-point segment, so a single source curve (a minor circle, a straight
+        // boundary, an SSI arc) arrives as a RUN of consecutive steps sharing
+        // one `tag`.  We fit each run as a whole to recover the exact line /
+        // circle it came from, then keep the ORIGINAL per-segment topology
+        // (one edge per step) — only the stored geometry changes.  This is what
+        // preserves the watertight invariant: the segment endpoints, the
+        // shared-edge keying and the co-edge structure are byte-identical to the
+        // proven polyline path; the neighbouring face fits the same run to the
+        // same circle (the writer reconstructs the arc from centre/axis/radius +
+        // the two vertices, independent of the frame's arbitrary X), so both
+        // emit one shared analytic EDGE_CURVE.  A 2-point arc segment is exact
+        // because its circle is known from the parent run, not inferred from the
+        // two points.
+        let ftol = (50.0 * self.tol).max(1e-5);
+        let order = tag_run_order(steps);
+        let mut coedges: Vec<CoEdgeId> = Vec::with_capacity(steps.len());
+        let mut push_coedge = |brep: &mut BRep, coedges: &mut Vec<CoEdgeId>, edge, sense| {
+            let ce = brep.add_coedge(CoEdge {
                 edge,
                 sense,
                 next: CoEdgeId::default(),
@@ -280,6 +548,43 @@ impl<'b> Assembler<'b> {
                 loop_id: lp,
             });
             coedges.push(ce);
+        };
+        let mut gi = 0;
+        while gi < order.len() {
+            let tag = steps[order[gi]].tag;
+            let seg_lo = gi;
+            let mut run_pts: Vec<Point3> = Vec::new();
+            while gi < order.len() && steps[order[gi]].tag == tag {
+                for &p in &step_poly[order[gi]] {
+                    if run_pts.last().map_or(true, |&q| (q - p).length() > 1e-12) {
+                        run_pts.push(p);
+                    }
+                }
+                gi += 1;
+            }
+            let seg_hi = gi;
+            if run_pts.len() < 2 {
+                continue;
+            }
+            let rc = if let Some(c) = torus_run_circle(domain, &run_pts, ftol) {
+                RunCurve::Circle(c)
+            } else if let Some(c) = fit_circle(&run_pts) {
+                RunCurve::Circle(c)
+            } else {
+                match classify_edge(&run_pts, ftol) {
+                    EdgeShape::Arc(c) => RunCurve::Circle(c),
+                    EdgeShape::Line => RunCurve::Line,
+                    EdgeShape::Free => RunCurve::Free,
+                }
+            };
+            for k in seg_lo..seg_hi {
+                let poly3 = &step_poly[order[k]];
+                if poly3.len() < 2 {
+                    continue;
+                }
+                let (edge, sense) = self.emit_step_edge(poly3, rc);
+                push_coedge(self.brep, &mut coedges, edge, sense);
+            }
         }
         // link the ring
         let n = coedges.len();
