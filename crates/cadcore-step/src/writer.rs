@@ -3604,6 +3604,56 @@ mod tests {
         }
     }
 
+    /// A closed-loop swept tube (continuous "extruder goes round in a circle"
+    /// G-code) must export a watertight AP214 shell — the welded seam shares one
+    /// EDGE_CURVE between the first and last cylinder, with no cap faces.
+    #[test]
+    fn closed_loop_sweep_stays_manifold() {
+        use cadcore_ops::{sweep_circle_along_closed_path, SweepPathSegment};
+
+        // Octagon loop in the XY plane — last vertex returns to the first.
+        let n = 8;
+        let r = 10.0_f64;
+        let mut pts = Vec::new();
+        for k in 0..n {
+            let a = std::f64::consts::TAU * (k as f64) / (n as f64);
+            pts.push(Point3::new(r * a.cos(), r * a.sin(), 0.0));
+        }
+        pts.push(pts[0]); // close the loop exactly
+        let segs: Vec<SweepPathSegment> = pts
+            .windows(2)
+            .map(|w| SweepPathSegment::Line {
+                start: w[0],
+                end: w[1],
+            })
+            .collect();
+
+        let mut brep = BRep::new();
+        sweep_circle_along_closed_path(
+            &mut brep,
+            &segs,
+            0.6,
+            &SweepOptions {
+                name: Some("loop".into()),
+                ..SweepOptions::default()
+            },
+        )
+        .unwrap();
+
+        // No cap faces on a closed loop.
+        let caps = brep
+            .faces
+            .values()
+            .filter(|f| matches!(f.geom, cadcore_topo::FaceGeom::Plane(_)))
+            .count();
+        assert_eq!(caps, 0, "closed loop must not emit planar caps");
+
+        let step = brep_to_step(&brep).unwrap();
+        if let Err(e) = check_ap214_manifold(&step) {
+            panic!("closed-loop sweep opened the shell:\n{e}");
+        }
+    }
+
     /// The 4 arc EDGE_CURVEs shared between caps and corner cylinders must each
     /// appear exactly once (no duplication).
     #[test]

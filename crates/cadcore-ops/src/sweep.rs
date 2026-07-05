@@ -696,6 +696,40 @@ pub fn sweep_circle_along_path_with_caps(
     start_cut_normal: Option<UnitVec3>,
     end_cut_normal: Option<UnitVec3>,
 ) -> Result<SolidId, SweepError> {
+    sweep_circle_capped_impl(brep, segments, radius, opts, start_cut_normal, end_cut_normal, false)
+}
+
+/// Sweep a circular profile along a **closed** analytic path (a loop whose last
+/// waypoint coincides with the first).
+///
+/// Unlike the open-path sweep this emits **no end caps**: the seam where the
+/// last segment meets the first is welded into a single shared `FaceBoundary`,
+/// so the start of segment 0 and the end of the last segment reference the same
+/// `EDGE_CURVE`.  The result is a watertight torus-topology tube — exactly what
+/// a continuous "extruder goes round in a circle" G-code loop should become.
+///
+/// The path must be geometrically closed (`segments[0].start ≈
+/// segments[last].end`); if it is not, this falls back to the open-path sweep
+/// with hemispherical caps so the caller never gets a broken solid.
+pub fn sweep_circle_along_closed_path(
+    brep: &mut BRep,
+    segments: &[SweepPathSegment],
+    radius: f64,
+    opts: &SweepOptions,
+) -> Result<SolidId, SweepError> {
+    sweep_circle_capped_impl(brep, segments, radius, opts, None, None, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sweep_circle_capped_impl(
+    brep: &mut BRep,
+    segments: &[SweepPathSegment],
+    radius: f64,
+    opts: &SweepOptions,
+    start_cut_normal: Option<UnitVec3>,
+    end_cut_normal: Option<UnitVec3>,
+    closed: bool,
+) -> Result<SolidId, SweepError> {
     if segments.is_empty() {
         return Err(SweepError::TooFewWaypoints);
     }
@@ -719,33 +753,65 @@ pub fn sweep_circle_along_path_with_caps(
         }
     }
 
+    // ── Closed-loop seam ─────────────────────────────────────────────────────
+    // A closed loop welds the last segment's end onto the first segment's start.
+    // We only honour the `closed` request when the path is GENUINELY closed
+    // (endpoints coincide) and there are no plane-cut caps; otherwise we fall
+    // back to the open-path behaviour so the caller never gets a broken solid.
+    let do_close = closed
+        && infos.len() >= 2
+        && start_cut_normal.is_none()
+        && end_cut_normal.is_none()
+        && (infos[0].start - infos.last().unwrap().end).length() <= 1.0e-6;
+
+    // Shared boundary at the seam: the start of segment 0 and the end of the
+    // last segment reference the SAME FaceBoundary, so they emit a single shared
+    // EDGE_CURVE (AP214 manifold invariant — see cadcore/CLAUDE.md).  The
+    // boundary direction matches the last segment's end tangent, exactly as a
+    // mid-path join uses the previous segment's end_tangent.
+    let seam_bound = if do_close {
+        let last = *infos.last().unwrap();
+        Some(join_boundary(
+            infos[0].start,
+            last.end_tangent,
+            infos[0].start_tangent,
+            last.end_tangent,
+            radius,
+        ))
+    } else {
+        None
+    };
+
     let mut face_ids = Vec::new();
 
     // ── Start cap boundary and extent ────────────────────────────────────────
-    let start_bound = {
-        if let Some(n) = start_cut_normal {
-            boundary_for_plane_cut(infos[0].start, infos[0].start_tangent, n, radius)
-        } else {
-            FaceBoundary::Circle(Circle3::new(infos[0].start, infos[0].start_tangent, radius))
-        }
-    };
-    let start_extent = if start_cut_normal.is_some() {
-        FaceExtent::PlanarBoundary {
-            boundary: start_bound.clone(),
-        }
+    let start_bound = if let Some(seam) = &seam_bound {
+        seam.clone()
+    } else if let Some(n) = start_cut_normal {
+        boundary_for_plane_cut(infos[0].start, infos[0].start_tangent, n, radius)
     } else {
-        FaceExtent::Disk { radius }
+        FaceBoundary::Circle(Circle3::new(infos[0].start, infos[0].start_tangent, radius))
     };
-    let start_normal = start_cut_normal
-        .map(|n| -n)
-        .unwrap_or(-infos[0].start_tangent);
-    let _cap_start_id = build_end_cap(
-        brep,
-        infos[0].start,
-        start_normal,
-        start_extent,
-        &mut face_ids,
-    );
+    // A closed loop has no seam disk — the tube closes onto itself.
+    if !do_close {
+        let start_extent = if start_cut_normal.is_some() {
+            FaceExtent::PlanarBoundary {
+                boundary: start_bound.clone(),
+            }
+        } else {
+            FaceExtent::Disk { radius }
+        };
+        let start_normal = start_cut_normal
+            .map(|n| -n)
+            .unwrap_or(-infos[0].start_tangent);
+        let _cap_start_id = build_end_cap(
+            brep,
+            infos[0].start,
+            start_normal,
+            start_extent,
+            &mut face_ids,
+        );
+    }
 
     // ── Cylinder / torus faces ───────────────────────────────────────────────
     for (idx, info) in infos.iter().enumerate() {
@@ -763,7 +829,10 @@ pub fn sweep_circle_along_path_with_caps(
             )
         };
         let end_bound = if idx + 1 == infos.len() {
-            if let Some(n) = end_cut_normal {
+            if let Some(seam) = &seam_bound {
+                // Closed loop: weld onto the shared seam boundary.
+                seam.clone()
+            } else if let Some(n) = end_cut_normal {
                 boundary_for_plane_cut(info.end, info.end_tangent, n, radius)
             } else {
                 FaceBoundary::Circle(Circle3::new(info.end, info.end_tangent, radius))
@@ -820,21 +889,24 @@ pub fn sweep_circle_along_path_with_caps(
     }
 
     // ── End cap ──────────────────────────────────────────────────────────────
-    let last = infos.last().expect("non-empty path");
-    let end_bound = if let Some(n) = end_cut_normal {
-        boundary_for_plane_cut(last.end, last.end_tangent, n, radius)
-    } else {
-        FaceBoundary::Circle(Circle3::new(last.end, last.end_tangent, radius))
-    };
-    let end_extent = if end_cut_normal.is_some() {
-        FaceExtent::PlanarBoundary {
-            boundary: end_bound,
-        }
-    } else {
-        FaceExtent::Disk { radius }
-    };
-    let end_normal = end_cut_normal.map(|n| -n).unwrap_or(last.end_tangent);
-    let _cap_end_id = build_end_cap(brep, last.end, end_normal, end_extent, &mut face_ids);
+    // A closed loop has already welded its end onto the seam — no cap.
+    if !do_close {
+        let last = infos.last().expect("non-empty path");
+        let end_bound = if let Some(n) = end_cut_normal {
+            boundary_for_plane_cut(last.end, last.end_tangent, n, radius)
+        } else {
+            FaceBoundary::Circle(Circle3::new(last.end, last.end_tangent, radius))
+        };
+        let end_extent = if end_cut_normal.is_some() {
+            FaceExtent::PlanarBoundary {
+                boundary: end_bound,
+            }
+        } else {
+            FaceExtent::Disk { radius }
+        };
+        let end_normal = end_cut_normal.map(|n| -n).unwrap_or(last.end_tangent);
+        let _cap_end_id = build_end_cap(brep, last.end, end_normal, end_extent, &mut face_ids);
+    }
 
     assemble_solid(brep, face_ids, opts.name.clone())
 }
@@ -1833,6 +1905,18 @@ fn assemble_solid(
     Ok(solid_id)
 }
 
+/// Smallest `|bisector · axis|` we will still miter.  Below this the join is so
+/// sharp (a near-U-turn) that the miter ellipse semi-major axis `radius / cos`
+/// blows up — at a true 180° reversal it is infinite, producing the notorious
+/// "filament spike" sticking far out of the model.  `0.10` only kicks in for genuine near-180° reversals (the miter then
+/// caps at ≈ 10× radius); real sharp corners up to ~168° keep the exact CAD
+/// miter ellipse, which lies precisely on BOTH adjacent cylinders; sharper joins fall back to a plain perpendicular circle, which
+/// is geometrically sound for near-reversals (the two segments are then almost
+/// anti-parallel, so one perpendicular cross-section fits both) and keeps the
+/// shared-edge AP214 manifold intact (both adjacent faces request the identical
+/// boundary).
+const MITER_MIN_COS: f64 = 0.10;
+
 fn miter_boundary(
     centre: Point3,
     incoming_dir: UnitVec3,
@@ -1844,6 +1928,11 @@ fn miter_boundary(
     else {
         return FaceBoundary::Circle(Circle3::new(centre, cylinder_dir, radius));
     };
+
+    // Too sharp to miter without an exploding ellipse → perpendicular circle.
+    if plane_normal.dot(cylinder_dir).abs() < MITER_MIN_COS {
+        return FaceBoundary::Circle(Circle3::new(centre, cylinder_dir, radius));
+    }
 
     boundary_for_plane_cut(centre, cylinder_dir, plane_normal, radius)
 }
@@ -1878,6 +1967,37 @@ fn boundary_for_plane_cut(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharp_reversal_join_does_not_explode() {
+        // A near-180° reversal (U-turn, as in infill zig-zags / seam over-turns).
+        // The miter ellipse `radius / cos` would blow up to a far "spike"; the
+        // join must instead fall back to a bounded perpendicular circle.
+        let incoming = UnitVec3::try_from_vec(Vec3::new(1.0, 0.0, 0.0)).unwrap();
+        // outgoing almost antiparallel (≈ 174° turn).
+        let outgoing = UnitVec3::try_from_vec(Vec3::new(-1.0, 0.1, 0.0)).unwrap();
+        let b = miter_boundary(Point3::new(0.0, 0.0, 0.0), incoming, outgoing, incoming, 0.5);
+        match b {
+            FaceBoundary::Circle(_) => {}
+            FaceBoundary::Ellipse(e) => panic!(
+                "sharp reversal mitred into an ellipse (semi-major {:.2}) instead of a circle",
+                e.semi_major
+            ),
+            other => panic!("unexpected boundary {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gentle_corner_still_mitres() {
+        // A 60° turn is well within the miterable range → keep the ellipse miter.
+        let incoming = UnitVec3::try_from_vec(Vec3::new(1.0, 0.0, 0.0)).unwrap();
+        let outgoing = UnitVec3::try_from_vec(Vec3::new(0.5, 0.866, 0.0)).unwrap();
+        let b = miter_boundary(Point3::new(0.0, 0.0, 0.0), incoming, outgoing, incoming, 0.5);
+        assert!(
+            matches!(b, FaceBoundary::Ellipse(_)),
+            "a 60° corner should still produce a miter ellipse",
+        );
+    }
 
     fn line(x0: f64, x1: f64) -> Vec<Point3> {
         vec![Point3::new(x0, 0.0, 0.0), Point3::new(x1, 0.0, 0.0)]
@@ -2461,5 +2581,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A closed square loop sweeps into a tube with **no cap faces** — every
+    /// face is a cylinder and the seam is welded onto the shared boundary.
+    #[test]
+    fn closed_square_loop_has_no_caps() {
+        let a = Point3::new(0.0, 0.0, 0.0);
+        let b = Point3::new(10.0, 0.0, 0.0);
+        let c = Point3::new(10.0, 10.0, 0.0);
+        let d = Point3::new(0.0, 10.0, 0.0);
+        let segments = vec![
+            SweepPathSegment::Line { start: a, end: b },
+            SweepPathSegment::Line { start: b, end: c },
+            SweepPathSegment::Line { start: c, end: d },
+            SweepPathSegment::Line { start: d, end: a }, // back to start → closed
+        ];
+
+        let mut brep = BRep::new();
+        let id = sweep_circle_along_closed_path(&mut brep, &segments, 0.5, &SweepOptions::default())
+            .unwrap();
+        assert!(brep.solids.contains_key(id));
+
+        // 4 cylinders, zero planar caps.
+        let cap_faces = brep
+            .faces
+            .values()
+            .filter(|f| matches!(f.geom, FaceGeom::Plane(_)))
+            .count();
+        assert_eq!(cap_faces, 0, "closed loop must not emit cap faces");
+        let stats = brep.stats();
+        assert_eq!(stats.faces, 4, "expected 4 cylinder faces, got {}", stats.faces);
+    }
+
+    /// A `closed` request on a path whose endpoints do NOT coincide falls back
+    /// to the open-path sweep (caps present) rather than producing a broken
+    /// solid.
+    #[test]
+    fn closed_request_on_open_path_falls_back_to_caps() {
+        let a = Point3::new(0.0, 0.0, 0.0);
+        let b = Point3::new(10.0, 0.0, 0.0);
+        let segments = vec![SweepPathSegment::Line { start: a, end: b }];
+
+        let mut brep = BRep::new();
+        sweep_circle_along_closed_path(&mut brep, &segments, 0.5, &SweepOptions::default()).unwrap();
+        // 1 cylinder + 2 caps = 3 faces (open fallback).
+        assert_eq!(brep.stats().faces, 3);
     }
 }

@@ -126,7 +126,7 @@ struct HoleRef {
     reversed: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum BoundarySide {
     Start,
     End,
@@ -367,11 +367,16 @@ pub fn union_solids_with_centerlines_and_options(
     let mut torus_through_pieces: Vec<Vec<ThroughPiece>> = vec![Vec::new(); torus_faces.len()];
     // Butt-end (capped) trims: collected in Pass 2c, processed in Pass 2e.
     let mut cap_bites: Vec<(usize, BoundarySide, usize, Vec<Point3>)> = Vec::new();
-    let mut cap_notches: std::collections::HashMap<FaceId, Vec<OpenNotchRef>> =
-        std::collections::HashMap::new();
+    // Deterministic iteration order: a randomized-`HashMap` order here makes the
+    // near-tangent vertex/edge merge (`get_or_create_vertex`) resolve marginal
+    // dense-fill junctions differently every run, flipping otherwise-identical
+    // layers between manifold and open.  `BTreeMap` iterates by key so the union
+    // is reproducible (a prerequisite for regression-testing the tangent fixes).
+    let mut cap_notches: std::collections::BTreeMap<FaceId, Vec<OpenNotchRef>> =
+        std::collections::BTreeMap::new();
     // (leg, side) -> planar Disk cap face at that free end.
-    let cap_map: std::collections::HashMap<(usize, BoundarySide), FaceId> = {
-        let mut m = std::collections::HashMap::new();
+    let cap_map: std::collections::BTreeMap<(usize, BoundarySide), FaceId> = {
+        let mut m = std::collections::BTreeMap::new();
         for &fid in &keep_faces {
             let Some(face) = brep.faces.get(fid) else { continue };
             let (FaceGeom::Plane(p), FaceExtent::Disk { radius }) = (&face.geom, &face.extent)
@@ -932,8 +937,9 @@ pub fn union_solids_with_centerlines_and_options(
                         PieceOwner::Leg(_) => true,
                     });
                     // group through-cut pieces per leg face
-                    let mut tc_legs: std::collections::HashMap<usize, Vec<usize>> =
-                        std::collections::HashMap::new();
+                    // BTreeMap: deterministic iteration (see cap_notches note).
+                    let mut tc_legs: std::collections::BTreeMap<usize, Vec<usize>> =
+                        std::collections::BTreeMap::new();
                     for (i, p) in pieces.iter().enumerate() {
                         if let PieceOwner::Leg(lci) = p.owner {
                             if !same_j(p) {
@@ -1480,10 +1486,11 @@ pub fn union_solids_with_centerlines_and_options(
                                 });
                                 // Through-pieces (j_in != j_out) must come in
                                 // pairs per face - legs AND elbows alike.
-                                let mut tcl: std::collections::HashMap<usize, Vec<usize>> =
-                                    std::collections::HashMap::new();
-                                let mut tce: std::collections::HashMap<usize, Vec<usize>> =
-                                    std::collections::HashMap::new();
+                                // BTreeMap: deterministic iteration (see cap_notches note).
+                                let mut tcl: std::collections::BTreeMap<usize, Vec<usize>> =
+                                    std::collections::BTreeMap::new();
+                                let mut tce: std::collections::BTreeMap<usize, Vec<usize>> =
+                                    std::collections::BTreeMap::new();
                                 for (i, p) in ps.iter().enumerate() {
                                     if same_j(p) {
                                         continue;
@@ -1846,8 +1853,9 @@ pub fn union_solids_with_centerlines_and_options(
                         PieceOwner::Elbow(_) => same_j(p),
                         PieceOwner::Leg(_) => true,
                     });
-                    let mut tc_legs: std::collections::HashMap<usize, Vec<usize>> =
-                        std::collections::HashMap::new();
+                    // BTreeMap: deterministic iteration (see cap_notches note).
+                    let mut tc_legs: std::collections::BTreeMap<usize, Vec<usize>> =
+                        std::collections::BTreeMap::new();
                     for (i, p) in pieces.iter().enumerate() {
                         if let PieceOwner::Leg(lci) = p.owner {
                             if !same_j(p) {
