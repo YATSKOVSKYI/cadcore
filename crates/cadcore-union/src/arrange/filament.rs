@@ -96,28 +96,35 @@ pub fn fuse_filament_with_crossers(
 
     // filament legs: seamless cylinder + their crossing windows + caps at free
     // ends.  Each window is shared with the matching crosser window.
+    // Per-junction weld groups (see scaffold.rs): leg i owns 2·i (incoming rim)
+    // and 2·i+1 (outgoing rim); each crosser gets its own pair past the legs.
+    let gin = |i: usize| 2 * i as u32;
+    let gout = |i: usize| 2 * i as u32 + 1;
     for i in 0..n {
-        let windows: Vec<Vec<Point3>> =
-            (0..crossers.len()).flat_map(|c| shared_loops[i][c].iter().cloned()).collect();
-        asm.emit_cylinder_face(legs[i].surf, legs[i].length, j_in[i], j_out[i], &windows);
+        let windows: Vec<(u32, Vec<Point3>)> = (0..crossers.len())
+            .flat_map(|c| shared_loops[i][c].iter().cloned())
+            .map(|w| (0u32, w))
+            .collect();
+        asm.emit_cylinder_face(legs[i].surf, legs[i].length, j_in[i], j_out[i], &windows, gin(i), gout(i));
         if i == 0 {
             let n0 = UnitVec3::try_from_vec(legs[i].surf.axis().as_vec() * -1.0).unwrap();
-            asm.emit_disk_cap(Plane3::from_origin_normal(legs[i].surf.frame.origin, n0), j_in[i]);
+            asm.emit_disk_cap(Plane3::from_origin_normal(legs[i].surf.frame.origin, n0), j_in[i], gin(i));
         }
         if i + 1 == n {
             let cc = legs[i].surf.frame.origin + legs[i].surf.axis().as_vec() * legs[i].length;
-            asm.emit_disk_cap(Plane3::from_origin_normal(cc, legs[i].surf.axis()), j_out[i]);
+            asm.emit_disk_cap(Plane3::from_origin_normal(cc, legs[i].surf.axis()), j_out[i], gout(i));
         }
     }
     for (i, e) in elbows.iter().enumerate() {
-        asm.emit_torus_fillet(e.surf, j_out[i], j_in[i + 1]);
+        asm.emit_torus_fillet(e.surf, j_out[i], j_in[i + 1], gout(i), gin(i + 1));
     }
 
     // crossers: seamless cylinder + the mutual windows + caps at both ends.
     for (ci, c) in crossers.iter().enumerate() {
         let len = c.length;
-        let windows: Vec<Vec<Point3>> = (0..legs.len())
+        let windows: Vec<(u32, Vec<Point3>)> = (0..legs.len())
             .flat_map(|i| shared_loops[i][ci].iter().cloned())
+            .map(|w| (0u32, w))
             .collect();
         let rim_lo = Circle3::new(c.surf.frame.origin, c.surf.axis(), c.surf.radius);
         let rim_hi = Circle3::new(
@@ -125,11 +132,12 @@ pub fn fuse_filament_with_crossers(
             c.surf.axis(),
             c.surf.radius,
         );
-        asm.emit_cylinder_face(c.surf, len, rim_lo, rim_hi, &windows);
+        let base = 2 * n as u32 + 2 * ci as u32;
+        asm.emit_cylinder_face(c.surf, len, rim_lo, rim_hi, &windows, base, base + 1);
         let n0 = UnitVec3::try_from_vec(c.surf.axis().as_vec() * -1.0).unwrap();
-        asm.emit_disk_cap(Plane3::from_origin_normal(c.surf.frame.origin, n0), rim_lo);
+        asm.emit_disk_cap(Plane3::from_origin_normal(c.surf.frame.origin, n0), rim_lo, base);
         let cc = c.surf.frame.origin + c.surf.axis().as_vec() * len;
-        asm.emit_disk_cap(Plane3::from_origin_normal(cc, c.surf.axis()), rim_hi);
+        asm.emit_disk_cap(Plane3::from_origin_normal(cc, c.surf.axis()), rim_hi, base + 1);
     }
 
     let faces = asm.faces().to_vec();
@@ -196,25 +204,28 @@ pub fn fuse_poly_filament(
 
     let mut asm = Assembler::new(brep, 1e-7);
 
+    // Per-junction weld groups (see scaffold.rs): leg i owns 2·i / 2·i+1.
+    let gin = |i: usize| 2 * i as u32;
+    let gout = |i: usize| 2 * i as u32 + 1;
     // Legs: seamless cylinder faces (no windows here), rims = the shared
     // junction / end circles.
     for i in 0..n {
-        asm.emit_cylinder_face(legs[i].surf, legs[i].length, j_in[i], j_out[i], &[]);
+        asm.emit_cylinder_face(legs[i].surf, legs[i].length, j_in[i], j_out[i], &[], gin(i), gout(i));
         if i == 0 {
             let n0 = UnitVec3::try_from_vec(legs[i].surf.axis().as_vec() * -1.0).unwrap();
             let plane = Plane3::from_origin_normal(legs[i].surf.frame.origin, n0);
-            asm.emit_disk_cap(plane, j_in[i]);
+            asm.emit_disk_cap(plane, j_in[i], gin(i));
         }
         if i + 1 == n {
             let c = legs[i].surf.frame.origin + legs[i].surf.axis().as_vec() * legs[i].length;
             let plane = Plane3::from_origin_normal(c, legs[i].surf.axis());
-            asm.emit_disk_cap(plane, j_out[i]);
+            asm.emit_disk_cap(plane, j_out[i], gout(i));
         }
     }
     // Elbows: seamless torus-fillet faces; junction_lo = leg i outgoing circle,
     // junction_hi = leg i+1 incoming circle (both shared with the legs).
     for (i, e) in elbows.iter().enumerate() {
-        asm.emit_torus_fillet(e.surf, j_out[i], j_in[i + 1]);
+        asm.emit_torus_fillet(e.surf, j_out[i], j_in[i + 1], gout(i), gin(i + 1));
     }
 
     let faces = asm.faces().to_vec();

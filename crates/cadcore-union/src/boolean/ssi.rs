@@ -25,9 +25,43 @@ pub struct SsiCurve {
     pub closed: bool,
 }
 
+/// Which surface pairs the caller wants intersected.
+///
+/// Everything the scaffold union needs is always on.  `plane_torus` is opt-in:
+/// the curves themselves are exact, but a plane meeting a torus is also how an
+/// END CAP meets a neighbouring tube, and the union's stitch stage cannot yet
+/// resolve that triple point (see `union_stacked_tori_watertight`) — handing it
+/// those curves splits the shell instead of welding it.  The half-space cut,
+/// which needs plane×torus for every U-turn fillet it crosses, turns it on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SsiOptions {
+    /// Intersect planar faces with toroidal ones.
+    pub plane_torus: bool,
+}
+
+impl SsiOptions {
+    /// Every supported pair, including plane×torus.
+    pub fn all() -> Self {
+        Self { plane_torus: true }
+    }
+}
+
 /// Intersect face `fa` of solid `a` with face `fb` of solid `b`, returning the
 /// shared intersection curve(s) clipped to both faces' regions.
+///
+/// Uses the default [`SsiOptions`]; see [`intersect_faces_with`].
 pub fn intersect_faces(a: &BRep, fa: FaceId, b: &BRep, fb: FaceId) -> Vec<SsiCurve> {
+    intersect_faces_with(a, fa, b, fb, SsiOptions::default())
+}
+
+/// [`intersect_faces`] with an explicit pair selection.
+pub fn intersect_faces_with(
+    a: &BRep,
+    fa: FaceId,
+    b: &BRep,
+    fb: FaceId,
+    opts: SsiOptions,
+) -> Vec<SsiCurve> {
     let ga = &a.faces[fa].geom;
     let gb = &b.faces[fb].geom;
     match (ga, gb) {
@@ -67,11 +101,11 @@ pub fn intersect_faces(a: &BRep, fa: FaceId, b: &BRep, fb: FaceId) -> Vec<SsiCur
             };
             torus_torus(&ta, alo, ahi, &tb, blo, bhi)
         }
-        (FaceGeom::Plane(pl), FaceGeom::Torus(_)) if std::env::var("CADCORE_PT").is_ok() => {
+        (FaceGeom::Plane(pl), FaceGeom::Torus(_)) if opts.plane_torus => {
             let Some((tor, lo, hi)) = torus_arc(b, fb) else { return Vec::new() };
             plane_torus(pl, region_polygon(a, fa), &tor, lo, hi)
         }
-        (FaceGeom::Torus(_), FaceGeom::Plane(pl)) if std::env::var("CADCORE_PT").is_ok() => {
+        (FaceGeom::Torus(_), FaceGeom::Plane(pl)) if opts.plane_torus => {
             let Some((tor, lo, hi)) = torus_arc(a, fa) else { return Vec::new() };
             plane_torus(pl, region_polygon(b, fb), &tor, lo, hi)
         }
@@ -204,7 +238,17 @@ fn plane_torus(plane: &Plane3, poly: Option<Vec<Point3>>, tor: &TorusSurf, lo: f
         let w = p - tor.frame.origin;
         tor.frame.y.dot_vec(w).atan2(tor.frame.x.dot_vec(w))
     };
-    let in_arc = |th: f64| (th - lo).rem_euclid(std::f64::consts::TAU) <= (hi - lo) + 1e-9;
+    // θ-arc membership for a SIGNED sweep: a fillet built by
+    // `Filament::serpentine` may run either way round, so `hi` can be < `lo`.
+    // (Comparing against a negative `hi - lo` used to reject every point, which
+    // silently returned no curve at all for half of all elbows.)
+    let sweep = hi - lo;
+    let in_arc = |th: f64| {
+        if sweep.abs() >= std::f64::consts::TAU - 1e-9 {
+            return true; // full donut
+        }
+        ((th - lo) * sweep.signum()).rem_euclid(std::f64::consts::TAU) <= sweep.abs() + 1e-9
+    };
 
     let mut out: Vec<SsiCurve> = Vec::new();
     let mut sigs: Vec<(Point3, f64)> = Vec::new();
@@ -241,20 +285,82 @@ fn plane_torus(plane: &Plane3, poly: Option<Vec<Point3>>, tor: &TorusSurf, lo: f
                 continue;
             }
             let Some(start) = (0..n).find(|&k| inside[k] && !inside[(k + n - 1) % n]) else { continue };
+            // Where the trace leaves (or re-enters) the kept region, end the arc
+            // on the EXACT boundary point, not on the last sample that happened
+            // to be inside.  A sample lands up to one tracer step (~20 µm) short,
+            // and that is a real gap: the neighbouring face's section reaches the
+            // shared junction exactly, so the two would never chain into one
+            // section outline.
+            let keep = |p: Point3| in_arc(theta_t(p)) && point_in_polygon_2d(&poly2, to_uv(p));
             let mut cur: Vec<Point3> = Vec::new();
             for k in 0..=n {
                 let idx = (start + k) % n;
+                let prev = (idx + n - 1) % n;
                 if inside[idx] {
+                    if !inside[prev] {
+                        // outside → inside: open the arc on the boundary
+                        if let Some(b) =
+                            boundary_point(curve.points[idx], curve.points[prev], &keep, &sa, &sb)
+                        {
+                            cur.push(b);
+                        }
+                    }
                     cur.push(curve.points[idx]);
-                } else if cur.len() >= 2 {
-                    out.push(SsiCurve { points: std::mem::take(&mut cur), closed: false });
                 } else {
-                    cur.clear();
+                    if inside[prev] {
+                        // inside → outside: close the arc on the boundary
+                        if let Some(b) =
+                            boundary_point(curve.points[prev], curve.points[idx], &keep, &sa, &sb)
+                        {
+                            cur.push(b);
+                        }
+                    }
+                    if cur.len() >= 2 {
+                        out.push(SsiCurve { points: std::mem::take(&mut cur), closed: false });
+                    } else {
+                        cur.clear();
+                    }
                 }
             }
+            // No tail flush: the walk starts at an inside sample whose
+            // predecessor is outside, so it always ends by re-entering there —
+            // whatever is left in `cur` is the head of the first arc, already
+            // emitted.  Flushing it again would duplicate that fragment.
         }
     }
     out
+}
+
+/// Bisect the chord `p_in → p_out` for the point where `keep` flips, then land
+/// it exactly on both carrier surfaces.
+///
+/// The chord midpoint is off both surfaces; `intersection_point_near` pulls it
+/// back onto their intersection curve, so the returned point is a genuine curve
+/// point ON the clip boundary rather than a linear approximation of one.
+fn boundary_point(
+    p_in: Point3,
+    p_out: Point3,
+    keep: &impl Fn(Point3) -> bool,
+    sa: &crate::geom::refine::AnalyticSurface,
+    sb: &crate::geom::refine::AnalyticSurface,
+) -> Option<Point3> {
+    use crate::geom::intersect::intersection_point_near;
+    let (mut a, mut b) = (p_in, p_out);
+    for _ in 0..40 {
+        let m = a + (b - a) * 0.5;
+        if keep(m) {
+            a = m;
+        } else {
+            b = m;
+        }
+    }
+    let mid = a + (b - a) * 0.5;
+    let p = intersection_point_near(sa, sb, mid, 1e-12).unwrap_or(mid);
+    // Reject a refinement that ran away from the bracket.
+    if (p - mid).length() > (p_in - p_out).length().max(1e-6) {
+        return None;
+    }
+    Some(p)
 }
 
 /// Keep the part of a closed loop where both tori's major angle θ lies in their
@@ -543,6 +649,57 @@ fn plane_plane(
 /// of a round peg passing through a plate face.  Partial arcs (conic clipped
 /// by a polygon edge) and the plane-parallel `Lines` case are deferred —
 /// returning empty there is incomplete, never wrong.
+/// Clip one ruling line of a plane∥axis section to the cylinder's finite band
+/// and to the plane face's region polygon.
+///
+/// The band is clipped EXACTLY (the line is parallel to the axis, so the band
+/// is just a parameter interval); the region polygon — in practice the large
+/// rectangle a cut plane is bounded by — is clipped by sampling, keeping the
+/// maximal inside runs.
+fn clip_ruling_line(
+    line: &cadcore_geom::Line3,
+    cyl: &CylSurf,
+    length: f64,
+    poly2: &[(f64, f64)],
+    to_uv: &impl Fn(Point3) -> (f64, f64),
+) -> Vec<SsiCurve> {
+    let axis = cyl.axis();
+    // The line runs along the axis; place it by the band's own parameter so the
+    // ends land exactly on the band's rims.
+    let base = line.origin - axis.as_vec() * axis.dot_vec(line.origin - cyl.frame.origin);
+    let at = |t: f64| base + axis.as_vec() * t;
+
+    const N: usize = 32;
+    let inside: Vec<bool> = (0..=N)
+        .map(|k| point_in_polygon_2d(poly2, to_uv(at(length * k as f64 / N as f64))))
+        .collect();
+
+    let mut out = Vec::new();
+    let mut k = 0usize;
+    while k <= N {
+        if !inside[k] {
+            k += 1;
+            continue;
+        }
+        let lo = k;
+        while k + 1 <= N && inside[k + 1] {
+            k += 1;
+        }
+        let (t0, t1) = (
+            length * lo as f64 / N as f64,
+            length * k as f64 / N as f64,
+        );
+        if t1 - t0 > 1e-9 {
+            out.push(SsiCurve {
+                points: vec![at(t0), at(t1)],
+                closed: false,
+            });
+        }
+        k += 1;
+    }
+    out
+}
+
 fn plane_cylinder(
     plane: &Plane3,
     poly: Option<Vec<Point3>>,
@@ -553,17 +710,30 @@ fn plane_cylinder(
         return Vec::new();
     };
     let conic = cadcore_geom::cyl_plane_intersection(cyl, plane);
-    let pts: Vec<Point3> = match &conic {
-        CylPlaneCurve::Circle(c) => (0..96).map(|i| c.point_at(i as f64 / 96.0 * std::f64::consts::TAU)).collect(),
-        CylPlaneCurve::Ellipse(e) => (0..96).map(|i| e.point_at(i as f64 / 96.0 * std::f64::consts::TAU)).collect(),
-        // Lines (plane ∥ axis) — deferred.
-        _ => return Vec::new(),
-    };
     let to_uv = |q: Point3| {
         let w = q - plane.frame.origin;
         (plane.frame.x.dot_vec(w), plane.frame.y.dot_vec(w))
     };
     let poly2: Vec<(f64, f64)> = poly.iter().map(|&q| to_uv(q)).collect();
+
+    let pts: Vec<Point3> = match &conic {
+        CylPlaneCurve::Circle(c) => (0..96).map(|i| c.point_at(i as f64 / 96.0 * std::f64::consts::TAU)).collect(),
+        CylPlaneCurve::Ellipse(e) => (0..96).map(|i| e.point_at(i as f64 / 96.0 * std::f64::consts::TAU)).collect(),
+        // Plane PARALLEL to the axis: the section is one or two straight ruling
+        // lines, not a closed conic — the tube is grazed lengthwise rather than
+        // sliced across.  Each line is clipped to the finite band and to the
+        // plane face's region, and returned as an OPEN curve: on its own it does
+        // not bound anything, it is one long side of a section that the tube's
+        // end caps / elbows close off.
+        CylPlaneCurve::Lines(lines) => {
+            let mut out = Vec::new();
+            for l in lines {
+                out.extend(clip_ruling_line(l, cyl, length, &poly2, &to_uv));
+            }
+            return out;
+        }
+        CylPlaneCurve::None => return Vec::new(),
+    };
     let axis = cyl.axis();
     // a sample is "in" when it lies inside the plane polygon AND the cyl band.
     let inside: Vec<bool> = pts
@@ -716,6 +886,251 @@ mod tests {
         }
         assert!(total > 0, "overlapping boxes produce SSI segments");
         assert!(seg_len_sum > 0.0);
+    }
+
+    // ── Plane × Torus ────────────────────────────────────────────────────────
+    //
+    // The terminal cut plane crosses the U-turn fillets, so this pair has to be
+    // first-class.  It used to be reachable only with `CADCORE_PT` set.
+
+    use cadcore_geom::Circle3;
+    use cadcore_topo::{Face, FaceNormal};
+
+    /// A finite planar face (square region centred on the plane origin).
+    fn plane_face(brep: &mut BRep, pl: Plane3, half: f64) -> FaceId {
+        let c = |su: f64, sv: f64| pl.frame.origin + pl.frame.x * su + pl.frame.y * sv;
+        brep.add_face(Face {
+            geom: FaceGeom::Plane(pl),
+            normal: FaceNormal::Same,
+            outer_loop: Default::default(),
+            inner_loops: Vec::new(),
+            shell: Default::default(),
+            extent: FaceExtent::Polygon {
+                points: vec![
+                    c(-half, -half),
+                    c(half, -half),
+                    c(half, half),
+                    c(-half, half),
+                ],
+            },
+        })
+    }
+
+    /// A torus fillet face spanning θ ∈ [lo, hi] (sweep may be negative).
+    fn fillet_face(brep: &mut BRep, tor: TorusSurf, lo: f64, hi: f64) -> FaceId {
+        let circ = |th: f64| {
+            let dir = tor.frame.x * th.cos() + tor.frame.y * th.sin();
+            let tan = tor.frame.y * th.cos() - tor.frame.x * th.sin();
+            Circle3::new(
+                tor.frame.origin + dir * tor.major_radius,
+                UnitVec3::try_from_vec(tan).unwrap(),
+                tor.minor_radius,
+            )
+        };
+        brep.add_face(Face {
+            geom: FaceGeom::Torus(tor),
+            normal: FaceNormal::Same,
+            outer_loop: Default::default(),
+            inner_loops: Vec::new(),
+            shell: Default::default(),
+            extent: FaceExtent::TorusFillet {
+                start_circle: circ(lo),
+                end_circle: circ(hi),
+            },
+        })
+    }
+
+    /// Every returned point must lie on BOTH carriers to knit tolerance.
+    fn assert_on_both(curves: &[SsiCurve], pl: &Plane3, tor: &TorusSurf) {
+        let ts = crate::geom::refine::AnalyticSurface::Torus(*tor);
+        for c in curves {
+            for &p in &c.points {
+                assert!(
+                    pl.signed_distance(p).abs() < 1e-6,
+                    "point off the plane by {:.3e}",
+                    pl.signed_distance(p)
+                );
+                assert!(
+                    ts.distance(p).abs() < 1e-6,
+                    "point off the torus by {:.3e}",
+                    ts.distance(p)
+                );
+            }
+        }
+    }
+
+    /// Ring in the XY plane, axis +Z, tube radius 0.275 — a filament U-turn.
+    ///
+    /// The frame is pinned to the world axes (`TorusSurf::new` picks an
+    /// arbitrary `frame.x`, so θ = 0 would not point along +X) — the tests below
+    /// reason about where the arc sits in world space.
+    fn quarter_fillet() -> TorusSurf {
+        TorusSurf {
+            frame: cadcore_math::Frame3 {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                x: UnitVec3::X,
+                y: UnitVec3::Y,
+                z: UnitVec3::Z,
+            },
+            major_radius: 1.0,
+            minor_radius: 0.275,
+        }
+    }
+
+    #[test]
+    fn plane_cutting_a_fillet_yields_curves_on_both_surfaces() {
+        use std::f64::consts::FRAC_PI_2;
+        let tor = quarter_fillet();
+        let pl = Plane3::from_origin_normal(Point3::new(0.7, 0.0, 0.0), UnitVec3::X);
+
+        let mut a = BRep::new();
+        let fa = plane_face(&mut a, pl, 4.0);
+        let mut b = BRep::new();
+        let fb = fillet_face(&mut b, tor, 0.0, FRAC_PI_2);
+
+        let curves = intersect_faces_with(&a, fa, &b, fb, SsiOptions::all());
+        assert!(
+            !curves.is_empty(),
+            "a plane through the fillet must produce a section curve"
+        );
+        assert_on_both(&curves, &pl, &tor);
+        // and the reversed argument order must agree
+        assert!(!intersect_faces_with(&b, fb, &a, fa, SsiOptions::all()).is_empty());
+    }
+
+    /// Same geometry, arc traced the other way (`theta_hi < theta_lo`) — the
+    /// sweep that `Filament::serpentine` produces for half of all elbows.
+    #[test]
+    fn plane_cutting_a_reversed_fillet_still_yields_curves() {
+        use std::f64::consts::FRAC_PI_2;
+        let tor = quarter_fillet();
+        let pl = Plane3::from_origin_normal(Point3::new(0.7, 0.0, 0.0), UnitVec3::X);
+
+        let mut a = BRep::new();
+        let fa = plane_face(&mut a, pl, 4.0);
+        let mut b = BRep::new();
+        let fb = fillet_face(&mut b, tor, FRAC_PI_2, 0.0);
+
+        let curves = intersect_faces_with(&a, fa, &b, fb, SsiOptions::all());
+        assert!(
+            !curves.is_empty(),
+            "a negative-sweep fillet must intersect exactly like the positive one"
+        );
+        assert_on_both(&curves, &pl, &tor);
+    }
+
+    /// A plane clear of the fillet produces nothing.
+    #[test]
+    fn plane_missing_the_fillet_yields_nothing() {
+        use std::f64::consts::FRAC_PI_2;
+        let tor = quarter_fillet();
+        let mut b = BRep::new();
+        let fb = fillet_face(&mut b, tor, 0.0, FRAC_PI_2);
+
+        // (a) far outside the torus altogether
+        let far = Plane3::from_origin_normal(Point3::new(5.0, 0.0, 0.0), UnitVec3::X);
+        let mut a = BRep::new();
+        let fa = plane_face(&mut a, far, 4.0);
+        assert!(intersect_faces_with(&a, fa, &b, fb, SsiOptions::all()).is_empty());
+
+        // (b) crossing the ring, but on the θ-arc the face does NOT cover
+        let other_side = Plane3::from_origin_normal(Point3::new(-0.7, 0.0, 0.0), UnitVec3::X);
+        let mut a2 = BRep::new();
+        let fa2 = plane_face(&mut a2, other_side, 4.0);
+        assert!(
+            intersect_faces_with(&a2, fa2, &b, fb, SsiOptions::all()).is_empty(),
+            "curves outside the fillet's θ-arc must be clipped away"
+        );
+    }
+
+    // ── Plane ∥ cylinder axis (ruling lines) ─────────────────────────────────
+
+    /// A plane that grazes a tube LENGTHWISE meets it in two straight ruling
+    /// lines, not a conic.  Used to be dropped ("deferred"), which left the
+    /// half-space cut with no section curve there — the tube survived the cut
+    /// whole, poking through the plane.
+    #[test]
+    fn plane_parallel_to_axis_yields_two_ruling_lines() {
+        let r = 0.275_f64;
+        let len = 4.0;
+        // Tube along +Y at x = 0, plane x = 0.1 → |d| = 0.1 < r ⇒ two lines.
+        let cyl = CylSurf::new(Point3::new(0.0, 0.0, 0.0), UnitVec3::Y, r);
+        let pl = Plane3::from_origin_normal(Point3::new(0.1, 0.0, 0.0), UnitVec3::X);
+
+        let mut a = BRep::new();
+        let fa = plane_face(&mut a, pl, 8.0);
+        let mut b = BRep::new();
+        let fb = b.add_face(Face {
+            geom: FaceGeom::Cylinder(cyl),
+            normal: FaceNormal::Same,
+            outer_loop: Default::default(),
+            inner_loops: Vec::new(),
+            shell: Default::default(),
+            extent: FaceExtent::Cylinder {
+                length: len,
+                start: cadcore_topo::FaceBoundary::Circle(Circle3::new(
+                    cyl.frame.origin,
+                    UnitVec3::Y,
+                    r,
+                )),
+                end: cadcore_topo::FaceBoundary::Circle(Circle3::new(
+                    cyl.frame.origin + UnitVec3::Y * len,
+                    UnitVec3::Y,
+                    r,
+                )),
+            },
+        });
+
+        let curves = intersect_faces(&a, fa, &b, fb);
+        assert_eq!(curves.len(), 2, "two ruling lines");
+        let half = (r * r - 0.1 * 0.1).sqrt();
+        for c in &curves {
+            assert_eq!(c.points.len(), 2, "a ruling line is a segment");
+            assert!(!c.closed);
+            for &p in &c.points {
+                assert!((p.x - 0.1).abs() < 1e-9, "point off the plane");
+                assert!(
+                    (p.z.abs() - half).abs() < 1e-9,
+                    "ruling line off the tube: z={:.6} want ±{half:.6}",
+                    p.z
+                );
+            }
+            // clipped to the finite band
+            let (y0, y1) = (c.points[0].y, c.points[1].y);
+            assert!(y0.min(y1) > -1e-9 && y0.max(y1) < len + 1e-9);
+            assert!((y1 - y0).abs() > len - 1e-6, "the whole band is covered");
+        }
+    }
+
+    /// A plane parallel to the axis but clear of the tube meets nothing.
+    #[test]
+    fn plane_parallel_and_clear_of_the_tube_yields_nothing() {
+        let cyl = CylSurf::new(Point3::new(0.0, 0.0, 0.0), UnitVec3::Y, 0.275);
+        let pl = Plane3::from_origin_normal(Point3::new(1.0, 0.0, 0.0), UnitVec3::X);
+        let mut a = BRep::new();
+        let fa = plane_face(&mut a, pl, 8.0);
+        let mut b = BRep::new();
+        let fb = b.add_face(Face {
+            geom: FaceGeom::Cylinder(cyl),
+            normal: FaceNormal::Same,
+            outer_loop: Default::default(),
+            inner_loops: Vec::new(),
+            shell: Default::default(),
+            extent: FaceExtent::Cylinder {
+                length: 4.0,
+                start: cadcore_topo::FaceBoundary::Circle(Circle3::new(
+                    cyl.frame.origin,
+                    UnitVec3::Y,
+                    0.275,
+                )),
+                end: cadcore_topo::FaceBoundary::Circle(Circle3::new(
+                    cyl.frame.origin + UnitVec3::Y * 4.0,
+                    UnitVec3::Y,
+                    0.275,
+                )),
+            },
+        });
+        assert!(intersect_faces(&a, fa, &b, fb).is_empty());
     }
 
     /// Faces of separated boxes never intersect.

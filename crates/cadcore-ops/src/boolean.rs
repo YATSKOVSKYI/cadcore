@@ -146,6 +146,8 @@ fn process_solid(brep: &BRep, solid_id: SolidId, plane: &ClipPlane) -> SolidOutc
     let mut cyl_faces: Vec<(CylSurf, f64, FaceBoundary, FaceBoundary)> = Vec::new();
     // Non-cylinder faces (sphere caps, existing flat disks, torus fillets) on the kept side.
     let mut kept_other_face_ids: Vec<FaceId> = Vec::new();
+    // Template faces that genuinely cross the plane but have no cut form.
+    let mut straddling = 0usize;
     for &shell_id in &solid.shells {
         let shell = match brep.shells.get(shell_id) {
             Some(s) => s,
@@ -160,19 +162,34 @@ fn process_solid(brep: &BRep, solid_id: SolidId, plane: &ClipPlane) -> SolidOutc
                 (&face.geom, &face.extent)
             {
                 cyl_faces.push((*cyl, *length, start.clone(), end.clone()));
+            } else if let Some((d_min, d_max)) = face_signed_range(face, plane) {
+                // Face template with a closed-form region: classify EXACTLY.
+                if d_min >= -COINCIDENT_TOL {
+                    kept_other_face_ids.push(face_id); // wholly on the kept side
+                } else if d_max <= COINCIDENT_TOL {
+                    // wholly on the discarded side в†’ drop
+                } else {
+                    // Genuinely straddles the plane and no template can express
+                    // the cut region.  Keeping it whole leaves a little material
+                    // past the plane; DROPPING it would open the shell, which is
+                    // far worse вЂ” so keep and say so loudly.
+                    straddling += 1;
+                    kept_other_face_ids.push(face_id);
+                }
             } else {
-                // Non-cylinder face: keep it if its representative point is on the kept side.
+                // No closed-form region (explicitly trimmed loops / templates we
+                // do not model): fall back to the carrier's representative point.
+                // NB this is coarse вЂ” it is deliberately biased toward KEEPING,
+                // because a face we cannot classify must never be silently
+                // deleted; that is exactly how a shell opens up.
                 let rep = match &face.geom {
-                    FaceGeom::Sphere(s) => Some(s.centre),
-                    FaceGeom::Plane(p) => Some(p.frame.origin),
-                    FaceGeom::Torus(t) => Some(t.frame.origin),
-                    _ => None,
+                    FaceGeom::Sphere(s) => s.centre,
+                    FaceGeom::Plane(p) => p.frame.origin,
+                    FaceGeom::Torus(t) => t.frame.origin,
+                    FaceGeom::Cylinder(c) => c.frame.origin,
                 };
-                if let Some(pt) = rep {
-                    let dist = plane.normal.dot_vec(pt - plane.origin);
-                    if dist >= -COINCIDENT_TOL {
-                        kept_other_face_ids.push(face_id);
-                    }
+                if plane.normal.dot_vec(rep - plane.origin) >= -COINCIDENT_TOL {
+                    kept_other_face_ids.push(face_id);
                 }
             }
         }
@@ -293,6 +310,14 @@ fn process_solid(brep: &BRep, solid_id: SolidId, plane: &ClipPlane) -> SolidOutc
         return SolidOutcome::Unchanged;
     }
 
+    if straddling > 0 {
+        eprintln!(
+            "[cadcore::boolean] {straddling} template face(s) cross the cut plane with no cut \
+             form (kept whole; material extends past the plane) in solid {:?}",
+            solid.name
+        );
+    }
+
     SolidOutcome::Replace(NewSolidParts {
         faces: new_faces,
         copied_face_ids: kept_other_face_ids,
@@ -408,6 +433,208 @@ fn classify_cylinder(cyl: &CylSurf, length: f64, plane: &ClipPlane) -> CylinderO
             radius,
             axis_dir,
         }
+    }
+}
+
+// в”Ђв”Ђ Exact face-region classification в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+//
+// A face that is not a full cylinder band still has to be classified against
+// the plane, and a *representative point* is not good enough: a U-turn torus
+// fillet's centre sits far from the fillet itself, and a chord face's plane
+// origin is one of its corners.  These helpers give the EXACT signed-distance
+// range of each template's material region, so the keep/drop decision is right
+// and only a genuine straddle is reported as such.
+
+/// Min/max of `a·cos О± + b·sin О±` over `О± в€€ [lo, hi]`.
+///
+/// `f(О±) = R·cos(О± в€’ П†)` with `R = hypot(a, b)`, `П† = atan2(b, a)`: the extrema
+/// are the interval endpoints plus, when they fall inside the interval, the
+/// stationary points `О± в‰Ў П†` (maximum `+R`) and `О± в‰Ў П† + ПЂ` (minimum `в€’R`).
+fn harmonic_range(a: f64, b: f64, lo: f64, hi: f64) -> (f64, f64) {
+    use std::f64::consts::{PI, TAU};
+    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+    let r = a.hypot(b);
+    if r < 1.0e-15 {
+        return (0.0, 0.0);
+    }
+    if hi - lo >= TAU {
+        return (-r, r);
+    }
+    let f = |ang: f64| a * ang.cos() + b * ang.sin();
+    let (f_lo, f_hi) = (f(lo), f(hi));
+    let mut min = f_lo.min(f_hi);
+    let mut max = f_lo.max(f_hi);
+    let phi = b.atan2(a);
+    for (base, is_max) in [(phi, true), (phi + PI, false)] {
+        // Smallest representative of `base` (mod 2ПЂ) that is в‰Ґ lo.
+        let ang = base + TAU * ((lo - base) / TAU).ceil();
+        if ang <= hi {
+            if is_max {
+                max = max.max(r);
+            } else {
+                min = min.min(-r);
+            }
+        }
+    }
+    (min, max)
+}
+
+/// Signed-distance range of a cylinder band, optionally limited to the arc
+/// `[a0, a1]` measured from `ref_dir` about the axis (the chord-cut /
+/// quarter-cylinder templates).
+fn cylinder_band_range(
+    cyl: &CylSurf,
+    length: f64,
+    arc: Option<(UnitVec3, f64, f64)>,
+    plane: &ClipPlane,
+) -> (f64, f64) {
+    let n = plane.normal;
+    let d0 = n.dot_vec(cyl.frame.origin - plane.origin);
+    let na = n.dot_vec(cyl.axis().as_vec()) * length;
+    let (ax_lo, ax_hi) = if na >= 0.0 { (0.0, na) } else { (na, 0.0) };
+
+    let (r_lo, r_hi) = match arc {
+        // p(О±) = axis_point + r·(cos О±·ref_dir + sin О±·(axis Г— ref_dir)) вЂ” the
+        // basis `add_lateral_cut_caps` and the STEP writer both use.
+        Some((ref_dir, a0, a1)) => {
+            let right = cyl.axis().cross(ref_dir);
+            harmonic_range(
+                cyl.radius * n.dot_vec(ref_dir.as_vec()),
+                cyl.radius * n.dot_vec(right),
+                a0,
+                a1,
+            )
+        }
+        // Full cross-section: В± the radius projected into the plane вЉҐ axis.
+        None => {
+            let na_unit = n.dot_vec(cyl.axis().as_vec());
+            let r = cyl.radius * (1.0 - na_unit * na_unit).max(0.0).sqrt();
+            (-r, r)
+        }
+    };
+
+    (d0 + ax_lo + r_lo, d0 + ax_hi + r_hi)
+}
+
+/// Signed-distance range `(min, max)` of the material region of a *template*
+/// face against `plane`.
+///
+/// `None` means the extent carries no closed-form region (explicitly trimmed
+/// loops, or a template we do not model here) вЂ” the caller falls back to a
+/// representative point.
+fn face_signed_range(face: &Face, plane: &ClipPlane) -> Option<(f64, f64)> {
+    use std::f64::consts::TAU;
+    let n = plane.normal;
+    let dist = |p: Point3| n.dot_vec(p - plane.origin);
+
+    // Range of a flat circular region (disk / circular boundary), optionally
+    // limited to an arc.
+    let planar_circle = |frame: &Frame3, radius: f64, arc: Option<(f64, f64)>| {
+        let c = dist(frame.origin);
+        let (a, b) = (
+            radius * n.dot_vec(frame.x.as_vec()),
+            radius * n.dot_vec(frame.y.as_vec()),
+        );
+        let (lo, hi) = match arc {
+            Some((a0, a1)) => harmonic_range(a, b, a0, a1),
+            None => harmonic_range(a, b, 0.0, TAU),
+        };
+        (c + lo, c + hi)
+    };
+
+    match (&face.geom, &face.extent) {
+        (FaceGeom::Cylinder(cyl), FaceExtent::Cylinder { length, .. }) => {
+            Some(cylinder_band_range(cyl, *length, None, plane))
+        }
+        (
+            FaceGeom::Cylinder(cyl),
+            FaceExtent::PartialCylinder {
+                length,
+                arc_start_angle,
+                arc_end_angle,
+                arc_ref_dir,
+            }
+            | FaceExtent::CylinderArcFace {
+                length,
+                arc_start_angle,
+                arc_end_angle,
+                arc_ref_dir,
+            },
+        ) => Some(cylinder_band_range(
+            cyl,
+            *length,
+            Some((*arc_ref_dir, *arc_start_angle, *arc_end_angle)),
+            plane,
+        )),
+
+        (FaceGeom::Plane(_), FaceExtent::Polygon { points }) if !points.is_empty() => {
+            let mut lo = f64::MAX;
+            let mut hi = f64::MIN;
+            for p in points {
+                let t = dist(*p);
+                lo = lo.min(t);
+                hi = hi.max(t);
+            }
+            Some((lo, hi))
+        }
+        (FaceGeom::Plane(pl), FaceExtent::Disk { radius }) => {
+            Some(planar_circle(&pl.frame, *radius, None))
+        }
+        // A partial disk is the region between the arc and its chord вЂ” the
+        // convex hull of the arc, so the arc's own range is exact.
+        (
+            FaceGeom::Plane(pl),
+            FaceExtent::PartialDisk {
+                radius,
+                start_angle,
+                end_angle,
+            },
+        ) => Some(planar_circle(
+            &pl.frame,
+            *radius,
+            Some((*start_angle, *end_angle)),
+        )),
+        (
+            FaceGeom::Plane(_),
+            FaceExtent::PlanarBoundary {
+                boundary: FaceBoundary::Circle(c),
+            },
+        ) => Some(planar_circle(&c.frame, c.radius, None)),
+
+        // Torus fillet: every surface point is within `minor_radius` of the
+        // centre-line circle, so the centre-line's range padded by the minor
+        // radius is exact.  (The torus CENTRE вЂ” what this used to test вЂ” is not
+        // even on the solid.)
+        (FaceGeom::Torus(t), FaceExtent::TorusFillet { start_circle, end_circle }) => {
+            let theta_of = |p: Point3| {
+                let w = p - t.frame.origin;
+                t.frame.y.dot_vec(w).atan2(t.frame.x.dot_vec(w))
+            };
+            let (lo, hi) = if (start_circle.frame.origin - end_circle.frame.origin).length() < 1e-9
+            {
+                (0.0, TAU) // full donut
+            } else {
+                let lo = theta_of(start_circle.frame.origin);
+                let mut hi = theta_of(end_circle.frame.origin);
+                hi += TAU * ((lo - hi) / TAU).round();
+                (lo, hi)
+            };
+            let c = dist(t.frame.origin);
+            let (a, b) = (
+                t.major_radius * n.dot_vec(t.frame.x.as_vec()),
+                t.major_radius * n.dot_vec(t.frame.y.as_vec()),
+            );
+            let (r_lo, r_hi) = harmonic_range(a, b, lo, hi);
+            Some((c + r_lo - t.minor_radius, c + r_hi + t.minor_radius))
+        }
+
+        // A sphere cap is bounded by its whole sphere.
+        (FaceGeom::Sphere(s), _) => {
+            let c = dist(s.centre);
+            Some((c - s.radius, c + s.radius))
+        }
+
+        _ => None,
     }
 }
 
@@ -667,7 +894,32 @@ fn build_placeholder_loop(brep: &mut BRep) -> cadcore_topo::LoopId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sweep::{sweep_circle_along_polyline, SweepOptions};
+    use crate::sweep::{
+        sweep_circle_along_polyline, sweep_circle_along_rounded_polyline, SweepOptions,
+    };
+
+    /// Faces reachable from a LIVE solid.  `half_space_cut_brep` drops solids
+    /// but leaves their faces in the arena, so counting `brep.faces` directly
+    /// counts orphans too (and the STEP writer only walks solids).
+    fn live_faces(brep: &BRep) -> Vec<&Face> {
+        let mut out = Vec::new();
+        for solid in brep.solids.values() {
+            for &sh in &solid.shells {
+                if let Some(shell) = brep.shells.get(sh) {
+                    for &fid in &shell.faces {
+                        if let Some(f) = brep.faces.get(fid) {
+                            out.push(f);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn count_live<F: Fn(&Face) -> bool>(brep: &BRep, pred: F) -> usize {
+        live_faces(brep).into_iter().filter(|f| pred(f)).count()
+    }
 
     /// X-direction cylinder centred at y=0.20 (= radius), cut by plane y=0.20.
     /// Axis runs through the plane в†’ LATERAL case, half-cylinder survives.
@@ -753,6 +1005,140 @@ mod tests {
         };
         let n = half_space_cut_brep(&mut brep, &plane);
         assert_eq!(n, 0, "cylinder fully below plane must be dropped");
+    }
+
+    /// Two cut planes applied in sequence (the default `trim_side = "both"`).
+    ///
+    /// The chord (`PartialCylinder`) face produced by the FIRST plane used to be
+    /// silently dropped by the second one вЂ” it is a `FaceGeom::Cylinder` face
+    /// with a non-`Cylinder` extent, so it fell through both collection arms вЂ”
+    /// while its chord polygon and partial-disk caps survived.  Result: a hole
+    /// where the half-tube was, i.e. an open shell in the exported STEP.
+    #[test]
+    fn sequential_cuts_keep_earlier_chord_faces() {
+        let mut brep = BRep::new();
+        // U-shape: X-leg at y=1, Y-connector, X-leg at y=19.
+        sweep_circle_along_polyline(
+            &mut brep,
+            &[
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(20.0, 1.0, 0.0),
+                Point3::new(20.0, 19.0, 0.0),
+                Point3::new(0.0, 19.0, 0.0),
+            ],
+            0.2,
+            &SweepOptions::default(),
+        )
+        .unwrap();
+
+        let is_partial_cyl = |f: &Face| matches!(f.extent, FaceExtent::PartialCylinder { .. });
+        let is_polygon = |f: &Face| matches!(f.extent, FaceExtent::Polygon { .. });
+        let is_partial_disk = |f: &Face| matches!(f.extent, FaceExtent::PartialDisk { .. });
+
+        // Plane 1 chord-cuts the y = 1 leg (its axis lies IN the plane).
+        half_space_cut_brep(
+            &mut brep,
+            &ClipPlane {
+                origin: Point3::new(0.0, 1.0, 0.0),
+                normal: UnitVec3::Y,
+            },
+        );
+        assert_eq!(count_live(&brep, is_partial_cyl), 1, "plane 1 chord face");
+
+        // Plane 2 chord-cuts the y = 19 leg.  BOTH chord faces must survive.
+        half_space_cut_brep(
+            &mut brep,
+            &ClipPlane {
+                origin: Point3::new(0.0, 19.0, 0.0),
+                normal: -UnitVec3::Y,
+            },
+        );
+        assert_eq!(
+            count_live(&brep, is_polygon),
+            2,
+            "one chord polygon per plane"
+        );
+        assert_eq!(
+            count_live(&brep, is_partial_disk),
+            4,
+            "two partial-disk caps per plane"
+        );
+        assert_eq!(
+            count_live(&brep, is_partial_cyl),
+            2,
+            "plane 2 dropped the chord cylinder made by plane 1 \
+             (its flat caps survived вЂ” the shell is open)"
+        );
+    }
+
+    /// A U-turn torus fillet lying entirely on the discarded side must be
+    /// dropped.  It used to be kept because the test point was the torus
+    /// CENTRE, which for a U-turn sits on the kept side вЂ” leaving the fillet
+    /// floating past the cut plane with an unshared junction edge.
+    #[test]
+    fn torus_fillet_past_the_plane_is_dropped() {
+        let mut brep = BRep::new();
+        // Hairpin in the XY plane: up to y = 20, U-turn, back down.
+        sweep_circle_along_rounded_polyline(
+            &mut brep,
+            &[
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(0.0, 20.0, 0.0),
+                Point3::new(2.0, 20.0, 0.0),
+                Point3::new(2.0, 0.0, 0.0),
+            ],
+            0.2,
+            1.0, // corner radius в†’ two torus fillets around y = 19..20
+            &SweepOptions::default(),
+        )
+        .unwrap();
+        let torus_count = |b: &BRep| count_live(b, |f| matches!(f.geom, FaceGeom::Torus(_)));
+        assert!(torus_count(&brep) >= 2, "rounded corners must be tori");
+
+        // Keep y <= 15: the whole U-turn is well past the plane.
+        half_space_cut_brep(
+            &mut brep,
+            &ClipPlane {
+                origin: Point3::new(0.0, 15.0, 0.0),
+                normal: -UnitVec3::Y,
+            },
+        );
+        assert_eq!(
+            torus_count(&brep),
+            0,
+            "fillets entirely on the discarded side must be dropped"
+        );
+    }
+
+    /// The mirror case: a fillet entirely on the kept side stays.
+    #[test]
+    fn torus_fillet_before_the_plane_is_kept() {
+        let mut brep = BRep::new();
+        sweep_circle_along_rounded_polyline(
+            &mut brep,
+            &[
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(0.0, 20.0, 0.0),
+                Point3::new(2.0, 20.0, 0.0),
+                Point3::new(2.0, 0.0, 0.0),
+            ],
+            0.2,
+            1.0,
+            &SweepOptions::default(),
+        )
+        .unwrap();
+        let torus_count = |b: &BRep| count_live(b, |f| matches!(f.geom, FaceGeom::Torus(_)));
+        let before = torus_count(&brep);
+
+        // Keep y >= 5: the legs are truncated, the U-turn is untouched.
+        half_space_cut_brep(
+            &mut brep,
+            &ClipPlane {
+                origin: Point3::new(0.0, 5.0, 0.0),
+                normal: UnitVec3::Y,
+            },
+        );
+        assert_eq!(torus_count(&brep), before, "kept-side fillets must survive");
     }
 
     /// Cylinder fully above the plane в†’ kept unchanged.

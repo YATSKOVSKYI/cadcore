@@ -92,6 +92,102 @@ pub fn axis_box(brep: &mut BRep, min: Point3, max: Point3) -> Vec<FaceId> {
     faces
 }
 
+/// An axis-aligned box built the way `cadcore_ops::build_solid_box` builds an
+/// electrode plate: six `FaceExtent::Polygon` faces with **placeholder loops**
+/// (no vertices, edges or co-edges at all).
+///
+/// The distinction matters — a solid like this carries its whole boundary in
+/// the extent template, so every consumer has to synthesise it.  This is the
+/// real electrode input, as opposed to [`axis_box`]'s fully-built topology.
+pub fn template_box(brep: &mut BRep, min: Point3, max: Point3) -> Vec<FaceId> {
+    let p = |x: f64, y: f64, z: f64| Point3::new(x, y, z);
+    let quads: [([Point3; 4], Vec3); 6] = [
+        (
+            [
+                p(min.x, min.y, max.z),
+                p(max.x, min.y, max.z),
+                p(max.x, max.y, max.z),
+                p(min.x, max.y, max.z),
+            ],
+            Vec3::new(0.0, 0.0, 1.0),
+        ),
+        (
+            [
+                p(min.x, max.y, min.z),
+                p(max.x, max.y, min.z),
+                p(max.x, min.y, min.z),
+                p(min.x, min.y, min.z),
+            ],
+            Vec3::new(0.0, 0.0, -1.0),
+        ),
+        (
+            [
+                p(min.x, max.y, max.z),
+                p(max.x, max.y, max.z),
+                p(max.x, max.y, min.z),
+                p(min.x, max.y, min.z),
+            ],
+            Vec3::new(0.0, 1.0, 0.0),
+        ),
+        (
+            [
+                p(min.x, min.y, min.z),
+                p(max.x, min.y, min.z),
+                p(max.x, min.y, max.z),
+                p(min.x, min.y, max.z),
+            ],
+            Vec3::new(0.0, -1.0, 0.0),
+        ),
+        (
+            [
+                p(max.x, min.y, min.z),
+                p(max.x, max.y, min.z),
+                p(max.x, max.y, max.z),
+                p(max.x, min.y, max.z),
+            ],
+            Vec3::new(1.0, 0.0, 0.0),
+        ),
+        (
+            [
+                p(min.x, min.y, max.z),
+                p(min.x, max.y, max.z),
+                p(min.x, max.y, min.z),
+                p(min.x, min.y, min.z),
+            ],
+            Vec3::new(-1.0, 0.0, 0.0),
+        ),
+    ];
+    let mut faces = Vec::new();
+    for (pts, nrm) in quads {
+        let normal = UnitVec3::try_from_vec(nrm).unwrap();
+        let face = brep.add_face(Face {
+            geom: FaceGeom::Plane(Plane3::from_origin_normal(pts[0], normal)),
+            normal: FaceNormal::Same,
+            outer_loop: Default::default(),
+            inner_loops: Vec::new(),
+            shell: Default::default(),
+            extent: FaceExtent::Polygon {
+                points: pts.to_vec(),
+            },
+        });
+        faces.push(face);
+    }
+    let shell = brep.add_shell(Shell {
+        faces: faces.clone(),
+        is_outer: true,
+        solid: Default::default(),
+    });
+    let solid = brep.add_solid(Solid {
+        shells: vec![shell],
+        name: Some("plate".into()),
+    });
+    brep.shells[shell].solid = solid;
+    for &f in &faces {
+        brep.faces[f].shell = shell;
+    }
+    faces
+}
+
 /// A capped cylinder solid: lateral cylinder + two disk caps.
 pub fn capped_cylinder(
     brep: &mut BRep,

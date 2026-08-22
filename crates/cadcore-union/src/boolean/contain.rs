@@ -209,7 +209,7 @@ fn torus_hits(tor: &cadcore_geom::TorusSurf, p: Point3, dir: UnitVec3) -> Vec<(f
 }
 
 /// Where a ray hit sits relative to a face's trimmed region.
-enum Membership {
+pub(crate) enum Membership {
     Inside,
     Outside,
     OnBoundary,
@@ -218,7 +218,7 @@ enum Membership {
 /// Does `hit` (already on the carrier surface) lie within the face's trimmed
 /// region?  Uses the analytic [`FaceExtent`] for primitive input faces; falls
 /// back to the real loop polygon when the extent is `Trimmed`/`None`.
-fn face_contains_hit(brep: &BRep, fid: FaceId, hit: Point3) -> Membership {
+pub(crate) fn face_contains_hit(brep: &BRep, fid: FaceId, hit: Point3) -> Membership {
     let f = &brep.faces[fid];
     const ON: f64 = 1e-7;
     let inside_outside = |d_in: f64| {
@@ -294,10 +294,20 @@ fn cylinder_band_membership(
         }
         let mut uv: Vec<(f64, f64)> = Vec::new();
         let mut c = lp.start;
+        // u is unwrapped CONTINUOUSLY along the loop.  Raw atan2 values make a
+        // window that happens to sit on the u = ±π seam look like it spans the
+        // whole period, so the full-wrap test below would mistake it for a rim
+        // and stop excluding it — the hole then reads as solid material.
+        let mut prev_u: Option<f64> = None;
         loop {
             let ce = &brep.coedges[c];
             for p in super::aabb::sample_edge(brep, ce.edge) {
-                let (u, v) = to_uv(p);
+                let (raw_u, v) = to_uv(p);
+                let u = match prev_u {
+                    Some(pu) => raw_u - TAU * ((raw_u - pu) / TAU).round(),
+                    None => raw_u,
+                };
+                prev_u = Some(u);
                 lo = lo.min(v);
                 hi = hi.max(v);
                 uv.push((u, v));
@@ -328,11 +338,11 @@ fn cylinder_band_membership(
         if umax - umin > 0.9 * TAU {
             continue; // a full-wrap rim, not a window
         }
-        // unwrap the window's u onto the branch nearest the query, then pip
-        let poly: Vec<(f64, f64)> = uv
-            .iter()
-            .map(|&(u, v)| (u + TAU * ((qu - u) / TAU).round(), v))
-            .collect();
+        // Shift the window onto the branch nearest the query as ONE rigid
+        // polygon (a per-vertex shift would tear a window that spans the seam).
+        let umean = uv.iter().map(|p| p.0).sum::<f64>() / uv.len() as f64;
+        let k = ((qu - umean) / TAU).round();
+        let poly: Vec<(f64, f64)> = uv.iter().map(|&(u, v)| (u + TAU * k, v)).collect();
         if let Membership::Inside = pip(&poly, qu, qv) {
             return Membership::Outside; // inside a window ⇒ off the band
         }

@@ -16,7 +16,7 @@
 use cadcore_geom::{Circle3, CylSurf, Ellipse3, Plane3, TorusSurf};
 use cadcore_math::{Point3, UnitVec3, Vec3};
 use cadcore_topo::{
-    BRep, Face, FaceBoundary, FaceExtent, FaceGeom, FaceNormal, Shell, Solid, SolidId,
+    BRep, Face, FaceBoundary, FaceExtent, FaceGeom, FaceNormal, PrismAxis, Shell, Solid, SolidId,
 };
 
 /// Options that control the sweep.
@@ -1040,15 +1040,8 @@ pub fn build_solid_box(
 
 /// Build a solid box with rounded XZ-plane corners using fully **analytic BREP geometry**.
 ///
-/// Produces exactly **10 faces**:
-/// * 2 cap faces (Y = ymax / ymin) — `FaceGeom::Plane` + `FaceExtent::RoundedRectCap`
-///   with 4 LINE + 4 CIRCLE arc edges in STEP (no tessellation on the cap).
-/// * 4 flat side quads — `FaceGeom::Plane` + `FaceExtent::Polygon` (4-vertex quads).
-/// * 4 quarter-cylinder corner faces — `FaceGeom::Cylinder` + `FaceExtent::CylinderArcFace`
-///   with analytic CIRCLE / LINE boundary curves in STEP.
-///
-/// This is equivalent to a "pull to radius" operation in a parametric modeller:
-/// smooth analytic geometry, no visible faceting, FEM-clean topology.
+/// Y-normal shorthand for [`build_solid_rounded_plate`] — the classic silver
+/// electrode plate: rounded-rectangle profile in XZ, extruded along Y.
 pub fn build_solid_rounded_box_xz(
     brep: &mut BRep,
     xmin: f64,
@@ -1060,14 +1053,73 @@ pub fn build_solid_rounded_box_xz(
     corner_radius: f64,
     name: Option<String>,
 ) -> Result<SolidId, SweepError> {
+    build_solid_rounded_plate(
+        brep,
+        PrismAxis::Y,
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+        zmin,
+        zmax,
+        corner_radius,
+        name,
+    )
+}
+
+/// Build a rounded-rectangle **plate** (prism) normal to `axis`, using fully
+/// **analytic BREP geometry**.
+///
+/// The four edges parallel to `axis` — the corners of the plate outline as seen
+/// face-on — are replaced by quarter-cylinder fillets of `corner_radius`.
+/// The caller passes a plain world-space AABB; the axis decides which pair of
+/// faces are the caps.
+///
+/// Produces exactly **10 faces**:
+/// * 2 cap faces (at `w = wmin` / `wmax`) — `FaceGeom::Plane` +
+///   `FaceExtent::RoundedRectCap` with 4 LINE + 4 CIRCLE arc edges in STEP
+///   (no tessellation on the cap).
+/// * 4 flat side quads — `FaceGeom::Plane` + `FaceExtent::Polygon` (4-vertex quads).
+/// * 4 quarter-cylinder corner faces — `FaceGeom::Cylinder` +
+///   `FaceExtent::CylinderArcFace` with analytic CIRCLE / LINE boundary curves.
+///
+/// This is equivalent to a "pull to radius" operation in a parametric modeller:
+/// smooth analytic geometry, no visible faceting, FEM-clean topology.
+///
+/// Every face is wound CCW-as-seen-from-outside so each edge — straight *and*
+/// arc — is traversed in opposite directions by the two faces sharing it, which
+/// is what makes the emitted STEP a watertight AP214 closed shell.  See
+/// `cadcore/CLAUDE.md`.
+///
+/// `corner_radius ≤ 0` (or a radius that doesn't fit) delegates to
+/// [`build_solid_box`].
+pub fn build_solid_rounded_plate(
+    brep: &mut BRep,
+    axis: PrismAxis,
+    xmin: f64,
+    xmax: f64,
+    ymin: f64,
+    ymax: f64,
+    zmin: f64,
+    zmax: f64,
+    corner_radius: f64,
+    name: Option<String>,
+) -> Result<SolidId, SweepError> {
+    // The (u, v, w) basis is a positive permutation of (X, Y, Z), so the AABB's
+    // min corner maps to the (u, v, w) minima and the max corner to the maxima.
+    let (umin, vmin, wmin) = axis.split(Point3::new(xmin, ymin, zmin));
+    let (umax, vmax, wmax) = axis.split(Point3::new(xmax, ymax, zmax));
+
     let r = corner_radius
         .max(0.0)
-        .min(((xmax - xmin) * 0.5).min((zmax - zmin) * 0.5));
+        .min(((umax - umin) * 0.5).min((vmax - vmin) * 0.5));
     if r <= 1.0e-9 {
         return build_solid_box(brep, xmin, xmax, ymin, ymax, zmin, zmax, name);
     }
 
-    let len_y = ymax - ymin;
+    let len_w = wmax - wmin;
+    let (ud, vd, wd) = (axis.u(), axis.v(), axis.w());
+    let p = |u: f64, v: f64, w: f64| axis.point(u, v, w);
 
     // Collect all (geom, normal_flag, extent) triples, then bulk-insert.
     struct FaceSpec {
@@ -1088,113 +1140,113 @@ pub fn build_solid_rounded_box_xz(
         }
     };
 
-    // ── 1. Back cap (Y = ymax, outward +Y) ───────────────────────────────────
+    // ── 1. Back cap (w = wmax, outward +w) ───────────────────────────────────
     specs.push(FaceSpec {
-        geom: FaceGeom::Plane(Plane3::from_origin_normal(
-            Point3::new(0.0, ymax, 0.0),
-            UnitVec3::Y,
-        )),
+        geom: FaceGeom::Plane(Plane3::from_origin_normal(p(0.0, 0.0, wmax), wd)),
         normal: FaceNormal::Same,
         extent: FaceExtent::RoundedRectCap {
-            xmin,
-            xmax,
-            zmin,
-            zmax,
+            axis,
+            umin,
+            umax,
+            vmin,
+            vmax,
             radius: r,
-            y: ymax,
-            plus_y: true,
+            w: wmax,
+            plus: true,
         },
     });
 
-    // ── 2. Front cap (Y = ymin, outward −Y) ──────────────────────────────────
+    // ── 2. Front cap (w = wmin, outward −w) ──────────────────────────────────
     specs.push(FaceSpec {
-        geom: FaceGeom::Plane(Plane3::from_origin_normal(
-            Point3::new(0.0, ymin, 0.0),
-            -UnitVec3::Y,
-        )),
+        geom: FaceGeom::Plane(Plane3::from_origin_normal(p(0.0, 0.0, wmin), -wd)),
         normal: FaceNormal::Same,
         extent: FaceExtent::RoundedRectCap {
-            xmin,
-            xmax,
-            zmin,
-            zmax,
+            axis,
+            umin,
+            umax,
+            vmin,
+            vmax,
             radius: r,
-            y: ymin,
-            plus_y: false,
+            w: wmin,
+            plus: false,
         },
     });
 
     // ── 3–6. Flat side faces ─────────────────────────────────────────────────
-    // Bottom (Z = zmin, outward −Z)
+    // v = vmin, outward −v
     specs.push(poly_spec(
         vec![
-            Point3::new(xmin + r, ymin, zmin),
-            Point3::new(xmin + r, ymax, zmin),
-            Point3::new(xmax - r, ymax, zmin),
-            Point3::new(xmax - r, ymin, zmin),
+            p(umin + r, vmin, wmin),
+            p(umin + r, vmin, wmax),
+            p(umax - r, vmin, wmax),
+            p(umax - r, vmin, wmin),
         ],
-        -UnitVec3::Z,
+        -vd,
     ));
-    // Top (Z = zmax, outward +Z)
+    // v = vmax, outward +v
     specs.push(poly_spec(
         vec![
-            Point3::new(xmax - r, ymin, zmax),
-            Point3::new(xmax - r, ymax, zmax),
-            Point3::new(xmin + r, ymax, zmax),
-            Point3::new(xmin + r, ymin, zmax),
+            p(umax - r, vmax, wmin),
+            p(umax - r, vmax, wmax),
+            p(umin + r, vmax, wmax),
+            p(umin + r, vmax, wmin),
         ],
-        UnitVec3::Z,
+        vd,
     ));
-    // Left (X = xmin, outward −X)
+    // u = umin, outward −u
     specs.push(poly_spec(
         vec![
-            Point3::new(xmin, ymin, zmax - r),
-            Point3::new(xmin, ymax, zmax - r),
-            Point3::new(xmin, ymax, zmin + r),
-            Point3::new(xmin, ymin, zmin + r),
+            p(umin, vmax - r, wmin),
+            p(umin, vmax - r, wmax),
+            p(umin, vmin + r, wmax),
+            p(umin, vmin + r, wmin),
         ],
-        -UnitVec3::X,
+        -ud,
     ));
-    // Right (X = xmax, outward +X)
+    // u = umax, outward +u
     specs.push(poly_spec(
         vec![
-            Point3::new(xmax, ymin, zmin + r),
-            Point3::new(xmax, ymax, zmin + r),
-            Point3::new(xmax, ymax, zmax - r),
-            Point3::new(xmax, ymin, zmax - r),
+            p(umax, vmin + r, wmin),
+            p(umax, vmin + r, wmax),
+            p(umax, vmax - r, wmax),
+            p(umax, vmax - r, wmin),
         ],
-        UnitVec3::X,
+        ud,
     ));
 
-    // ── 7–10. Quarter-cylinder corner faces (CCW-from-+Y order: BR→TR→TL→BL) ─
+    // ── 7–10. Quarter-cylinder corner faces (CCW-from-+w order: BR→TR→TL→BL) ─
     //
-    // Each cylinder has axis = +Y, origin at (cx, ymin, cz).
+    // Each cylinder has axis = +w, origin at (cu, cv, wmin).
     // arc_ref_dir is the CylSurf x-reference (angle=0 direction).
-    // right = Y × arc_ref_dir (= CylSurf y-reference).
+    // right = w × arc_ref_dir (= CylSurf y-reference).
     //
-    // CylinderArcFace: arc_start=0, arc_end=−π/2, length=len_y.
-    //   arc_pt(0)    = origin + arc_ref_dir * r   ← arc start at ymin
-    //   arc_pt(−π/2) = origin − right * r         ← arc end at ymin
+    // CylinderArcFace: arc_start=0, arc_end=−π/2, length=len_w.
+    //   arc_pt(0)    = origin + arc_ref_dir * r   ← arc start at wmin
+    //   arc_pt(−π/2) = origin − right * r         ← arc end at wmin
     //
-    // Corner  arc_ref  start(xz)         end(xz)
-    // BR  −Z   (xmax−r, zmin)  (xmax, zmin+r)
-    // TR  +X   (xmax,  zmax−r) (xmax−r, zmax)
-    // TL  +Z   (xmin+r,zmax)   (xmin, zmax−r)
-    // BL  −X   (xmin,  zmin+r) (xmin+r,zmin)
+    // With `u × v = −w` the frame's y-reference `right = w × arc_ref` is always
+    // another principal axis, tabulated here so no fallible cross product is
+    // needed:
+    //
+    // Corner  arc_ref  right   start(u,v)        end(u,v)
+    // BR      −v       −u      (umax−r, vmin)    (umax, vmin+r)
+    // TR      +u       −v      (umax,  vmax−r)   (umax−r, vmax)
+    // TL      +v       +u      (umin+r, vmax)    (umin, vmax−r)
+    // BL      −u       +v      (umin,  vmin+r)   (umin+r, vmin)
     let corner_data: [(f64, f64, UnitVec3, UnitVec3); 4] = [
-        (xmax - r, zmin + r, -UnitVec3::Z, -UnitVec3::X), // BR: ref=−Z, right=Y×(−Z)=−X
-        (xmax - r, zmax - r, UnitVec3::X, -UnitVec3::Z),  // TR: ref=+X, right=Y×X=−Z
-        (xmin + r, zmax - r, UnitVec3::Z, UnitVec3::X),   // TL: ref=+Z, right=Y×Z=+X
-        (xmin + r, zmin + r, -UnitVec3::X, UnitVec3::Z),  // BL: ref=−X, right=Y×(−X)=+Z
+        (umax - r, vmin + r, -vd, -ud), // BR
+        (umax - r, vmax - r, ud, -vd),  // TR
+        (umin + r, vmax - r, vd, ud),   // TL
+        (umin + r, vmin + r, -ud, vd),  // BL
     ];
 
-    for (cx, cz, arc_ref, right) in corner_data {
+    for (cu, cv, arc_ref, right) in corner_data {
         let cyl = CylSurf {
             frame: cadcore_math::Frame3 {
-                origin: Point3::new(cx, ymin, cz),
+                origin: p(cu, cv, wmin),
                 x: arc_ref,
                 y: right,
-                z: UnitVec3::Y,
+                z: wd,
             },
             radius: r,
         };
@@ -1202,7 +1254,7 @@ pub fn build_solid_rounded_box_xz(
             geom: FaceGeom::Cylinder(cyl),
             normal: FaceNormal::Same,
             extent: FaceExtent::CylinderArcFace {
-                length: len_y,
+                length: len_w,
                 arc_start_angle: 0.0,
                 arc_end_angle: -std::f64::consts::FRAC_PI_2,
                 arc_ref_dir: arc_ref,
@@ -2516,8 +2568,9 @@ mod tests {
             .faces
             .values()
             .filter_map(|f| {
-                if let FaceExtent::RoundedRectCap { y, .. } = f.extent {
-                    Some(y)
+                if let FaceExtent::RoundedRectCap { axis, w, .. } = f.extent {
+                    assert_eq!(axis, PrismAxis::Y, "XZ plate caps must be Y-normal");
+                    Some(w)
                 } else {
                     None
                 }
@@ -2532,6 +2585,124 @@ mod tests {
             cap_ys.iter().any(|&y| (y - ymax).abs() < 1e-9),
             "no cap at ymax={ymax}"
         );
+    }
+
+    // ── build_solid_rounded_plate (axis-generic) tests ────────────────────────
+
+    /// The three axes are a permutation of one another: same face inventory,
+    /// same solid count, whichever pair of faces are the caps.
+    #[test]
+    fn rounded_plate_face_inventory_is_axis_independent() {
+        for axis in [PrismAxis::X, PrismAxis::Y, PrismAxis::Z] {
+            let mut brep = BRep::new();
+            build_solid_rounded_plate(
+                &mut brep,
+                axis,
+                0.0,
+                20.0,
+                -0.5,
+                0.0,
+                0.0,
+                3.0,
+                0.2,
+                Some(format!("plate_{axis:?}")),
+            )
+            .unwrap();
+            let (mut caps, mut polys, mut cyls) = (0usize, 0usize, 0usize);
+            for face in brep.faces.values() {
+                match &face.extent {
+                    FaceExtent::RoundedRectCap { axis: a, .. } => {
+                        assert_eq!(*a, axis, "cap carries the wrong axis");
+                        caps += 1;
+                    }
+                    FaceExtent::Polygon { .. } => polys += 1,
+                    FaceExtent::CylinderArcFace { .. } => cyls += 1,
+                    other => panic!("unexpected extent {other:?} for {axis:?}"),
+                }
+            }
+            assert_eq!((caps, polys, cyls), (2, 4, 4), "wrong faces for {axis:?}");
+            assert_eq!(brep.solids.len(), 1);
+        }
+    }
+
+    /// The caps sit on the two AABB faces normal to `axis`, and the rounded
+    /// corners run parallel to `axis` (so the plate outline is what gets filleted).
+    #[test]
+    fn rounded_plate_caps_and_fillets_follow_the_axis() {
+        let (xmin, xmax, ymin, ymax, zmin, zmax) = (0.0_f64, 20.0, -0.5, 0.0, 0.0, 3.0);
+        // (axis, expected cap coordinates along that axis)
+        let cases = [
+            (PrismAxis::X, (xmin, xmax)),
+            (PrismAxis::Y, (ymin, ymax)),
+            (PrismAxis::Z, (zmin, zmax)),
+        ];
+        for (axis, (lo, hi)) in cases {
+            let mut brep = BRep::new();
+            // The corner radius must fit the in-plane extents of every axis; the
+            // thinnest in-plane span here is 0.5 mm (the Y slab), so use 0.2.
+            build_solid_rounded_plate(
+                &mut brep, axis, xmin, xmax, ymin, ymax, zmin, zmax, 0.2, None,
+            )
+            .unwrap();
+
+            let cap_ws: Vec<f64> = brep
+                .faces
+                .values()
+                .filter_map(|f| match f.extent {
+                    FaceExtent::RoundedRectCap { w, .. } => Some(w),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(cap_ws.len(), 2, "{axis:?}: expected 2 caps");
+            assert!(
+                cap_ws.iter().any(|&w| (w - lo).abs() < 1e-9)
+                    && cap_ws.iter().any(|&w| (w - hi).abs() < 1e-9),
+                "{axis:?}: caps at {cap_ws:?}, expected {lo} and {hi}"
+            );
+
+            for face in brep.faces.values() {
+                if let FaceGeom::Cylinder(ref cyl) = face.geom {
+                    assert!(
+                        (cyl.frame.z.dot(axis.w()).abs() - 1.0).abs() < 1e-12,
+                        "{axis:?}: fillet axis {:?} is not parallel to the plate normal",
+                        cyl.frame.z
+                    );
+                }
+            }
+        }
+    }
+
+    /// Winding check on every axis: each planar face normal points away from the
+    /// solid centroid.  Inward winding is what silently breaks the STEP shell.
+    #[test]
+    fn rounded_plate_normals_point_outward_on_every_axis() {
+        let (xmin, xmax, ymin, ymax, zmin, zmax) = (0.0_f64, 20.0, -0.5, 0.0, 0.0, 3.0);
+        let center = Point3::new(
+            (xmin + xmax) * 0.5,
+            (ymin + ymax) * 0.5,
+            (zmin + zmax) * 0.5,
+        );
+        for axis in [PrismAxis::X, PrismAxis::Y, PrismAxis::Z] {
+            let mut brep = BRep::new();
+            build_solid_rounded_plate(
+                &mut brep, axis, xmin, xmax, ymin, ymax, zmin, zmax, 0.2, None,
+            )
+            .unwrap();
+            for face in brep.faces.values() {
+                if let FaceGeom::Plane(ref plane) = face.geom {
+                    let dot = plane.normal().dot_vec(plane.frame.origin - center);
+                    assert!(dot > 0.0, "{axis:?}: inward plane normal");
+                }
+                if let FaceGeom::Cylinder(ref cyl) = face.geom {
+                    // Fillet axes sit at the outer corners, away from the centre.
+                    let radial = cyl.frame.origin - center;
+                    assert!(
+                        radial.length() > 0.0,
+                        "{axis:?}: degenerate fillet placement"
+                    );
+                }
+            }
+        }
     }
 
     /// XZ-variant: planar face normals point outward from the solid centroid.

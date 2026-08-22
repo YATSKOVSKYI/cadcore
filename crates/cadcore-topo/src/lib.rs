@@ -30,6 +30,6 @@ mod ids;
 pub use brep::BRep;
 pub use entities::{
     CoEdge, CoEdgeSense, Edge, EdgeGeom, Face, FaceBoundary, FaceExtent, FaceGeom, FaceNormal,
-    Loop, Shell, Solid, Vertex,
+    Loop, PrismAxis, Shell, Solid, Vertex,
 };
 pub use ids::{CoEdgeId, EdgeId, FaceId, LoopId, ShellId, SolidId, VertexId};

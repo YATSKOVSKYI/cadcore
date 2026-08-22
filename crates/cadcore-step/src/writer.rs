@@ -9,7 +9,7 @@ use cadcore_geom::Ellipse3;
 use cadcore_math::{Point3, UnitVec3};
 use cadcore_topo::{
     BRep, CoEdgeSense, EdgeGeom, EdgeId, FaceBoundary, FaceExtent, FaceGeom, FaceId, FaceNormal,
-    LoopId, SolidId,
+    LoopId, PrismAxis, SolidId,
 };
 
 use crate::entities::{
@@ -21,11 +21,25 @@ use crate::entities::{
 use crate::nurbs::torus_patch_nurbs;
 use crate::pcurve::{cyl_pcurve, cyl_uv};
 
+/// Stable numeric identity of a BRep edge (its slotmap ffi handle), used as the
+/// writer's edge-cache key on the arrangement/union path so ONE `EDGE_CURVE` is
+/// emitted per topological edge — coincident-but-distinct edges stay separate.
+fn edge_ffi(e: EdgeId) -> u64 {
+    use slotmap::Key;
+    e.data().as_ffi()
+}
+
 /// Per-shell context for pcurve emission: each face's emitted surface id, and
 /// the faces adjacent to each (topologically-shared) edge.
 struct PcurveCtx {
     face_surf: HashMap<FaceId, usize>,
     edge_faces: HashMap<EdgeId, Vec<FaceId>>,
+    /// Number of co-edges referencing each edge across ALL faces of the shell
+    /// (not just `Trimmed`).  `≥2` marks a genuinely shared BRep edge (weld by
+    /// edge id); `1` marks a legacy edge welded geometrically with a coincident
+    /// distinct edge.  `edge_faces` only covers `Trimmed` faces, so it
+    /// under-counts junction circles (leg↔elbow) and disk rims (leg↔disk).
+    edge_coedges: HashMap<EdgeId, usize>,
     /// Branch-continuous `(u,v)` chains per `(face, polyline edge)`, computed
     /// by walking every wire with a running cursor: each edge's `u` branch is
     /// chained to the previous edge's end (±2π).  Independently-anchored
@@ -236,6 +250,45 @@ impl<'a> StepWriter<'a> {
         self.brep
             .loop_coedges(face.outer_loop)
             .is_some_and(|c| !c.is_empty())
+    }
+
+    /// True when `edge_id` belongs to the arrangement/union path: at least one
+    /// adjacent face is `FaceExtent::Trimmed` (a cadcore-union leg — legacy
+    /// cadcore-ops emits Cylinder/Disk TEMPLATE extents, never `Trimmed`).  Then
+    /// the writer keys the edge cache by BRep edge id (`TopoEdge`) so two
+    /// coincident-but-distinct edges (a self-overlapping toolpath / stacked
+    /// bands) stay separate EDGE_CURVEs instead of merging to a four-used edge.
+    /// A legacy edge (no Trimmed neighbour) welds through the GEOMETRIC key.
+    /// Keying on `Trimmed`-adjacency (not a coedge count) is robust even when
+    /// `edge_faces` under-reports a shared edge.
+    fn edge_is_shared(&self, edge_id: EdgeId, pc: &PcurveCtx) -> bool {
+        pc.edge_coedges.get(&edge_id).is_some_and(|&n| n >= 2)
+    }
+
+    /// True when this Disk cap's rim edge is shared with a `FaceExtent::Trimmed`
+    /// face — the marker of a cadcore-union (arrangement) leg.  Distinguishes an
+    /// arrangement cap (weld by BRep edge id via the topology walker) from a
+    /// legacy cadcore-ops cap (weld geometrically via the template path).
+    fn disk_rim_shares_trimmed(&self, face: &cadcore_topo::Face, pc: &PcurveCtx) -> bool {
+        let Some(coedges) = self.brep.loop_coedges(face.outer_loop) else {
+            return false;
+        };
+        for ce in coedges {
+            let Some(coe) = self.brep.coedges.get(ce) else { continue };
+            if let Some(faces) = pc.edge_faces.get(&coe.edge) {
+                for &f in faces {
+                    if self
+                        .brep
+                        .faces
+                        .get(f)
+                        .is_some_and(|fc| matches!(fc.extent, FaceExtent::Trimmed))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Recover the major-angle arc range `(theta_lo, theta_hi)` of a torus-elbow
@@ -553,9 +606,24 @@ impl<'a> StepWriter<'a> {
                     }
                 }
             }
+            // Coedge count per edge across ALL faces (not only Trimmed).
+            let mut edge_coedges: HashMap<EdgeId, usize> = HashMap::new();
+            for &face_id in &shell.faces {
+                let Some(face) = self.brep.faces.get(face_id) else { continue };
+                for &lp in std::iter::once(&face.outer_loop).chain(face.inner_loops.iter()) {
+                    if let Some(coedges) = self.brep.loop_coedges(lp) {
+                        for ce_id in coedges {
+                            if let Some(ce) = self.brep.coedges.get(ce_id) {
+                                *edge_coedges.entry(ce.edge).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
             let pc = PcurveCtx {
                 face_surf,
                 edge_faces,
+                edge_coedges,
                 wire_uv,
             };
 
@@ -582,9 +650,23 @@ impl<'a> StepWriter<'a> {
                 // cadcore-ops rounded-corner TorusFillet, by contrast, carries
                 // only placeholder loops — `face_has_real_loops` is false there,
                 // so it falls back to the closed-form NURBS template below.
+                // Arrangement/union faces carry real CoEdge/Edge topology (a
+                // shared BRep edge per junction), so route them through the
+                // topology walker where the edge cache is keyed by BRep edge id
+                // — including Disk caps, whose rim must weld to its leg via the
+                // SAME edge, not a coincidentally-matching geometric circle.
                 let analytic_bounds = matches!(face.extent, FaceExtent::Trimmed)
                     || (matches!(face.extent, FaceExtent::TorusFillet { .. })
-                        && self.face_has_real_loops(face));
+                        && self.face_has_real_loops(face))
+                    // A Disk cap routes through the topology walker ONLY when its
+                    // rim edge is shared with an arrangement (Trimmed) leg — i.e.
+                    // a cadcore-union cap that must weld by BRep edge id.  A legacy
+                    // cadcore-ops Disk (rim shared with a FaceExtent::Cylinder
+                    // template) keeps the geometric template path, so mixing edge
+                    // keys never opens its shell.
+                    || (matches!(face.extent, FaceExtent::Disk { .. })
+                        && self.face_has_real_loops(face)
+                        && self.disk_rim_shares_trimmed(face, &pc));
                 let bounds = if analytic_bounds {
                     self.emit_trimmed_face_bounds(ctx, face, &pc)?
                 } else {
@@ -720,6 +802,13 @@ impl<'a> StepWriter<'a> {
                                 is_outer,
                                 orient,
                                 bound_orientation,
+                                // Shared (arrangement) circle → key by edge id;
+                                // legacy circle (1 face) → geometric (edge = 0).
+                                if self.edge_is_shared(ce.edge, pc) {
+                                    edge_ffi(ce.edge)
+                                } else {
+                                    0
+                                },
                             )?;
                             return Ok(Some(id));
                         }
@@ -968,10 +1057,17 @@ impl<'a> StepWriter<'a> {
             let n = pts.len() as f64;
             Point3::new(acc.x / n, acc.y / n, acc.z / n)
         };
-        let key = StepCurveKey::Polyline {
-            v1: v_from.min(v_to),
-            v2: v_from.max(v_to),
-            mid: point_key(centroid),
+        // Topologically-shared edges (arrangement) key by BRep edge id so two
+        // coincident-but-distinct windows stay separate; legacy edges weld via
+        // the geometric key.
+        let key = if self.edge_is_shared(edge_id, pc) {
+            StepCurveKey::TopoEdge { edge: edge_ffi(edge_id) }
+        } else {
+            StepCurveKey::Polyline {
+                v1: v_from.min(v_to),
+                v2: v_from.max(v_to),
+                mid: point_key(centroid),
+            }
         };
         let (ec_id, orig_start) = if let Some(&pair) = ctx.edge_cache.get(&key) {
             pair
@@ -1205,14 +1301,20 @@ impl<'a> StepWriter<'a> {
         let v_from = emit_vertex_point(ctx, p_from)?;
         let v_to = emit_vertex_point(ctx, p_to)?;
         let r_micro = (r * 1_000_000.0).round() as i64;
-        let key = arc_edge_key(
-            point_key(p_from),
-            point_key(p_to),
-            point_key(centre),
-            r_micro,
-            dir_key(axis),
-            dir_key(xref),
-        );
+        // Shared (arrangement) edge → key by BRep edge id so coincident-but-
+        // distinct arcs stay separate; legacy edge → geometric arc key.
+        let key = if self.edge_is_shared(edge_id, pc) {
+            StepCurveKey::TopoEdge { edge: edge_ffi(edge_id) }
+        } else {
+            arc_edge_key(
+                point_key(p_from),
+                point_key(p_to),
+                point_key(centre),
+                r_micro,
+                dir_key(axis),
+                dir_key(xref),
+            )
+        };
         let (ec_id, orig_start) = if let Some(&pair) = ctx.edge_cache.get(&key) {
             pair
         } else {
@@ -1375,6 +1477,7 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
                 *radius,
                 true,
                 true,
+                0,
             )?;
             Ok(vec![bound])
         }
@@ -1438,6 +1541,7 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
                 c_outer.radius,
                 true,
                 true,
+                0,
             )?;
             let inner = emit_circle_bound(
                 ctx,
@@ -1447,6 +1551,7 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
                 c_inner.radius,
                 false,
                 false,
+                0,
             )?;
             Ok(vec![outer, inner])
         }
@@ -1534,14 +1639,15 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
 
         // ── Rounded-rectangle cap (4 lines + 4 arcs) — analytic bounds ─────
         FaceExtent::RoundedRectCap {
-            xmin,
-            xmax,
-            zmin,
-            zmax,
+            axis,
+            umin,
+            umax,
+            vmin,
+            vmax,
             radius,
-            y,
-            plus_y,
-        } => emit_rounded_rect_cap_bounds(ctx, *xmin, *xmax, *zmin, *zmax, *radius, *y, *plus_y),
+            w,
+            plus,
+        } => emit_rounded_rect_cap_bounds(ctx, *axis, *umin, *umax, *vmin, *vmax, *radius, *w, *plus),
 
         // ── Cylinder arc face (quarter-cylinder fillet) — analytic bounds ────
         FaceExtent::CylinderArcFace {
@@ -1801,6 +1907,7 @@ fn emit_boundary(
             c.radius,
             outer,
             orient,
+            0,
         ),
         FaceBoundary::Ellipse(e) => emit_ellipse_bound(ctx, e, fallback_x_dir, outer, orient),
     }
@@ -1814,10 +1921,16 @@ fn emit_circle_bound(
     radius: f64,
     outer: bool,
     orient: bool,
+    edge: u64,
 ) -> Result<usize, StepError> {
-    emit_circle_bound_oriented(ctx, centre, normal, _x_dir, radius, outer, orient, true)
+    emit_circle_bound_oriented(ctx, centre, normal, _x_dir, radius, outer, orient, true, edge)
 }
 
+/// `edge` (a BRep edge ffi id, or 0) keys the shared-edge cache topologically on
+/// the arrangement/union path so two coincident-but-distinct junction circles
+/// (a self-touching serpentine, or two tangent filaments) stay separate
+/// EDGE_CURVEs.  `0` keeps the legacy geometric key (the template path, where
+/// two independently-built faces share a circle by geometry).
 fn emit_circle_bound_oriented(
     ctx: &mut Ctx,
     centre: Point3,
@@ -1827,11 +1940,16 @@ fn emit_circle_bound_oriented(
     outer: bool,
     orient: bool,
     bound_orientation: bool,
+    edge: u64,
 ) -> Result<usize, StepError> {
-    let key = StepCurveKey::Circle {
-        center: point_key(centre),
-        radius_micro: (radius * 1_000_000.0).round() as i64,
-        normal: normal_key(normal),
+    let key = if edge != 0 {
+        StepCurveKey::TopoEdge { edge }
+    } else {
+        StepCurveKey::Circle {
+            center: point_key(centre),
+            radius_micro: (radius * 1_000_000.0).round() as i64,
+            normal: normal_key(normal),
+        }
     };
     // Cache second element stores first-user's orient (0=.F., 1=.T.) so that
     // the second user (adjacent face sharing this edge) always gets the
@@ -2747,54 +2865,53 @@ fn emit_cylinder_arc_face_bounds(
 
 // ── Rounded-rectangle cap bounds (4 LINE + 4 CIRCLE arc edges) ───────────────
 //
-// One end cap of the prism (a flat rounded rectangle at y = `y`).  Traversed
-// along the profile so the loop is CCW as seen from outside:
-//   * front cap (−Y, `plus_y = false`): profile forward  (segments 0..8)
-//   * back  cap (+Y, `plus_y = true` ): profile backward  (segments 7..0)
+// One end cap of the prism (a flat rounded rectangle at `w` along `axis`).
+// Everything is expressed in the prism's own `(u, v, w)` basis (see
+// `PrismAxis`), so the same emitter serves X-, Y- and Z-normal plates.
+//
+// Traversed along the profile so the loop is CCW as seen from outside:
+//   * front cap (−axis, `plus = false`): profile forward  (segments 0..8)
+//   * back  cap (+axis, `plus = true` ): profile backward  (segments 7..0)
 //
 // Every line/arc here is shared with the matching prism side face, so the cap
 // is sewn into the shell instead of floating as a loose surface.
+#[allow(clippy::too_many_arguments)]
 fn emit_rounded_rect_cap_bounds(
     ctx: &mut Ctx,
-    xmin: f64,
-    xmax: f64,
-    zmin: f64,
-    zmax: f64,
+    axis: PrismAxis,
+    umin: f64,
+    umax: f64,
+    vmin: f64,
+    vmax: f64,
     r: f64,
-    y: f64,
-    plus_y: bool,
+    w: f64,
+    plus: bool,
 ) -> Result<Vec<usize>, StepError> {
-    use cadcore_math::Vec3;
+    let p = |u: f64, v: f64| axis.point(u, v, w);
+    let (ud, vd, wd) = (axis.u(), axis.v(), axis.w());
 
-    // Profile junction points (CCW in XZ as seen from −Y).
+    // Profile junction points (CCW in the uv-plane as seen from −axis).
     let pts = [
-        Point3::new(xmin + r, y, zmin), // 0
-        Point3::new(xmax - r, y, zmin), // 1
-        Point3::new(xmax, y, zmin + r), // 2
-        Point3::new(xmax, y, zmax - r), // 3
-        Point3::new(xmax - r, y, zmax), // 4
-        Point3::new(xmin + r, y, zmax), // 5
-        Point3::new(xmin, y, zmax - r), // 6
-        Point3::new(xmin, y, zmin + r), // 7
+        p(umin + r, vmin), // 0
+        p(umax - r, vmin), // 1
+        p(umax, vmin + r), // 2
+        p(umax, vmax - r), // 3
+        p(umax - r, vmax), // 4
+        p(umin + r, vmax), // 5
+        p(umin, vmax - r), // 6
+        p(umin, vmin + r), // 7
     ];
 
     // Per-segment geometry: (is_arc, centre, xref).  Centres/xrefs match the
     // quarter-cylinder corner faces so the arc-edge cache keys collide.
     let seg_arc: [bool; 8] = [false, true, false, true, false, true, false, true];
     let centres = [
-        Point3::new(xmax - r, y, zmin + r), // seg1 BR
-        Point3::new(xmax - r, y, zmax - r), // seg3 TR
-        Point3::new(xmin + r, y, zmax - r), // seg5 TL
-        Point3::new(xmin + r, y, zmin + r), // seg7 BL
+        p(umax - r, vmin + r), // seg1 BR
+        p(umax - r, vmax - r), // seg3 TR
+        p(umin + r, vmax - r), // seg5 TL
+        p(umin + r, vmin + r), // seg7 BL
     ];
-    let xrefs: [Vec3; 4] = [
-        Vec3::new(0.0, 0.0, -1.0), // BR: −Z
-        Vec3::new(1.0, 0.0, 0.0),  // TR: +X
-        Vec3::new(0.0, 0.0, 1.0),  // TL: +Z
-        Vec3::new(-1.0, 0.0, 0.0), // BL: −X
-    ];
-
-    let axis_y = UnitVec3::try_from_vec(Vec3::new(0.0, 1.0, 0.0)).unwrap();
+    let xrefs: [UnitVec3; 4] = [-vd, ud, vd, -ud]; // BR, TR, TL, BL
 
     // Map a segment index (the arc index 0..4) from the profile segment id.
     let arc_corner = |seg: usize| -> usize {
@@ -2810,25 +2927,21 @@ fn emit_rounded_rect_cap_bounds(
     let mut oe_ids: Vec<usize> = Vec::with_capacity(8);
 
     // Order + direction of the 8 segments depends on the cap's outward normal.
-    let order: Vec<(Point3, Point3, usize)> = if plus_y {
-        // +Y cap → profile backward: segment i traversed pts[i+1] → pts[i].
+    let order: Vec<(Point3, Point3, usize)> = if plus {
+        // +axis cap → profile backward: segment i traversed pts[i+1] → pts[i].
         (0..8)
             .rev()
             .map(|i| (pts[(i + 1) % 8], pts[i], i))
             .collect()
     } else {
-        // −Y cap → profile forward: segment i traversed pts[i] → pts[i+1].
+        // −axis cap → profile forward: segment i traversed pts[i] → pts[i+1].
         (0..8).map(|i| (pts[i], pts[(i + 1) % 8], i)).collect()
     };
 
     for (p_from, p_to, seg) in order {
         if seg_arc[seg] {
             let c = arc_corner(seg);
-            let xref = match UnitVec3::try_from_vec(xrefs[c]) {
-                Some(u) => u,
-                None => continue,
-            };
-            push_shared_arc(ctx, centres[c], axis_y, xref, r, p_from, p_to, &mut oe_ids)?;
+            push_shared_arc(ctx, centres[c], wd, xrefs[c], r, p_from, p_to, &mut oe_ids)?;
         } else {
             push_shared_line(ctx, p_from, p_to, &mut oe_ids)?;
         }
@@ -3540,6 +3653,50 @@ mod tests {
 
         if let Err(e) = check_ap214_manifold(&step) {
             panic!("Electrode AP214 manifold violation:\n{e}");
+        }
+    }
+
+    /// The same plate, built normal to **each** principal axis, must export as a
+    /// watertight AP214 shell.  The X- and Z-normal plates are what the "left /
+    /// right" and "top / bottom" electrode placements emit, so a winding mistake
+    /// in the generalised cap emitter would show up here as an open shell —
+    /// exactly the failure mode that once made electrodes render transparent in
+    /// SpaceClaim.
+    #[test]
+    fn rounded_plate_is_manifold_on_every_axis() {
+        use cadcore_ops::build_solid_rounded_plate;
+        use cadcore_topo::PrismAxis;
+
+        for axis in [PrismAxis::X, PrismAxis::Y, PrismAxis::Z] {
+            let mut brep = BRep::new();
+            build_solid_rounded_plate(
+                &mut brep,
+                axis,
+                0.0,
+                10.0, // xmin xmax
+                0.0,
+                1.0, // ymin ymax
+                0.0,
+                8.0, // zmin zmax
+                0.4, // corner_radius (fits the 1 mm slab on every axis)
+                Some(format!("electrode_{axis:?}")),
+            )
+            .unwrap();
+            let step = brep_to_step(&brep).unwrap();
+
+            assert_eq!(
+                count(&step, "ADVANCED_FACE"),
+                10,
+                "{axis:?}: rounded plate must produce exactly 10 faces"
+            );
+            assert_eq!(
+                count(&step, "CYLINDRICAL_SURFACE"),
+                4,
+                "{axis:?}: four quarter-cylinder corners"
+            );
+            if let Err(e) = check_ap214_manifold(&step) {
+                panic!("{axis:?} plate AP214 manifold violation:\n{e}");
+            }
         }
     }
 

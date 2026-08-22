@@ -69,6 +69,17 @@ pub(crate) enum StepCurveKey {
         v2: usize,
         mid: [i64; 3],
     },
+    /// Topological edge key: the identity of a BRep `Edge` (its slotmap ffi
+    /// id).  Used by the arrangement/union path where the two faces meeting at
+    /// an edge reference the SAME `Edge` (two co-edges → one edge id), so the
+    /// writer emits ONE `EDGE_CURVE` per BRep edge and shares it correctly —
+    /// WITHOUT re-merging two geometrically-coincident-but-topologically-distinct
+    /// edges (a self-overlapping serpentine, or two tangent filaments) the way a
+    /// purely geometric key would.  Never mixes with the legacy template keys
+    /// (that path has no shared BRep edge and matches by geometry).
+    TopoEdge {
+        edge: u64,
+    },
     /// Elliptic arc edge, keyed direction-agnostically by endpoints + ellipse.
     EllipseArc {
         v_start: [i64; 3],

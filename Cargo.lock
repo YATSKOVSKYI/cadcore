@@ -43,6 +43,7 @@ dependencies = [
  "cadcore-math",
  "cadcore-ops",
  "cadcore-topo",
+ "slotmap",
 ]
 
 [[package]]

@@ -255,16 +255,20 @@ pub fn fuse_crossing_grid(brep: &mut BRep, legs: &[GridLeg]) -> ShellId {
             axis,
             surf.radius,
         );
-        asm.emit_cylinder_face(surf, len, rim_lo, rim_hi, &loops_on[i]);
+        // Per-leg junction weld groups (each straight leg owns 2·i / 2·i+1).
+        let (g_lo, g_hi) = (2 * i as u32, 2 * i as u32 + 1);
+        let win_ids: Vec<(u32, Vec<Point3>)> =
+            loops_on[i].iter().cloned().map(|w| (0u32, w)).collect();
+        asm.emit_cylinder_face(surf, len, rim_lo, rim_hi, &win_ids, g_lo, g_hi);
         // caps share the SAME rim circles (seamless weld).
         let nlo = cadcore_math::UnitVec3::try_from_vec(axis.as_vec() * -1.0).unwrap();
         let plane_lo = cadcore_geom::Plane3::from_origin_normal(surf.frame.origin, nlo);
-        asm.emit_disk_cap(plane_lo, rim_lo);
+        asm.emit_disk_cap(plane_lo, rim_lo, g_lo);
         let plane_hi = cadcore_geom::Plane3::from_origin_normal(
             surf.frame.origin + axis.as_vec() * len,
             axis,
         );
-        asm.emit_disk_cap(plane_hi, rim_hi);
+        asm.emit_disk_cap(plane_hi, rim_hi, g_hi);
     }
 
     let faces = asm.faces().to_vec();

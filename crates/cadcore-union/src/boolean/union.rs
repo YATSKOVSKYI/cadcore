@@ -167,7 +167,10 @@ pub fn union_many(solids: &[(&BRep, &[FaceId])], knit: f64) -> Option<(BRep, She
 }
 
 /// Imprint + classify + emit every face of one solid.
-fn emit_solid_faces(
+///
+/// Shared with the half-space cut ([`super::halfspace`]), which is the same
+/// operation with a different `inside_other` predicate.
+pub(crate) fn emit_solid_faces(
     brep: &BRep,
     faces: &[FaceId],
     ssi: &HashMap<FaceId, Vec<SsiCurve>>,
@@ -202,32 +205,7 @@ fn emit_solid_faces(
             }
         }
 
-        // A full-donut TorusBand is arranged non-periodically in θ, so every
-        // chain's θ must be continuous (no atan2 ±π jump): unwrap each chain's
-        // u onto the branch nearest its previous point.
-        if matches!(domain, FaceDomain::TorusBand { .. }) {
-            let tau = std::f64::consts::TAU;
-            for ch in &mut chains {
-                for i in 1..ch.pts.len() {
-                    let du = ch.pts[i].0 - ch.pts[i - 1].0;
-                    ch.pts[i].0 -= tau * (du / tau).round();
-                    let dv = ch.pts[i].1 - ch.pts[i - 1].1;
-                    ch.pts[i].1 -= tau * (dv / tau).round();
-                }
-                // An SSI loop that wraps the full ring (every θ, with φ = v(θ) —
-                // coaxial stack: constant v; offset stack: a varying band) is a
-                // chord spanning the [0,2π]² rectangle left→right.  Whichever way
-                // it was traced, rebuild it as v(u) sampled cleanly on u∈[0,2π]
-                // so it touches BOTH θ-seams (welds) and carries the true φ.
-                if ch.tag >= 1000 {
-                    let umin = ch.pts.iter().cloned().fold(f64::MAX, |m, p| m.min(p.0));
-                    let umax = ch.pts.iter().cloned().fold(f64::MIN, |m, p| m.max(p.0));
-                    if umax - umin >= tau - 0.25 {
-                        ch.pts = resample_fullwrap_chord(&ch.pts, 96);
-                    }
-                }
-            }
-        }
+        unwrap_torus_band_chains(&domain, &mut chains);
 
         if std::env::var("CADCORE_DUMP_CHAINS").is_ok() && matches!(domain, FaceDomain::TorusBand { .. }) {
             for ch in &chains {
@@ -250,6 +228,38 @@ fn emit_solid_faces(
         for cell in cells {
             if cell.keep {
                 asm.emit_cell(&domain, f.geom.clone(), f.normal, &cell);
+            }
+        }
+    }
+}
+
+/// A full-donut `TorusBand` is arranged NON-periodically in θ, so every chain's
+/// θ must be continuous (no atan2 ±π jump): unwrap each chain's u onto the
+/// branch nearest its previous point.  No-op for every other domain.
+///
+/// Shared by the union and the half-space cut — both feed the same DCEL.
+pub(crate) fn unwrap_torus_band_chains(domain: &FaceDomain, chains: &mut [FaceChain]) {
+    if !matches!(domain, FaceDomain::TorusBand { .. }) {
+        return;
+    }
+    let tau = std::f64::consts::TAU;
+    for ch in chains.iter_mut() {
+        for i in 1..ch.pts.len() {
+            let du = ch.pts[i].0 - ch.pts[i - 1].0;
+            ch.pts[i].0 -= tau * (du / tau).round();
+            let dv = ch.pts[i].1 - ch.pts[i - 1].1;
+            ch.pts[i].1 -= tau * (dv / tau).round();
+        }
+        // An SSI loop that wraps the full ring (every θ, with φ = v(θ) —
+        // coaxial stack: constant v; offset stack: a varying band) is a chord
+        // spanning the [0,2π]² rectangle left→right.  Whichever way it was
+        // traced, rebuild it as v(u) sampled cleanly on u∈[0,2π] so it touches
+        // BOTH θ-seams (welds) and carries the true φ.
+        if ch.tag >= 1000 {
+            let umin = ch.pts.iter().cloned().fold(f64::MAX, |m, p| m.min(p.0));
+            let umax = ch.pts.iter().cloned().fold(f64::MIN, |m, p| m.max(p.0));
+            if umax - umin >= tau - 0.25 {
+                ch.pts = resample_fullwrap_chord(&ch.pts, 96);
             }
         }
     }
@@ -298,7 +308,7 @@ fn resample_fullwrap_chord(pts: &[(f64, f64)], n: usize) -> Vec<(f64, f64)> {
 /// shared set of representative points within `tol`.  Curves that meet at a
 /// triple point then carry the IDENTICAL endpoint, so the per-face DCEL
 /// connects them instead of leaving dangling edges.
-fn snap_ssi_endpoints(ssi: &mut [HashMap<FaceId, Vec<SsiCurve>>], tol: f64) {
+pub(crate) fn snap_ssi_endpoints(ssi: &mut [HashMap<FaceId, Vec<SsiCurve>>], tol: f64) {
     // 1) gather every endpoint, tagged exact (from a 2-point curve — a straight
     //    ruling line whose ends ARE the true triple points) or approximate
     //    (from a sampled arc).
@@ -554,7 +564,7 @@ fn presplit_loop(
 }
 
 /// Build a [`FaceDomain`] for a face (planar + cylinder-band supported).
-fn face_domain(brep: &BRep, fid: FaceId) -> Option<FaceDomain> {
+pub(crate) fn face_domain(brep: &BRep, fid: FaceId) -> Option<FaceDomain> {
     let f = &brep.faces[fid];
     match (&f.geom, &f.extent) {
         (FaceGeom::Plane(pl), _) => {
@@ -651,7 +661,11 @@ pub(crate) fn face_loop_points(brep: &BRep, fid: FaceId) -> Vec<Point3> {
 }
 
 /// The face's boundary loops as closed uv polylines (outer + inners).
-fn face_boundary_chains(brep: &BRep, fid: FaceId, domain: &FaceDomain) -> Vec<Vec<(f64, f64)>> {
+pub(crate) fn face_boundary_chains(
+    brep: &BRep,
+    fid: FaceId,
+    domain: &FaceDomain,
+) -> Vec<Vec<(f64, f64)>> {
     let f = &brep.faces[fid];
     let mut loops = Vec::new();
     let mut ids = vec![f.outer_loop];
@@ -742,6 +756,15 @@ fn synthesize_boundary(brep: &BRep, fid: FaceId, domain: &FaceDomain) -> Vec<Vec
                 phis.iter().map(|&ph| (0.0, ph)).collect(),
                 phis.iter().map(|&ph| (tau, ph)).collect(),
             ]
+        }
+        // Flat polygonal template — the faces `cadcore_ops::build_solid_box`
+        // emits for an electrode plate.  Without this the plate reaches the
+        // arrangement with NO boundary at all: every cell is unbounded, nothing
+        // is emitted, and the plate silently vanishes from the union.
+        FaceExtent::Polygon { points } if points.len() >= 3 => {
+            let mut ring: Vec<(f64, f64)> = points.iter().map(|&p| domain.uv(p)).collect();
+            ring.push(ring[0]);
+            vec![ring]
         }
         _ => Vec::new(),
     }

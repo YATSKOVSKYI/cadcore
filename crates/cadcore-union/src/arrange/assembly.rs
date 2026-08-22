@@ -26,6 +26,29 @@ use super::domain::FaceDomain;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PtKey(i64, i64, i64);
 
+/// Outward (radial) direction of a cylinder surface at `p` — from the axis to
+/// `p`, in the plane through `p` perpendicular to the axis.  Not normalised;
+/// only its sign relative to a loop's area vector is used.
+fn cyl_outward(surf: &CylSurf, p: Point3) -> cadcore_math::Vec3 {
+    let w = p - surf.frame.origin;
+    let ax = surf.axis().dot_vec(w);
+    w - surf.axis().as_vec() * ax
+}
+
+/// Outward direction of a torus (tube) surface at `p` — from the nearest point
+/// on the tube centre-line (the major circle) to `p`.  Not normalised.
+fn torus_outward(surf: &TorusSurf, p: Point3) -> cadcore_math::Vec3 {
+    let w = p - surf.frame.origin;
+    let h = surf.frame.z.dot_vec(w);
+    let planar = w - surf.frame.z.as_vec() * h;
+    let a = planar.length();
+    if a < 1e-12 {
+        return surf.frame.z.as_vec();
+    }
+    let centre_pt = surf.frame.origin + planar * (surf.major_radius / a);
+    p - centre_pt
+}
+
 /// If `poly` is a closed, planar, near-constant-radius loop, fit and return the
 /// circle it traces.  Used to weld rim / junction circles by geometry (centre,
 /// sign-normalised axis, radius) regardless of where each face's seam split it.
@@ -327,6 +350,12 @@ struct EdgeKey {
     lo: PtKey,
     hi: PtKey,
     mid: PtKey,
+    /// Topological weld group (crossing identity for window edges; 0 for the
+    /// globally-welded cell/boundary edges).  Two coincident polyline pieces
+    /// weld only within the same group — a leg crossed by two coincident legs
+    /// (a self-overlapping serpentine) then gets two DISTINCT twice-used window
+    /// edges instead of one four-used edge.
+    group: u32,
 }
 
 /// Shared topology builder across all faces of one union solid.
@@ -339,9 +368,22 @@ pub struct Assembler<'b> {
     verts: HashMap<PtKey, VertexId>,
     /// edge key → (edge id, first user's start vertex)
     edges: HashMap<EdgeKey, (EdgeId, VertexId)>,
-    /// circle key → (edge id, first user's start vertex) — analytic rim/cap
-    /// circles, shared SEAMLESSLY between a cylinder rim and its cap / elbow.
-    circles: HashMap<CircleKey, (EdgeId, VertexId)>,
+    /// (weld group, circle key) → (edge id, first user's start vertex) — analytic
+    /// rim/cap circles, shared SEAMLESSLY between a cylinder rim and its cap /
+    /// elbow WITHIN one weld group.
+    ///
+    /// A full junction/cap circle is a *topological* junction of ONE filament
+    /// (leg↔elbow, leg↔cap), shared by exactly two faces.  Two DISTINCT
+    /// filaments that merely touch tangentially (e.g. equal-radius tubes whose
+    /// centre-lines sit 2r apart, or two U-turns that coincide) have
+    /// geometrically-identical junction circles — welding those by geometry
+    /// alone collapses them into ONE edge used by four faces → non-manifold.
+    /// Keying by `weld_group` (set per filament, see [`Self::set_weld_group`])
+    /// keeps each filament's junctions separate, so tangent filaments produce
+    /// two independent twice-used edges the way a manifold shell requires.
+    /// Crossing *windows* (which MUST weld across filaments) go through the
+    /// polyline `edges` cache instead and stay global.
+    circles: HashMap<(u32, CircleKey), (EdgeId, VertexId)>,
     faces: Vec<cadcore_topo::FaceId>,
 }
 
@@ -407,9 +449,9 @@ impl<'b> Assembler<'b> {
     /// Get-or-create the shared edge for a 3-D polyline; returns the co-edge
     /// sense this user must traverse it with (`Same` for the first user,
     /// `Opposite` for the second).
-    fn shared_edge(&mut self, poly3: &[Point3]) -> (EdgeId, CoEdgeSense) {
+    fn shared_edge(&mut self, poly3: &[Point3], group: u32) -> (EdgeId, CoEdgeSense) {
         let geom = EdgeGeom::Polyline(poly3.to_vec());
-        self.shared_edge_geom(poly3, geom, 0.0, 1.0)
+        self.shared_edge_geom(poly3, geom, 0.0, 1.0, group)
     }
 
     /// Emit one segment edge, trimmed onto its run's recovered analytic curve.
@@ -431,17 +473,17 @@ impl<'b> Assembler<'b> {
                 while t1 - t0 < -pi {
                     t1 += 2.0 * pi;
                 }
-                self.shared_edge_geom(poly3, EdgeGeom::Circle(c), t0, t1)
+                self.shared_edge_geom(poly3, EdgeGeom::Circle(c), t0, t1, 0)
             }
             RunCurve::Line => match (to - from).try_normalize() {
                 Some(dir) => {
                     let len = (to - from).length();
                     let udir = cadcore_math::UnitVec3::new_unchecked(dir);
-                    self.shared_edge_geom(poly3, EdgeGeom::Line(cadcore_geom::Line3::new(from, udir)), 0.0, len)
+                    self.shared_edge_geom(poly3, EdgeGeom::Line(cadcore_geom::Line3::new(from, udir)), 0.0, len, 0)
                 }
-                None => self.shared_edge(poly3),
+                None => self.shared_edge(poly3, 0),
             },
-            RunCurve::Free => self.shared_edge(poly3),
+            RunCurve::Free => self.shared_edge(poly3, 0),
         }
     }
 
@@ -456,6 +498,7 @@ impl<'b> Assembler<'b> {
         geom: EdgeGeom,
         t_start: f64,
         t_end: f64,
+        group: u32,
     ) -> (EdgeId, CoEdgeSense) {
         let a = poly3[0];
         let b = *poly3.last().unwrap();
@@ -473,6 +516,7 @@ impl<'b> Assembler<'b> {
             lo,
             hi,
             mid: pt_key(mid, self.tol),
+            group,
         };
         if let Some(&(eid, first_start)) = self.edges.get(&key) {
             // second user: opposite sense iff it starts at the same vertex
@@ -601,10 +645,131 @@ impl<'b> Assembler<'b> {
         lp
     }
 
+    /// Re-emit an EXISTING face unchanged through this assembler.
+    ///
+    /// The half-space cut uses this for every face the plane does not touch.
+    /// Running such a face back through the arrangement is not neutral: a fused
+    /// periodic band is *seamless* (its boundary is two rim circles, no
+    /// parametric seam), and the periodic DCEL re-introduces a seam — splitting
+    /// each crossing-window loop at a seam the partner face does not share, so
+    /// the two halves never weld.  Copying keeps the source topology.
+    ///
+    /// Every edge still goes through the shared-edge cache, at the SAME
+    /// per-segment granularity [`Self::build_loop`] uses, so a copied face and a
+    /// re-arranged one weld along the boundary between them.
+    ///
+    /// `joints` are extra points that must become vertices wherever they lie on
+    /// one of this face's edges: they are where the neighbouring ARRANGED face
+    /// was split, so the copy has to be split there too or the two disagree.
+    pub fn emit_face_copy(
+        &mut self,
+        src: &BRep,
+        fid: cadcore_topo::FaceId,
+        joints: &[Point3],
+    ) -> Option<cadcore_topo::FaceId> {
+        let sf = src.faces.get(fid)?;
+        let (geom, normal, extent) = (sf.geom.clone(), sf.normal, sf.extent.clone());
+        let inner_ids: Vec<LoopId> = sf.inner_loops.clone();
+        let outer_id = sf.outer_loop;
+        let face = self.brep.add_face(Face {
+            geom,
+            normal,
+            outer_loop: LoopId::default(),
+            inner_loops: Vec::new(),
+            shell: Default::default(),
+            extent,
+        });
+        let outer = self.copy_loop(src, outer_id, face, joints)?;
+        let inners: Vec<LoopId> = inner_ids
+            .into_iter()
+            .filter_map(|l| self.copy_loop(src, l, face, joints))
+            .collect();
+        self.brep.faces[face].outer_loop = outer;
+        self.brep.faces[face].inner_loops = inners;
+        self.faces.push(face);
+        Some(face)
+    }
+
+    /// Copy one loop of `src` into this assembler's B-Rep, welding every edge.
+    fn copy_loop(
+        &mut self,
+        src: &BRep,
+        lid: LoopId,
+        face: cadcore_topo::FaceId,
+        joints: &[Point3],
+    ) -> Option<LoopId> {
+        let slp = src.loops.get(lid)?;
+        let start = slp.start;
+        src.coedges.get(start)?;
+        let lp = self.brep.add_loop(Loop {
+            start: CoEdgeId::default(),
+            face,
+        });
+        let mut coedges: Vec<CoEdgeId> = Vec::new();
+        let mut c = start;
+        let mut guard = 0usize;
+        loop {
+            let ce = &src.coedges[c];
+            let (edge_id, sense_src, next) = (ce.edge, ce.sense, ce.next);
+            let rc = match &src.edges[edge_id].geom {
+                EdgeGeom::Circle(c3) => RunCurve::Circle(*c3),
+                EdgeGeom::Line(_) => RunCurve::Line,
+                _ => RunCurve::Free,
+            };
+            let mut pts = crate::boolean::aabb::sample_edge(src, edge_id);
+            if sense_src == CoEdgeSense::Opposite {
+                pts.reverse();
+            }
+            crate::boolean::halfspace::insert_joints(&mut pts, joints);
+            let mut poly: Vec<Point3> = Vec::with_capacity(pts.len());
+            for p in pts {
+                let q = self.snap(p);
+                if poly.last().map_or(true, |&r| (r - q).length() > 1e-12) {
+                    poly.push(q);
+                }
+            }
+            for w in poly.windows(2) {
+                let (edge, sense) = self.emit_step_edge(w, rc);
+                let ceid = self.brep.add_coedge(CoEdge {
+                    edge,
+                    sense,
+                    next: CoEdgeId::default(),
+                    prev: CoEdgeId::default(),
+                    loop_id: lp,
+                });
+                coedges.push(ceid);
+            }
+            c = next;
+            guard += 1;
+            if c == start || guard > 100_000 {
+                break;
+            }
+        }
+        if coedges.is_empty() {
+            return None;
+        }
+        let n = coedges.len();
+        for i in 0..n {
+            let cur = coedges[i];
+            self.brep.coedges[cur].next = coedges[(i + 1) % n];
+            self.brep.coedges[cur].prev = coedges[(i + n - 1) % n];
+        }
+        self.brep.loops[lp].start = coedges[0];
+        Some(lp)
+    }
+
     /// Get-or-create a shared analytic full-circle edge; returns the co-edge
     /// sense this user must traverse it with.  Welds a cylinder rim to its
     /// cap / elbow with NO seam (the periodic surface closes implicitly).
-    fn shared_circle(&mut self, c: Circle3) -> (EdgeId, CoEdgeSense) {
+    ///
+    /// `group` is the TOPOLOGICAL junction identity: two coincident circles
+    /// weld into one edge only if they carry the same group.  The mating faces
+    /// of ONE junction (leg rim ↔ its elbow / cap) pass the same group; two
+    /// DISTINCT junctions that merely coincide in space (a self-touching
+    /// serpentine, or two tangent filaments) pass different groups and stay
+    /// separate twice-used edges — the manifold invariant.  Callers that don't
+    /// care (single features, no coincidence) pass `0`.
+    fn shared_circle(&mut self, c: Circle3, group: u32) -> (EdgeId, CoEdgeSense) {
         let q = 1.0 / self.tol;
         let ax = c.frame.z.as_vec();
         // normalise axis sign (largest component positive) so ±normal match
@@ -624,8 +789,9 @@ impl<'b> Assembler<'b> {
             axis: ((a.x * q).round() as i64, (a.y * q).round() as i64, (a.z * q).round() as i64),
             radius: (c.radius * q).round() as i64,
         };
+        let gkey = (group, key);
         let start_pt = c.point_at(0.0);
-        if let Some(&(eid, first_start)) = self.circles.get(&key) {
+        if let Some(&(eid, first_start)) = self.circles.get(&gkey) {
             let my_start = self.vertex(start_pt);
             let sense = if my_start == first_start {
                 CoEdgeSense::Same
@@ -643,14 +809,37 @@ impl<'b> Assembler<'b> {
             t_end: std::f64::consts::TAU,
             partner: None,
         });
-        self.circles.insert(key, (eid, v));
+        self.circles.insert(gkey, (eid, v));
         (eid, CoEdgeSense::Same)
     }
 
-    /// Build a loop holding exactly ONE closed analytic circle edge.
-    fn circle_loop(&mut self, c: Circle3, face: cadcore_topo::FaceId) -> LoopId {
+    /// Build a loop holding exactly ONE closed analytic circle edge, welded
+    /// within the topological junction `group` (see [`Self::shared_circle`]).
+    ///
+    /// `outward`: when `Some(n)`, the loop is wound CCW about `n` (flip the
+    /// shared co-edge if the circle's own axis opposes it).  A planar DISK cap
+    /// MUST be CCW about its outward normal — SolidWorks/SpaceClaim IGNORE the
+    /// `FACE_OUTER_BOUND` orientation flag and read the physical winding, so a
+    /// clockwise outer circle is taken as "keep the outside" and the cap face is
+    /// dropped (torn caps).  Periodic cylinder/torus rims pass `None` (their
+    /// boundary wire winds around the surface period, so it has no area role).
+    fn circle_loop(
+        &mut self,
+        c: Circle3,
+        face: cadcore_topo::FaceId,
+        group: u32,
+        outward: Option<cadcore_math::UnitVec3>,
+    ) -> LoopId {
         let lp = self.brep.add_loop(Loop { start: CoEdgeId::default(), face });
-        let (edge, sense) = self.shared_circle(c);
+        let (edge, mut sense) = self.shared_circle(c, group);
+        if let Some(n) = outward {
+            if c.frame.z.dot(n) < 0.0 {
+                sense = match sense {
+                    CoEdgeSense::Same => CoEdgeSense::Opposite,
+                    CoEdgeSense::Opposite => CoEdgeSense::Same,
+                };
+            }
+        }
         let ce = self.brep.add_coedge(CoEdge {
             edge,
             sense,
@@ -675,7 +864,9 @@ impl<'b> Assembler<'b> {
         _length: f64,
         rim_lo: Circle3,
         rim_hi: Circle3,
-        windows: &[Vec<Point3>],
+        windows: &[(u32, Vec<Point3>)],
+        g_lo: u32,
+        g_hi: u32,
     ) -> cadcore_topo::FaceId {
         let face = self.brep.add_face(Face {
             geom: FaceGeom::Cylinder(surf),
@@ -685,11 +876,13 @@ impl<'b> Assembler<'b> {
             shell: Default::default(),
             extent: FaceExtent::Trimmed,
         });
-        // outer = lo rim circle; inner = hi rim circle + window holes
-        let outer = self.circle_loop(rim_lo, face);
-        let mut inner = vec![self.circle_loop(rim_hi, face)];
-        for w in windows {
-            inner.push(self.window_hole_loop(w, &surf, face));
+        // outer = lo rim circle; inner = hi rim circle + window holes.  `g_lo`,
+        // `g_hi` = the topological junction groups of the two rims; each window
+        // carries its crossing id so coincident windows stay distinct edges.
+        let outer = self.circle_loop(rim_lo, face, g_lo, None);
+        let mut inner = vec![self.circle_loop(rim_hi, face, g_hi, None)];
+        for (wg, w) in windows {
+            inner.push(self.window_hole_loop(w, |p| cyl_outward(&surf, p), face, *wg));
         }
         self.brep.faces[face].outer_loop = outer;
         self.brep.faces[face].inner_loops = inner;
@@ -697,12 +890,25 @@ impl<'b> Assembler<'b> {
         face
     }
 
-    /// Build a window hole loop on a cylinder.  The loop is wound CW about the
-    /// cylinder's OUTWARD normal (the STEP hole convention) and split into a
-    /// FEW shared edges — a single closed edge cannot carry an opposite sense
-    /// between the two faces sharing it (start == end vertex), so we split so
-    /// the two legs' pieces weld with opposite senses → a manifold edge.
-    fn window_hole_loop(&mut self, pts3: &[Point3], surf: &CylSurf, face: cadcore_topo::FaceId) -> LoopId {
+    /// Build a window hole loop on a carrier surface.  The loop is wound CW
+    /// about the surface's OUTWARD normal (the STEP hole convention) and split
+    /// into a FEW shared edges — a single closed edge cannot carry an opposite
+    /// sense between the two faces sharing it (start == end vertex), so we split
+    /// so the two members' pieces weld with opposite senses → a manifold edge.
+    ///
+    /// `outward_at` returns the surface's outward normal at a point (radial from
+    /// the axis for a cylinder, radial from the tube centre-line for a torus);
+    /// it decides the traversal direction so BOTH faces sharing this window wind
+    /// it CW about their own outward normal and thus weld each shared edge with
+    /// opposite senses regardless of carrier type (cylinder↔cylinder,
+    /// cylinder↔torus).
+    fn window_hole_loop(
+        &mut self,
+        pts3: &[Point3],
+        outward_at: impl Fn(Point3) -> cadcore_math::Vec3,
+        face: cadcore_topo::FaceId,
+        group: u32,
+    ) -> LoopId {
         // drop a trailing duplicate of the start
         let mut poly: Vec<Point3> = pts3.to_vec();
         if poly.len() > 1 && (poly[0] - *poly.last().unwrap()).length() < 1e-9 {
@@ -723,9 +929,7 @@ impl<'b> Assembler<'b> {
             for p in &poly { c = c + (*p - o) * (1.0 / m as f64); }
             c
         };
-        let w = cen - surf.frame.origin;
-        let ax = surf.axis().dot_vec(w);
-        let out = w - surf.axis().as_vec() * ax;
+        let out = outward_at(cen);
         // CW about outward ⇒ traverse the canonical loop BACKWARD when the
         // forward (traced) loop is CCW about the outward normal.
         let backward = area.dot(out) > 0.0;
@@ -757,7 +961,7 @@ impl<'b> Assembler<'b> {
             let mut seg = pieces[k].clone();
             if backward { seg.reverse(); }
             if seg.len() < 2 { continue; }
-            let (edge, sense) = self.shared_edge(&seg);
+            let (edge, sense) = self.shared_edge(&seg, group);
             let ce = self.brep.add_coedge(CoEdge {
                 edge, sense, next: CoEdgeId::default(), prev: CoEdgeId::default(), loop_id: lp,
             });
@@ -781,6 +985,33 @@ impl<'b> Assembler<'b> {
         surf: TorusSurf,
         junction_lo: Circle3,
         junction_hi: Circle3,
+        g_lo: u32,
+        g_hi: u32,
+    ) -> cadcore_topo::FaceId {
+        self.emit_torus_fillet_windows(surf, junction_lo, junction_hi, &[], g_lo, g_hi)
+    }
+
+    /// Emit an elbow torus-fillet face bounded by its two junction minor-circles
+    /// PLUS the crossing `windows` as interior holes — the torus counterpart of
+    /// [`Self::emit_cylinder_face`].  Each window is a closed 3-D loop shared
+    /// with the crossing tube's matching window (single source of truth → the
+    /// two faces weld it with opposite senses → manifold).  Used where an elbow
+    /// (a U-turn fillet) overlaps a neighbouring leg — the dense-fill case the
+    /// leg↔leg pass alone cannot resolve.
+    ///
+    /// The extent stays `TorusFillet`: `face_has_real_loops` is true (the two
+    /// minor circles are real), so the writer emits every inner loop (end circle
+    /// + windows) as `FACE_BOUND`s, and the θ-band is read from the extent
+    /// circles — the window polylines never pollute it (they are not
+    /// minor-radius circles).
+    pub fn emit_torus_fillet_windows(
+        &mut self,
+        surf: TorusSurf,
+        junction_lo: Circle3,
+        junction_hi: Circle3,
+        windows: &[(u32, Vec<Point3>)],
+        g_lo: u32,
+        g_hi: u32,
     ) -> cadcore_topo::FaceId {
         let face = self.brep.add_face(Face {
             geom: FaceGeom::Torus(surf),
@@ -793,17 +1024,20 @@ impl<'b> Assembler<'b> {
                 end_circle: junction_hi,
             },
         });
-        let outer = self.circle_loop(junction_lo, face);
-        let inner = self.circle_loop(junction_hi, face);
+        let outer = self.circle_loop(junction_lo, face, g_lo, None);
+        let mut inner = vec![self.circle_loop(junction_hi, face, g_hi, None)];
+        for (wg, w) in windows {
+            inner.push(self.window_hole_loop(w, |p| torus_outward(&surf, p), face, *wg));
+        }
         self.brep.faces[face].outer_loop = outer;
-        self.brep.faces[face].inner_loops = vec![inner];
+        self.brep.faces[face].inner_loops = inner;
         self.faces.push(face);
         face
     }
 
     /// Emit a flat end-cap disk bounded by a single shared circle (welds to
     /// the cylinder rim with no seam).
-    pub fn emit_disk_cap(&mut self, plane: Plane3, rim: Circle3) -> cadcore_topo::FaceId {
+    pub fn emit_disk_cap(&mut self, plane: Plane3, rim: Circle3, group: u32) -> cadcore_topo::FaceId {
         let face = self.brep.add_face(Face {
             geom: FaceGeom::Plane(plane),
             normal: FaceNormal::Same,
@@ -812,7 +1046,11 @@ impl<'b> Assembler<'b> {
             shell: Default::default(),
             extent: FaceExtent::Disk { radius: rim.radius },
         });
-        let outer = self.circle_loop(rim, face);
+        // A planar disk cap MUST wind CCW about its outward (plane) normal or
+        // SpaceClaim/SolidWorks read it as "keep the outside" and drop the face
+        // (torn caps).  Pass the plane normal so `circle_loop` flips the shared
+        // co-edge when the rim circle's own axis opposes the outward normal.
+        let outer = self.circle_loop(rim, face, group, Some(plane.normal()));
         self.brep.faces[face].outer_loop = outer;
         self.faces.push(face);
         face
@@ -953,9 +1191,9 @@ mod tests {
         let mut brep = BRep::new();
         let mut asm = Assembler::new(&mut brep, 1e-7);
         let poly = vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)];
-        let (e1, s1) = asm.shared_edge(&poly);
+        let (e1, s1) = asm.shared_edge(&poly, 0);
         let rev: Vec<Point3> = poly.iter().rev().copied().collect();
-        let (e2, s2) = asm.shared_edge(&rev);
+        let (e2, s2) = asm.shared_edge(&rev, 0);
         assert_eq!(e1, e2, "same geometry → one edge");
         assert_eq!(s1, CoEdgeSense::Same);
         assert_eq!(s2, CoEdgeSense::Opposite, "second user flips");

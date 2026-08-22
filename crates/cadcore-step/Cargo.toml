@@ -16,6 +16,7 @@ categories   = ["science", "encoding"]
 cadcore-math = { path = "../cadcore-math", version = "0.1.22" }
 cadcore-geom = { path = "../cadcore-geom", version = "0.1.22" }
 cadcore-topo = { path = "../cadcore-topo", version = "0.1.22" }
+slotmap      = "1"
 
 [dev-dependencies]
 cadcore-ops  = { path = "../cadcore-ops", version = "0.1.22" }

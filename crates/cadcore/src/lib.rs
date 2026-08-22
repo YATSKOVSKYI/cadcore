@@ -77,6 +77,7 @@ pub use cadcore_math::{Frame3, Point3, UnitVec3, Vec3};
 pub use cadcore_ops::{
     analytic_path_from_polyline_samples, build_solid_box,
     build_solid_rounded_box, build_solid_rounded_box_full, build_solid_rounded_box_xz,
+    build_solid_rounded_plate,
     clip_polyline, clip_polyline_with_radius,
     rounded_path_from_polyline, sharp_path_from_polyline_samples, sweep_circle_along_path,
     sweep_circle_along_path_with_caps, sweep_circle_along_polyline,

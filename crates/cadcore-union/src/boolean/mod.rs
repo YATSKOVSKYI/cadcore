@@ -19,6 +19,7 @@
 
 pub mod aabb;
 pub mod contain;
+pub mod halfspace;
 pub mod ssi;
 pub mod union;
 
@@ -27,7 +28,8 @@ pub(crate) mod tests_support;
 
 pub use aabb::{candidate_pairs, face_aabb, Aabb};
 pub use contain::point_in_solid;
-pub use ssi::{intersect_faces, SsiCurve};
+pub use halfspace::{half_space_cut, CutOutcome};
+pub use ssi::{intersect_faces, intersect_faces_with, SsiCurve, SsiOptions};
 pub use union::{union, union_many, union_n};
 
 #[cfg(test)]
@@ -35,7 +37,7 @@ mod tests {
     use super::*;
     use cadcore_math::{Point3, UnitVec3};
     use cadcore_topo::BRep;
-    use tests_support::{axis_box, capped_cylinder};
+    use tests_support::{axis_box, capped_cylinder, template_box};
 
     #[test]
     fn point_in_axis_box() {
@@ -160,6 +162,43 @@ mod tests {
         assert!(!uses.is_empty(), "union produced faces");
         let open = uses.values().filter(|&&n| n != 2).count();
         assert_eq!(open, 0, "watertight: every edge used twice ({} open of {})", open, uses.len());
+    }
+
+    /// An electrode plate as the pipeline actually builds it — a box whose
+    /// faces carry only a `Polygon` extent, with placeholder loops — fused to a
+    /// filament that runs into it.
+    ///
+    /// This is the shape of the real question "can the plates be welded to the
+    /// scaffold instead of shipped as loose bodies".  It used to be impossible:
+    /// with no explicit loops and no `Polygon` arm in `synthesize_boundary`, the
+    /// plate arrived at the arrangement with NO boundary, so not one of its
+    /// faces was emitted and it vanished from the result.
+    #[test]
+    fn union_template_plate_with_filament_watertight() {
+        let mut a = BRep::new();
+        let fa = template_box(
+            &mut a,
+            Point3::new(-0.5, -0.5, -0.5),
+            Point3::new(0.5, 0.5, 0.5),
+        );
+        let mut b = BRep::new();
+        // A tube running into the plate through its -X face and out the +X one.
+        let fb = capped_cylinder(&mut b, Point3::new(-2.0, 0.0, 0.0), UnitVec3::X, 0.25, 4.0);
+
+        let (out, shell) = union(&a, &fa, &b, &fb, 1e-6);
+        let uses = edge_use_counts(&out, shell);
+        assert!(!uses.is_empty(), "the union produced faces");
+        assert_eq!(components(&out, shell), 1, "plate and filament fused");
+        let open = uses.values().filter(|&&n| n != 2).count();
+        assert_eq!(open, 0, "watertight: {} open of {}", open, uses.len());
+        // The plate's own faces must be there: six planes went in, and the two
+        // the tube pierces come back trimmed, so at least six planar faces out.
+        let planes = out.shells[shell]
+            .faces
+            .iter()
+            .filter(|&&f| matches!(out.faces[f].geom, cadcore_topo::FaceGeom::Plane(_)))
+            .count();
+        assert!(planes >= 6, "plate faces survived the union, got {planes}");
     }
 
     /// A round peg through a plate: a cylinder passing fully through a box
@@ -405,12 +444,15 @@ mod tests {
         let (clo, tlo) = minor(lo);
         let (chi, thi) = minor(hi);
         let mut asm = Assembler::new(brep, 1e-7);
-        asm.emit_torus_fillet(tor, clo, chi);
+        // Distinct junction groups for the torus's two ends (0 = lo, 1 = hi);
+        // each cap shares its end's group.
+        asm.emit_torus_fillet(tor, clo, chi, 0, 1);
         asm.emit_disk_cap(
             Plane3::from_origin_normal(clo.frame.origin, UnitVec3::try_from_vec(tlo.as_vec() * -1.0).unwrap()),
             clo,
+            0,
         );
-        asm.emit_disk_cap(Plane3::from_origin_normal(chi.frame.origin, thi), chi);
+        asm.emit_disk_cap(Plane3::from_origin_normal(chi.frame.origin, thi), chi, 1);
         let faces = asm.faces().to_vec();
         let shell = brep.add_shell(cadcore_topo::Shell {
             faces: faces.clone(),

@@ -8,6 +8,79 @@ use cadcore_math::{Point3, UnitVec3};
 
 use crate::ids::*;
 
+// ── PrismAxis ─────────────────────────────────────────────────────────────────
+
+/// Principal axis a rounded-rectangle prism (plate) is extruded along — i.e. the
+/// outward normal of its two end caps.
+///
+/// The two in-plane axes `(u, v)` are fixed per axis so that **`u × v = −w`**.
+/// With that handedness the profile traversed *u-then-v* is CCW **as seen from
+/// −w**, which is exactly the winding the `−w` cap needs to face outward (the
+/// `+w` cap traverses it backwards).  Every emitter downstream relies on this,
+/// so the table is the single source of truth:
+///
+/// | axis (`w`) | `u` | `v` |
+/// |------------|-----|-----|
+/// | [`PrismAxis::X`] | Z | Y |
+/// | [`PrismAxis::Y`] | X | Z |
+/// | [`PrismAxis::Z`] | Y | X |
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PrismAxis {
+    /// Caps normal to X; profile lives in the ZY plane.
+    X,
+    /// Caps normal to Y; profile lives in the XZ plane (the classic electrode plate).
+    Y,
+    /// Caps normal to Z; profile lives in the YX plane.
+    Z,
+}
+
+impl PrismAxis {
+    /// The extrusion axis itself (`w`).
+    pub fn w(self) -> UnitVec3 {
+        match self {
+            PrismAxis::X => UnitVec3::X,
+            PrismAxis::Y => UnitVec3::Y,
+            PrismAxis::Z => UnitVec3::Z,
+        }
+    }
+
+    /// First in-plane axis (`u`).
+    pub fn u(self) -> UnitVec3 {
+        match self {
+            PrismAxis::X => UnitVec3::Z,
+            PrismAxis::Y => UnitVec3::X,
+            PrismAxis::Z => UnitVec3::Y,
+        }
+    }
+
+    /// Second in-plane axis (`v`), chosen so that `u × v = −w`.
+    pub fn v(self) -> UnitVec3 {
+        match self {
+            PrismAxis::X => UnitVec3::Y,
+            PrismAxis::Y => UnitVec3::Z,
+            PrismAxis::Z => UnitVec3::X,
+        }
+    }
+
+    /// Compose a world point from in-plane `(u, v)` and along-axis `w` coordinates.
+    pub fn point(self, u: f64, v: f64, w: f64) -> Point3 {
+        match self {
+            PrismAxis::X => Point3::new(w, v, u),
+            PrismAxis::Y => Point3::new(u, w, v),
+            PrismAxis::Z => Point3::new(v, u, w),
+        }
+    }
+
+    /// Split a world point into `(u, v, w)`.  Inverse of [`PrismAxis::point`].
+    pub fn split(self, p: Point3) -> (f64, f64, f64) {
+        match self {
+            PrismAxis::X => (p.z, p.y, p.x),
+            PrismAxis::Y => (p.x, p.z, p.y),
+            PrismAxis::Z => (p.y, p.x, p.z),
+        }
+    }
+}
+
 // ── FaceExtent ────────────────────────────────────────────────────────────────
 
 /// Geometric extent of a face — data *not* captured by the infinite carrier surface.
@@ -75,23 +148,28 @@ pub enum FaceExtent {
         /// The polygon vertices in counter-clockwise order.
         points: Vec<Point3>,
     },
-    /// Rounded-rectangle cap face (end cap of a `build_solid_rounded_box_xz` solid).
+    /// Rounded-rectangle cap face (end cap of a `build_solid_rounded_plate` solid).
     /// The boundary consists of 4 LINE + 4 CIRCLE arc edges in analytic STEP form.
+    ///
+    /// All extents are expressed in the prism's own `(u, v, w)` basis — see
+    /// [`PrismAxis`] — so the same cap works on an X-, Y- or Z-normal plate.
     RoundedRectCap {
-        /// Minimum X of the rectangle.
-        xmin: f64,
-        /// Maximum X of the rectangle.
-        xmax: f64,
-        /// Minimum Z of the rectangle.
-        zmin: f64,
-        /// Maximum Z of the rectangle.
-        zmax: f64,
+        /// Extrusion axis: the cap's outward normal is `±axis`.
+        axis: PrismAxis,
+        /// Minimum of the first in-plane coordinate (`axis.u()`).
+        umin: f64,
+        /// Maximum of the first in-plane coordinate (`axis.u()`).
+        umax: f64,
+        /// Minimum of the second in-plane coordinate (`axis.v()`).
+        vmin: f64,
+        /// Maximum of the second in-plane coordinate (`axis.v()`).
+        vmax: f64,
         /// Corner arc radius.
         radius: f64,
-        /// Y coordinate of this cap.
-        y: f64,
-        /// `true` = back cap (outward +Y); `false` = front cap (outward −Y).
-        plus_y: bool,
+        /// Coordinate along `axis` where this cap sits.
+        w: f64,
+        /// `true` = the cap facing `+axis`; `false` = the cap facing `−axis`.
+        plus: bool,
     },
     /// **Analytic Boolean union output** — a face whose boundary is given by
     /// explicit B-Rep topology (`Face::outer_loop` + `Face::inner_loops` →
