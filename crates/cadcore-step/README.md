@@ -1,96 +1,78 @@
 # cadcore-step
 
+**High-Precision, Pure-Rust STEP AP203/AP214 Exporter.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![crates.io](https://img.shields.io/crates/v/cadcore-step)](https://crates.io/crates/cadcore-step)
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](../../LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](https://www.rust-lang.org/)
 
-Pure-Rust STEP AP203 writer for the [cadcore](https://crates.io/crates/cadcore) CAD kernel.
+`cadcore-step` is a native, pure-Rust STEP (ISO 10303-21) writer for the `cadcore` CAD kernel. It translates Boundary Representation (B-Rep) topological shells into standard CAD exchange files.
 
-Converts a `BRep` to an ISO 10303-21 exchange file. Every cadcore surface maps directly to a native STEP entity — **no tessellation, no mesh approximation**. The output opens in FreeCAD, SolidWorks, CATIA, Rhino, and any other AP203-compliant CAD tool.
+**Zero FFI. Zero C++ dependencies. Generates exact mathematical shapes (no polygonal approximations).**
 
 ---
 
-## Entity mapping
+## Why cadcore-step?
 
-| cadcore type | STEP AP203 entity |
-|---|---|
-| `Plane3` | `PLANE` |
-| `CylSurf` | `CYLINDRICAL_SURFACE` |
-| `SphereSurf` | `SPHERICAL_SURFACE` |
-| `TorusSurf` | `TOROIDAL_SURFACE` |
-| `ConeSurf` | `CONICAL_SURFACE` |
-| `Circle3` | `CIRCLE` |
-| `Ellipse3` | `ELLIPSE` |
-| `Line3` | `LINE` |
-| `Point3` | `CARTESIAN_POINT` |
-| `Vec3` | `DIRECTION` |
-| `Frame3` | `AXIS2_PLACEMENT_3D` |
+1.  **Exact Analytic Entities:** Exported models map directly to exact mathematical STEP entities (`PLANE`, `CYLINDRICAL_SURFACE`, `TOROIDAL_SURFACE`, etc.). The resulting files contain true analytic curves and surfaces rather than discretized triangular meshes, ensuring infinite zoom resolution and flawless CAD importing.
+2.  **Broad CAD Compatibility:** Generates standard AP203 (`CONFIGURATION_CONTROLLED_DESIGN` protocol) or AP214 assembly structures that open out-of-the-box in major CAD engines including **SolidWorks, Autodesk Inventor, Fusion 360, FreeCAD, Rhino, CATIA, and AutoCAD**.
+3.  **Sub-Micron Precision:** Coordinates, directions, radii, and transforms are serialized with `:.10` (10 decimal places) precision, preserving watertight manifolds and tiny geometric tolerances down to sub-atomic scales ($10^{-10}$ mm).
+4.  **No Temporary Files:** Writes directly to memory strings or output buffers, avoiding intermediate disk reads/writes. Perfect for high-concurrency microservices and WebAssembly runtimes.
+
+---
+
+## Entity Mapping
+
+| cadcore Type | STEP AP203 Entity | Description |
+|---|---|---|
+| `Plane3` | `PLANE` | Flat boundary plane |
+| `CylSurf` | `CYLINDRICAL_SURFACE` | Cylindrical face |
+| `SphereSurf` | `SPHERICAL_SURFACE` | Spherical cap |
+| `TorusSurf` | `TOROIDAL_SURFACE` | Toroidal blend face |
+| `Circle3` | `CIRCLE` | Circular edge boundary |
+| `Ellipse3` | `ELLIPSE` | Elliptical edge boundary |
+| `Line3` | `LINE` | Linear edge boundary |
+| `Point3` | `CARTESIAN_POINT` | Topological vertex point |
+| `Vec3` / `UnitVec3` | `DIRECTION` | Normalized direction vector |
+| `Frame3` | `AXIS2_PLACEMENT_3D` | Orthonormal coordinate system placement |
 
 ---
 
 ## Usage
 
+Add `cadcore-step` to your `Cargo.toml`:
+
 ```toml
 [dependencies]
-cadcore-step = "0.1"
+cadcore-step = "0.1.23"
 ```
 
 ```rust
 use cadcore_topo::BRep;
 use cadcore_step::brep_to_step;
 
-// brep is populated via cadcore-ops or manually
-let step_text: String = brep_to_step(&brep)?;
-std::fs::write("output.step", &step_text)?;
-```
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize and populate BRep (usually via cadcore-ops)
+    let mut brep = BRep::new();
+    // (populate geometry here...)
 
-### Example — sweep + export in one shot
+    // 2. Serialize directly to STEP string
+    let step_text: String = brep_to_step(&brep)?;
 
-```rust
-use cadcore_topo::BRep;
-use cadcore_math::Point3;
-use cadcore_ops::{sweep_circle_along_polyline, SweepOptions};
-use cadcore_step::brep_to_step;
-
-let waypoints = vec![
-    Point3::new(0.0, 0.0, 0.0),
-    Point3::new(10.0, 0.0, 0.0),
-    Point3::new(10.0, 8.0, 0.0),
-];
-
-let mut brep = BRep::new();
-sweep_circle_along_polyline(&mut brep, &waypoints, 0.2, &SweepOptions::default())?;
-
-let step = brep_to_step(&brep)?;
-std::fs::write("rod.step", &step)?;
+    // 3. Save to disk
+    std::fs::write("model.step", &step_text)?;
+    Ok(())
+}
 ```
 
 ---
 
-## Output format
+## License & Contact
 
-The generated `.step` file conforms to ISO 10303-21 / AP203 (CONFIGURATION_CONTROLLED_DESIGN protocol) and contains:
+Licensed under the **MIT License** (see [LICENSE](LICENSE)). Free for commercial
+and non-commercial use, including earlier releases. Versions 0.1.0-0.1.21 were
+originally published under PolyForm-Noncommercial-1.0.0 and are now additionally
+available under MIT; their historical crates.io metadata remains unchanged.
+See the copyright holder's explicit [MIT grant and licensing history](https://github.com/YATSKOVSKYI/cadcore/blob/master/LICENSE-HISTORY.md).
+Third-party dependencies retain their own licenses.
 
-- `FILE_DESCRIPTION`, `FILE_NAME`, `FILE_SCHEMA` header
-- One `PRODUCT` / `SHAPE_DEFINITION_REPRESENTATION` per solid
-- Exact surface and curve geometry — no `B_SPLINE_SURFACE_WITH_KNOTS` approximations
-
----
-
-## Part of cadcore
-
-For the full kernel (sweep + STEP export via the facade), use [`cadcore`](https://crates.io/crates/cadcore):
-
-```toml
-[dependencies]
-cadcore = "0.1"
-```
-
----
-
-## License
-
-[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
-
-Free for research, education, and non-commercial use.
-Commercial licensing: **dmytroyatskovskiy@gmail.com**
+For questions, support, or custom integrations, please contact Dmytro Yatskovskyi at [dmytroyatskovskyi@outlook.com](mailto:dmytroyatskovskyi@outlook.com).
