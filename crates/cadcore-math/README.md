@@ -67,6 +67,11 @@ fn main() {
 
 ## License & Contact
 
-Licensed under the **MIT License** (see [LICENSE](../../LICENSE)). Free for commercial and non-commercial application.
+Licensed under the **MIT License** (see [LICENSE](LICENSE)). Free for commercial
+and non-commercial use, including earlier releases. Versions 0.1.0-0.1.21 were
+originally published under PolyForm-Noncommercial-1.0.0 and are now additionally
+available under MIT; their historical crates.io metadata remains unchanged.
+See the copyright holder's explicit [MIT grant and licensing history](https://github.com/YATSKOVSKYI/cadcore/blob/master/LICENSE-HISTORY.md).
+Third-party dependencies retain their own licenses.
 
 For questions, support, or custom integrations, please contact Dmytro Yatskovskyi at [dmytroyatskovskyi@outlook.com](mailto:dmytroyatskovskyi@outlook.com).

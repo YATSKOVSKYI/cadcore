@@ -85,3 +85,10 @@ Small models, full feature sets (the 5.4 mm mini reproduces everything the
 15 mm part does at 1/20 the bytes).  Every gate runs on every artefact in CI.
 A configuration matrix (HL 0.35–0.50 × spacing × offsets) is the regression
 suite — single golden files are not enough.
+
+## License
+
+Licensed under the **MIT License** (see [LICENSE](LICENSE)). Free for commercial
+and non-commercial use. See the workspace [licensing history and MIT grant for
+earlier cadcore releases](https://github.com/YATSKOVSKYI/cadcore/blob/master/LICENSE-HISTORY.md).
+Third-party dependencies retain their own licenses.

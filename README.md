@@ -138,7 +138,20 @@ cadcore-step          cadcore (facade)
 
 ## License
 
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details. It is free for both non-commercial and commercial usage.
+All seven cadcore workspace crates are available under the **MIT License**,
+including earlier published releases. Commercial and non-commercial use are
+permitted under the terms of [LICENSE](LICENSE).
+
+Versions 0.1.0-0.1.21 were originally published under
+PolyForm-Noncommercial-1.0.0; version 0.1.22 was the first published with MIT
+metadata. The copyright holder has additionally licensed those earlier releases
+under MIT. Their existing crates.io archives and historical metadata are
+unchanged (0.1.0 is displayed as `non-standard`). See the explicit
+[MIT grant for earlier releases and licensing history](LICENSE-HISTORY.md),
+which you can retain with an older release as evidence of this permission.
+
+Third-party dependencies retain their own licenses; this grant covers cadcore's
+code, not third-party code.
 
 ---
 
