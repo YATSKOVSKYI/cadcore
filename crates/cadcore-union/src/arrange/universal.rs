@@ -127,9 +127,30 @@ pub fn fuse_filaments_with(
     // ── 1. Trace every boundary loop between every pair of filaments ────────
     let mut loops: Vec<TracedLoop> = Vec::new();
     let mut known: PointGrid = PointGrid::new(opts.step * 1.5);
+    // Member boxes once per body, and the body's box: a pair of filaments
+    // whose boxes miss each other has nothing to trace (the member boxes lie
+    // inside it), so the O(n²) pair sweep skips it before looking at members.
+    let member_boxes: Vec<Vec<(Member, Aabb)>> = bodies
+        .iter()
+        .map(|b| b.members().into_iter().map(|m| (m, b.member_box(m))).collect())
+        .collect();
+    let body_boxes: Vec<Aabb> = member_boxes
+        .iter()
+        .map(|ms| {
+            let mut bb = Aabb::empty();
+            for (_, mb) in ms {
+                bb.expand(mb.min);
+                bb.expand(mb.max);
+            }
+            bb
+        })
+        .collect();
     for i in 0..nb {
         for j in (i + 1)..nb {
-            trace_pair(&bodies, i, j, opts, &mut loops, &mut known, &mut report);
+            if !body_boxes[i].overlaps(&body_boxes[j]) {
+                continue;
+            }
+            trace_pair(&bodies, &member_boxes, i, j, opts, &mut loops, &mut known, &mut report);
         }
         // Self-crossings (a filament weaving back over itself) are not traced
         // here; note them so the caller knows the output interpenetrates there.
@@ -227,6 +248,34 @@ pub fn fuse_filaments_with(
     }
     let t_stage = std::time::Instant::now();
     let mut t_cells = std::time::Duration::ZERO;
+    for lp in &mut loops {
+        for piece in &mut lp.pieces {
+            let Some((key, mid)) = piece.on_circle else { continue };
+            let (Some(ring), Some(&a), Some(&b)) = (sampled.get(&key), piece.pts.first(), piece.pts.last()) else {
+                continue;
+            };
+            let ring = &ring[..ring.len().saturating_sub(1)]; // drop the closing repeat
+            let find = |q: Point3| ring.iter().position(|&r| (r - q).length() < 1e-9);
+            let (Some(ia), Some(ib)) = (find(a), find(b)) else {
+                report.notes.push("cap lens arc endpoints not on the sampled rim".into());
+                continue;
+            };
+            let m = ring.len();
+            let walk = |step: isize| -> Vec<Point3> {
+                let mut out = vec![ring[ia]];
+                let mut k = ia as isize;
+                while k as usize != ib {
+                    k = (k + step).rem_euclid(m as isize);
+                    out.push(ring[k as usize]);
+                }
+                out
+            };
+            let (fw, bw) = (walk(1), walk(-1));
+            let near = |w: &Vec<Point3>| w.iter().map(|&q| (q - mid).length()).fold(f64::MAX, f64::min);
+            piece.pts = if near(&fw) <= near(&bw) { fw } else { bw };
+        }
+    }
+
     // ── 3 + 4. Arrange every face and stitch the kept cells ─────────────────
     // Every face's arrangement + classification is independent and only reads
     // the bodies, so it runs on all cores first; the cells are then emitted in
@@ -239,11 +288,22 @@ pub fn fuse_filaments_with(
         .collect();
     let arrange_one = |bi: usize, m: Member| {
         let b = &bodies[bi];
+        // A cap's sample sits ON a coplanar cap of another body where two
+        // flush filaments overlap: nudge it off the plane, outward when this
+        // body has the lower index (it keeps the shared lens), inward otherwise
+        // (it gives the lens up), so exactly one of the two caps keeps it.
+        let cap_n = match m {
+            Member::Cap(c) => Some(b.caps[c].plane.normal().as_vec()),
+            _ => None,
+        };
         let drop = |p: Point3| {
-            bodies
-                .iter()
-                .enumerate()
-                .any(|(k, other)| k != bi && other.tube.contains(p))
+            bodies.iter().enumerate().any(|(k, other)| {
+                k != bi
+                    && other.tube.contains(match cap_n {
+                        Some(n) => p + n * if bi < k { 1e-7 } else { -1e-7 },
+                        None => p,
+                    })
+            })
         };
         let domain = b.domain(m);
         let mut chains: Vec<FaceChain> = Vec::new();
@@ -806,6 +866,11 @@ struct Piece {
     a: (usize, Member),
     b: (usize, Member),
     pts: Vec<Point3>,
+    /// The piece runs ALONG a junction circle (coplanar end caps: the arc of
+    /// the kept cap's rim inside the other disk) — its points are replaced by
+    /// that circle's own samples once they are known, so the cap rim and the
+    /// piece emit identical edges.  `(junction, a point inside the arc)`.
+    on_circle: Option<(JunctionKey, Point3)>,
 }
 
 /// A point where the boundary curve crosses a junction circle.
@@ -858,8 +923,10 @@ impl PointGrid {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn trace_pair(
     bodies: &[Body],
+    member_boxes: &[Vec<(Member, Aabb)>],
     i: usize,
     j: usize,
     opts: &FuseOptions,
@@ -868,11 +935,16 @@ fn trace_pair(
     report: &mut FuseReport,
 ) {
     let (bi, bj) = (&bodies[i], &bodies[j]);
-    for mi in bi.members() {
-        let box_i = bi.member_box(mi);
-        for mj in bj.members() {
-            if !box_i.overlaps(&bj.member_box(mj)) {
+    for &(mi, box_i) in &member_boxes[i] {
+        for &(mj, box_j) in &member_boxes[j] {
+            if !box_i.overlaps(&box_j) {
                 continue;
+            }
+            if let (Member::Cap(ci), Member::Cap(cj)) = (mi, mj) {
+                let (ca, cb) = (&bi.caps[ci], &bj.caps[cj]);
+                if ca.plane.normal().dot(cb.plane.normal()).abs() > 1.0 - 1e-9 {
+                    continue; // coplanar caps: reached from the legs, never seeded
+                }
             }
             let si = bi.surface(mi);
             let sj = bj.surface(mj);
@@ -928,7 +1000,7 @@ fn trace_boundary(
 
     let mut pieces: Vec<Piece> = Vec::new();
     let mut joints: Vec<Joint> = Vec::new();
-    let mut cur = Piece { a: (i, m_i), b: (j, m_j), pts: vec![start] };
+    let mut cur = Piece { a: (i, m_i), b: (j, m_j), pts: vec![start], on_circle: None };
     let mut p = start;
     let mut dir: Option<Vec3> = None;
     let mut travelled = 0.0;
@@ -943,7 +1015,14 @@ fn trace_boundary(
     macro_rules! abort {
         ($why:expr) => {{
             if dbg {
-                eprintln!("[trace][abort] {} at ({:.4},{:.4},{:.4}) members {:?}/{:?} pieces so far {}", $why, p.x, p.y, p.z, m_i, m_j, pieces.len());
+                eprintln!("[trace][abort] {} at ({:.4},{:.4},{:.4}) members {:?}/{:?} pieces so far {} bodies {i}/{j}", $why, p.x, p.y, p.z, m_i, m_j, pieces.len());
+                for (b, m) in [(bi, m_i), (bj, m_j)] {
+                    if let Member::Cap(c) = m {
+                        let cp = &b.caps[c];
+                        let n = cp.plane.normal().as_vec();
+                        eprintln!("[trace][abort]   cap centre ({:.4},{:.4},{:.4}) n ({:.4},{:.4},{:.4}) r {:.4} leg {} end {}", cp.centre.x, cp.centre.y, cp.centre.z, n.x, n.y, n.z, cp.radius, cp.leg, cp.end);
+                    }
+                }
             }
             return None;
         }};
@@ -1063,6 +1142,41 @@ fn trace_boundary(
         let (body, m_cur, other_surf) = if on_i { (bi, m_i, s_j) } else { (bj, m_j, s_i) };
         let Some((next_m, circle, key)) = body.neighbour(m_cur, hi) else { abort!("no neighbour") };
         let Some(jpt) = joint_on_circle(&circle, &other_surf, approx, hh.max(opts.step)) else { abort!("joint not found") };
+        // Coincident junction planes (stacked, bonded walls, snapped to one
+        // plan position upstream): this junction circle and one of the OTHER
+        // body's lie in one plane and cross at two points.  Each such point is
+        // on both tubes, so the boundary passes exactly through it and BOTH
+        // sides change member there.  Switching one side now and the other a
+        // marching step later leaves either a nanometre piece or a vertex a
+        // hair off its circle (Parasolid: a self-intersecting face).  Snap the
+        // joint to the exact circle–circle point and switch both sides at once.
+        let (obody, om) = if on_i { (bj, m_j) } else { (bi, m_i) };
+        let mut jpt = jpt;
+        let mut also: Option<(Member, (usize, u8))> = None;
+        if !matches!(om, Member::Cap(_)) {
+            for (ol, oend) in obody.junctions_of(om) {
+                let oc = obody.leg_circle(ol, oend);
+                let n = circle.frame.z;
+                let coplanar = n.dot(oc.frame.z).abs() > 1.0 - 1e-9 && n.dot_vec(oc.frame.origin - circle.frame.origin).abs() < 1e-7;
+                if !coplanar {
+                    continue;
+                }
+                let Some(lens) = coplanar_circles_point(&circle, &oc, jpt) else { continue };
+                if (lens - jpt).length() > 1e-3 {
+                    continue;
+                }
+                let hi_o = match om {
+                    Member::Leg(_) => oend == 1,
+                    Member::Elbow(e) => ol == e + 1,
+                    Member::Cap(_) => false,
+                };
+                if let Some((onext, _, okey)) = obody.neighbour(om, hi_o) {
+                    jpt = lens;
+                    also = Some((onext, okey));
+                }
+                break;
+            }
+        }
         let jkey = JunctionKey { body: if on_i { i } else { j }, leg: key.0, end: key.1 };
 
         // A step point landing a hair before the joint would leave a sliver
@@ -1091,18 +1205,138 @@ fn trace_boundary(
             m_j = next_m;
             s_j = bj.surface(m_j);
         }
-        cur = Piece { a: (i, m_i), b: (j, m_j), pts: vec![jpt] };
+        if let Some((onext, okey)) = also {
+            joints.push(Joint { key: JunctionKey { body: if on_i { j } else { i }, leg: okey.0, end: okey.1 }, p: jpt });
+            if on_i {
+                m_j = onext;
+                s_j = bj.surface(m_j);
+            } else {
+                m_i = onext;
+                s_i = bi.surface(m_i);
+            }
+        }
+        cur = Piece { a: (i, m_i), b: (j, m_j), pts: vec![jpt], on_circle: None };
         travelled += (jpt - p).length();
         p = jpt;
+
+        // One side just stepped onto an end cap at a point that also lies on
+        // the rim of the OTHER body's coplanar cap (two flush, overlapping
+        // filament ends): both rims pass through here, so the other side has
+        // reached its cap too — a step later only by sampling.  Marching on
+        // "cap × other lateral" would run exactly along the other rim, a
+        // degenerate path; switch the other side now as well so the
+        // coplanar-cap lens below takes over from this rim crossing.
+        let cap_of = |_b: &Body, m: Member| match m {
+            Member::Cap(c) => Some(c),
+            _ => None,
+        };
+        let flush_partner = |cap_body: &Body, c: usize, leg_body: &Body, m: Member| -> Option<usize> {
+            let Member::Leg(l) = m else { return None };
+            let ca = &cap_body.caps[c];
+            leg_body.caps.iter().position(|cb| {
+                cb.leg == l
+                    && ca.plane.normal().dot(cb.plane.normal()) > 1.0 - 1e-9
+                    && ca.plane.normal().dot_vec(cb.centre - ca.centre).abs() < 1e-7
+                    && ((p - cb.centre).length() - cb.radius).abs() < 1e-6
+            })
+        };
+        match (cap_of(bi, m_i), cap_of(bj, m_j)) {
+            (Some(c), None) => {
+                if let Some(cb) = flush_partner(bi, c, bj, m_j) {
+                    let cap = &bj.caps[cb];
+                    joints.push(Joint { key: JunctionKey { body: j, leg: cap.leg, end: cap.end }, p });
+                    m_j = Member::Cap(cb);
+                    s_j = bj.surface(m_j);
+                    cur = Piece { a: (i, m_i), b: (j, m_j), pts: vec![p], on_circle: None };
+                }
+            }
+            (None, Some(c)) => {
+                if let Some(ca) = flush_partner(bj, c, bi, m_i) {
+                    let cap = &bi.caps[ca];
+                    joints.push(Joint { key: JunctionKey { body: i, leg: cap.leg, end: cap.end }, p });
+                    m_i = Member::Cap(ca);
+                    s_i = bi.surface(m_i);
+                    cur = Piece { a: (i, m_i), b: (j, m_j), pts: vec![p], on_circle: None };
+                }
+            }
+            _ => {}
+        }
 
         // new marching direction: enter the member we just switched to
         let (Some(na), Some(nb)) = (s_i.normal_at(p), s_j.normal_at(p)) else { abort!("no normal after switch") };
         let cr = na.cross(nb);
         let cl = cr.length();
         if cl < 1e-5 {
-            // Two caps in one plane (filaments starting flush on the same
-            // boundary plane) — a coplanar-face Boolean, not a curve to march.
-            abort!("tangency after switch (coplanar caps?)");
+            // Two caps in one plane (filaments ending flush on the same
+            // boundary plane, e.g. a honeycomb wall bonded to the wall below):
+            // a coplanar-face Boolean, not a curve to march.  The union keeps
+            // body i's cap whole (i < j) and cuts body j's cap along i's rim,
+            // so the boundary runs along the arc of i's rim that lies inside
+            // j's disk, from this rim crossing to the other one, and then down
+            // the two legs again.
+            let (Member::Cap(ci), Member::Cap(cj)) = (m_i, m_j) else { abort!("tangency after switch") };
+            let (ca, cb) = (&bi.caps[ci], &bj.caps[cj]);
+            let n = ca.plane.normal();
+            let coplanar = n.dot(cb.plane.normal()) > 1.0 - 1e-9
+                && n.dot_vec(cb.centre - ca.centre).abs() < 1e-7
+                && (ca.radius - cb.radius).abs() < 1e-9;
+            if !coplanar {
+                abort!("tangency after switch (caps not coplanar)");
+            }
+            let d = cb.centre - ca.centre;
+            let dl = d.length();
+            if dl < 1e-9 || dl >= 2.0 * ca.radius {
+                abort!("coplanar caps without a lens");
+            }
+            let u = d * (1.0 / dl);
+            let rel = p - ca.centre;
+            let p2 = ca.centre + u * (2.0 * rel.dot(u)) - rel; // reflect across the centre line
+            let mid = ca.centre + u * ca.radius; // a rim point inside j's disk
+            // sample i's rim from p to p2 through `mid` (replaced later by the
+            // junction circle's own samples)
+            let e1 = rel * (1.0 / rel.length().max(1e-30));
+            let e2 = n.as_vec().cross(e1);
+            let ang = |q: Vec3| e2.dot(q).atan2(e1.dot(q));
+            let mut a_end = ang(p2 - ca.centre);
+            let a_mid = ang(mid - ca.centre);
+            let tau = std::f64::consts::TAU;
+            // choose the sweep sign whose arc contains `mid`
+            let (ae, am) = (a_end.rem_euclid(tau), a_mid.rem_euclid(tau));
+            a_end = if am < ae { ae } else { ae - tau };
+            let ns = ((a_end.abs() * ca.radius / opts.step).ceil() as usize).max(2);
+            let mut arc: Vec<Point3> = (0..=ns)
+                .map(|k| {
+                    let a = a_end * k as f64 / ns as f64;
+                    ca.centre + e1 * (ca.radius * a.cos()) + e2 * (ca.radius * a.sin())
+                })
+                .collect();
+            arc[0] = p;
+            arc[ns] = p2;
+            let ki = JunctionKey { body: i, leg: ca.leg, end: ca.end };
+            let kj = JunctionKey { body: j, leg: cb.leg, end: cb.end };
+            pieces.push(Piece { a: (i, m_i), b: (j, m_j), pts: arc, on_circle: Some((ki, mid)) });
+            joints.push(Joint { key: ki, p: p2 });
+            joints.push(Joint { key: kj, p: p2 });
+            m_i = Member::Leg(ca.leg);
+            m_j = Member::Leg(cb.leg);
+            s_i = bi.surface(m_i);
+            s_j = bj.surface(m_j);
+            travelled += (p2 - p).length();
+            p = p2;
+            cur = Piece { a: (i, m_i), b: (j, m_j), pts: vec![p2], on_circle: None };
+            let (Some(na), Some(nb)) = (s_i.normal_at(p), s_j.normal_at(p)) else { abort!("no normal after cap lens") };
+            let cr = na.cross(nb);
+            let cl = cr.length();
+            if cl < 1e-9 {
+                abort!("tangent legs after cap lens");
+            }
+            let mut t = cr * (1.0 / cl);
+            if t.dot(n.as_vec()) > 0.0 {
+                t = -t; // back into the filaments, away from the caps
+            }
+            dir = Some(t);
+            consecutive_switches = 0;
+            continue;
         }
         let t0 = cr * (1.0 / cl);
         let probe_len = 0.5 * opts.step;
@@ -1147,6 +1381,24 @@ fn trace_boundary(
         );
     }
     None
+}
+
+/// The point of two coplanar circles' intersection nearest `near` (`None`
+/// when they do not cross).
+fn coplanar_circles_point(c1: &Circle3, c2: &Circle3, near: Point3) -> Option<Point3> {
+    let d = c2.frame.origin - c1.frame.origin;
+    let dl = d.length();
+    let (r1, r2) = (c1.radius, c2.radius);
+    if dl < 1e-12 || dl > r1 + r2 || dl < (r1 - r2).abs() {
+        return None;
+    }
+    let ud = d * (1.0 / dl);
+    let a = (r1 * r1 - r2 * r2 + dl * dl) / (2.0 * dl);
+    let h = (r1 * r1 - a * a).max(0.0).sqrt();
+    let base = c1.frame.origin + ud * a;
+    let perp = c1.frame.z.as_vec().cross(ud);
+    let (p1, p2) = (base + perp * h, base - perp * h);
+    Some(if (p1 - near).length() <= (p2 - near).length() { p1 } else { p2 })
 }
 
 /// Merge the closing piece into the opening one (same face pair, shared

@@ -28,7 +28,6 @@ use crate::geom::composite::CompositeTube;
 use crate::arrange::merge::merge_shell_edges;
 use crate::arrange::filament::Filament;
 use crate::arrange::universal::{fuse_filaments_with, FuseOptions, FuseReport};
-use crate::boolean::half_space_cut_robust;
 
 /// What one trim plane did.
 #[derive(Debug, Clone, Copy)]
@@ -215,7 +214,7 @@ impl LatticeModel {
 /// Trim the fused `shell` of `src` with every plane in turn (keeping the side
 /// each normal points to), then fold the per-step edges into whole curves.
 ///
-/// Each plane goes through [`half_space_cut_robust`]: a plane that grazes a
+/// Each plane goes through [`crate::half_space_cut_robust`]: a plane that grazes a
 /// junction rim or an end cap is moved by 10–40 µm and the move is reported in
 /// [`TrimInfo::shift`].  `knit` is the model knit tolerance (1e-6 for a shell
 /// built by the universal fuse).
@@ -234,7 +233,10 @@ pub fn trim_shell(src: &BRep, shell: ShellId, planes: &[Plane3], knit: f64) -> O
             None => (src, shell),
         };
         let faces = b.shells.get(sh)?.faces.clone();
-        let robust = half_space_cut_robust(b, &faces, requested, knit)?;
+        // open edges the shell already has (0 for a sound fuse): the cut is
+        // judged only on the ones it would add
+        let baseline = crate::validate::manifold::check(b, sh).violations.len();
+        let robust = crate::boolean::halfspace::half_space_cut_robust_over(b, &faces, requested, knit, baseline)?;
         let n = requested.normal();
         trims.push(TrimInfo {
             requested: *requested,

@@ -356,10 +356,27 @@ pub fn check_face(brep: &BRep, fid: FaceId, issues: &mut Vec<String>) {
                 }
                 if seg_intersect(a[ai], a[ai + 1], a[bi], a[bi + 1]) {
                     if std::env::var("CADCORE_DUMP_WIRES").is_ok() {
+                        let kind = match &face.geom {
+                            cadcore_topo::FaceGeom::Plane(_) => "plane",
+                            cadcore_topo::FaceGeom::Cylinder(_) => "cyl",
+                            cadcore_topo::FaceGeom::Torus(_) => "torus",
+                            cadcore_topo::FaceGeom::Sphere(_) => "sphere",
+                        };
+                        let p0 = brep
+                            .loops
+                            .get(w.lp)
+                            .and_then(|l| brep.coedges.get(l.start))
+                            .and_then(|c| brep.edges.get(c.edge))
+                            .and_then(|e| brep.vertices.get(e.v_start))
+                            .map(|v| v.point);
                         eprintln!(
-                            "[wires] {fid:?} {:?} n={n} self-intersection: seg {ai} ({:.6},{:.6})->({:.6},{:.6}) × seg {bi} ({:.6},{:.6})->({:.6},{:.6})",
-                            w.lp, a[ai].0, a[ai].1, a[ai + 1].0, a[ai + 1].1, a[bi].0, a[bi].1, a[bi + 1].0, a[bi + 1].1
+                            "[wires] {fid:?} {kind} at {:?} {:?} n={n} self-intersection: seg {ai} ({:.6},{:.6})->({:.6},{:.6}) × seg {bi} ({:.6},{:.6})->({:.6},{:.6})",
+                            p0.map(|p| (p.x, p.y, p.z)), w.lp, a[ai].0, a[ai].1, a[ai + 1].0, a[ai + 1].1, a[bi].0, a[bi].1, a[bi + 1].0, a[bi + 1].1
                         );
+                        let lo = ai.saturating_sub(2);
+                        let hi = (bi + 3).min(n);
+                        let around: Vec<String> = (lo..hi).map(|k| format!("{k}:({:.7},{:.7})", a[k].0, a[k].1)).collect();
+                        eprintln!("[wires]   {}", around.join(" "));
                     }
                     issues.push(format!(
                         "face {fid:?} loop {:?}: wire SELF-INTERSECTS in uv",

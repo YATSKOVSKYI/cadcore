@@ -348,6 +348,40 @@ fn lsq_fit(vals: &[Vec<f64>], nc: usize, rows: &[(usize, [f64; 4])]) -> (Vec<Vec
     (ctrl, err)
 }
 
+/// The fit stays on the sampled curve BETWEEN samples too: at the middle of
+/// each interval it must lie within `tol` of the chord midpoint widened by the
+/// chord's sagitta, estimated from the second difference of the neighbouring
+/// samples (`|Q₋ − 2Q + Q₊| / 8 ≈ h²κ/8`).  A smooth curve passes easily; a
+/// fit that oscillates between sparse samples on a tight bend does not.
+fn holds_between(vals: &[Vec<f64>], ctrl: &[Vec<f64>], mid_rows: &[(usize, [f64; 4])], tol: f64) -> bool {
+    let m = vals.len();
+    let dim = vals[0].len();
+    let sag = |k: usize| -> f64 {
+        // second difference around sample k (clamped at the ends)
+        let k = k.clamp(1, m - 2);
+        let mut s2 = 0.0;
+        for d in 0..dim {
+            s2 += (vals[k - 1][d] - 2.0 * vals[k][d] + vals[k + 1][d]).powi(2);
+        }
+        s2.sqrt() / 8.0
+    };
+    for (k, &(s, nb)) in mid_rows.iter().enumerate() {
+        let allow = tol + 2.0 * sag(k).max(sag(k + 1));
+        let mut e2 = 0.0;
+        for d in 0..dim {
+            let mut c = 0.0;
+            for (j, &w) in nb.iter().enumerate() {
+                c += w * ctrl[s - 3 + j][d];
+            }
+            e2 += (c - 0.5 * (vals[k][d] + vals[k + 1][d])).powi(2);
+        }
+        if e2.sqrt() > allow {
+            return false;
+        }
+    }
+    true
+}
+
 /// Fit `pts` and every pcurve sample list in `uvs` (same length and order as
 /// `pts`) with ONE cubic knot vector, adding control points until each sample
 /// is within `tol` (mm in 3-D, parameter units on the pcurves).  `None` when
@@ -384,13 +418,23 @@ pub(crate) fn approx_cubic_shared(pts: &[Point3], uvs: &[Vec<(f64, f64)>], tol: 
                 (s, basis4(s, x, &u))
             })
             .collect();
+        // basis rows at the middle of every sample interval: a fit that meets
+        // the samples can still swing between them where they are sparse
+        let mid_rows: Vec<(usize, [f64; 4])> = t
+            .windows(2)
+            .map(|w| {
+                let x = 0.5 * (w[0] + w[1]);
+                let s = find_span(nc, x, &u);
+                (s, basis4(s, x, &u))
+            })
+            .collect();
         let (c3, e3) = lsq_fit(&v3, nc, &rows);
-        let mut ok = e3 <= tol;
+        let mut ok = e3 <= tol && holds_between(&v3, &c3, &mid_rows, tol);
         let mut c2s: Vec<Vec<(f64, f64)>> = Vec::with_capacity(uvs.len());
         if ok {
             for vals in &v2 {
                 let (c2, e2) = lsq_fit(vals, nc, &rows);
-                if e2 > tol {
+                if e2 > tol || !holds_between(vals, &c2, &mid_rows, tol) {
                     ok = false;
                     break;
                 }

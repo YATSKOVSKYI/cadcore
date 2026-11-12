@@ -237,3 +237,32 @@ The fuse → cut → merge chain on a 15 × 15 mm, 12-layer lattice went from 6.
   (22.5° samples) went out as chords 10.9 µm off the face (OCC edge tolerance 0.0108 mm, above
   SolidWorks' 1 µm knit).  Now exact circles: max edge-to-face deviation 6e-5 mm.  Check any STEP
   change with `docs/benchmarks/union_trim_2026-11-12/freecad_edge_dev.py` in 3DcadCore.
+
+## 0.2.4 — honeycomb (bonded walls) fuses watertight
+
+A 15 × 15 mm, 12-layer honeycomb with walls bonded layer on layer (hℓ 0.45 < d 0.55) used to come out
+with ~47 000 open edges.  What it needed, and what must stay:
+
+* **Coplanar end caps** (two stacked walls ending flush in one plane, overlapping disks): never seeded;
+  the tracer, arriving at the caps, walks the lower-index body's rim arc inside the other disk
+  (`Piece.on_circle` → points replaced by that junction circle's own samples) and goes on down the legs.
+  When one side steps onto its cap at a point already on the other body's coplanar cap rim, the other
+  side is switched to its cap at once.  Classification on a cap nudges the probe ±1e-7 along the cap
+  normal (lower index keeps the shared lens).
+* **Coincident junction planes** (stacked walls end at the same axial positions): the two junction
+  circles cross at two points that lie on BOTH tubes; a joint near such a point is snapped to the exact
+  circle–circle point (`coplanar_circles_point`) and BOTH sides switch there.  Never "weld" a joint onto
+  another body's point within a tolerance — the vertex then sits off its own circle and Parasolid calls
+  the face self-intersecting.
+* **Shared cubic fit (0.2.3) also checks the middle of every sample interval** (`holds_between`): at
+  1e-4 tolerance on samples alone, sparse samples on tight elbow–elbow curves let the cubic swing
+  0.25 mm between them (FreeCAD still said "valid").
+* **Robust cut on a defective input** judges only the open edges it adds and tries at most 2 offsets.
+* Fuse pair sweep skips body pairs whose boxes miss (member boxes cached): honeycomb trace 1.2 → 0.46 s.
+
+Validation that caught each step: SpaceClaim gate in `validate_shell`, FreeCAD
+`docs/benchmarks/union_trim_2026-11-12/freecad_edge_dev.py` (edge-to-face deviation), Monte-Carlo
+volume from `LatticeModel` (`bench_union_trim` with `BENCH_MC`), SolidWorks `Check3`.  Open: SolidWorks
+reports 3 faults of code -1 on honeycomb top-half elbows where a crossing tube grazes the elbow's end
+junction circle within ~1e-5 mm (volume and body are right; the "touch" vertex experiments broke
+manifoldness and were removed).

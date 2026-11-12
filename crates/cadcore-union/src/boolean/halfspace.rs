@@ -114,9 +114,27 @@ pub const ROBUST_CUT_SHIFTS: [f64; 7] = [0.0, 0.01, -0.01, 0.02, -0.02, 0.04, -0
 /// returned together with the shift, so the caller can place whatever mates
 /// with the cut face (an electrode plate) on the plane actually used.
 pub fn half_space_cut_robust(src: &BRep, faces: &[FaceId], keep: &Plane3, knit: f64) -> Option<RobustCut> {
+    half_space_cut_robust_over(src, faces, keep, knit, 0)
+}
+
+/// [`half_space_cut_robust`] on an input that already has `baseline` open
+/// edges: an attempt is accepted as soon as the cut adds none of its own.
+/// Moving the plane cannot repair edges the input brought along, so demanding
+/// zero would try every offset in vain (14 full cuts of a defective lattice).
+/// With `baseline == 0` this is exactly [`half_space_cut_robust`].
+pub fn half_space_cut_robust_over(
+    src: &BRep,
+    faces: &[FaceId],
+    keep: &Plane3,
+    knit: f64,
+    baseline: usize,
+) -> Option<RobustCut> {
     let n = keep.normal();
     let mut best: Option<RobustCut> = None;
-    for &shift in ROBUST_CUT_SHIFTS.iter() {
+    // On a defective input the open edges it carries usually cross the plane
+    // too, so no offset closes the cut; two tries are enough to dodge a graze.
+    let max_tries = if baseline > 0 { 2 } else { ROBUST_CUT_SHIFTS.len() };
+    for &shift in ROBUST_CUT_SHIFTS.iter().take(max_tries) {
         let plane = Plane3::from_origin_normal(keep.frame.origin + n.as_vec() * shift, n);
         // a panic inside one attempt (a degenerate arrangement) is just a
         // failed attempt
@@ -133,7 +151,7 @@ pub fn half_space_cut_robust(src: &BRep, faces: &[FaceId], keep: &Plane3, knit: 
         if better {
             best = Some(RobustCut { outcome, shift, violations });
         }
-        if violations == 0 {
+        if violations <= baseline {
             break;
         }
     }
