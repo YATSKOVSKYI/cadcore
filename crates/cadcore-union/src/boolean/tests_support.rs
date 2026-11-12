@@ -240,3 +240,79 @@ pub fn capped_cylinder(
     }
     faces
 }
+
+/// A whole serpentine filament as a solid of TEMPLATE faces — the input the
+/// general union sees when a scaffold is fused filament-by-filament: one
+/// `FaceExtent::Cylinder` band per leg (circle rims), one `TorusFillet` per
+/// elbow, a `Disk` cap on each free end.  No loops: every boundary is implied
+/// by the template, exactly like `capped_cylinder`.
+pub fn filament_solid(brep: &mut BRep, fil: &crate::arrange::scaffold::Filament) -> Vec<FaceId> {
+    let mut faces = Vec::new();
+    let n = fil.legs.len();
+    let circ = |l: &crate::arrange::filament::LegSeg, v: f64| {
+        Circle3::new(l.surf.frame.origin + l.surf.axis().as_vec() * v, l.surf.axis(), l.surf.radius)
+    };
+    for (i, l) in fil.legs.iter().enumerate() {
+        faces.push(brep.add_face(Face {
+            geom: FaceGeom::Cylinder(l.surf),
+            normal: FaceNormal::Same,
+            outer_loop: Default::default(),
+            inner_loops: Vec::new(),
+            shell: Default::default(),
+            extent: FaceExtent::Cylinder {
+                length: l.length,
+                start: FaceBoundary::Circle(circ(l, 0.0)),
+                end: FaceBoundary::Circle(circ(l, l.length)),
+            },
+        }));
+        if i == 0 {
+            let nrm = UnitVec3::try_from_vec(l.surf.axis().as_vec() * -1.0).unwrap();
+            faces.push(brep.add_face(Face {
+                geom: FaceGeom::Plane(Plane3::from_origin_normal(l.surf.frame.origin, nrm)),
+                normal: FaceNormal::Same,
+                outer_loop: Default::default(),
+                inner_loops: Vec::new(),
+                shell: Default::default(),
+                extent: FaceExtent::Disk { radius: l.surf.radius },
+            }));
+        }
+        if i + 1 == n {
+            let c = l.surf.frame.origin + l.surf.axis().as_vec() * l.length;
+            faces.push(brep.add_face(Face {
+                geom: FaceGeom::Plane(Plane3::from_origin_normal(c, l.surf.axis())),
+                normal: FaceNormal::Same,
+                outer_loop: Default::default(),
+                inner_loops: Vec::new(),
+                shell: Default::default(),
+                extent: FaceExtent::Disk { radius: l.surf.radius },
+            }));
+        }
+    }
+    for (i, e) in fil.elbows.iter().enumerate() {
+        faces.push(brep.add_face(Face {
+            geom: FaceGeom::Torus(e.surf),
+            normal: FaceNormal::Same,
+            outer_loop: Default::default(),
+            inner_loops: Vec::new(),
+            shell: Default::default(),
+            extent: FaceExtent::TorusFillet {
+                start_circle: circ(&fil.legs[i], fil.legs[i].length),
+                end_circle: circ(&fil.legs[i + 1], 0.0),
+            },
+        }));
+    }
+    let shell = brep.add_shell(Shell {
+        faces: faces.clone(),
+        is_outer: true,
+        solid: Default::default(),
+    });
+    let solid = brep.add_solid(Solid {
+        shells: vec![shell],
+        name: Some("filament".into()),
+    });
+    brep.shells[shell].solid = solid;
+    for &f in &faces {
+        brep.faces[f].shell = shell;
+    }
+    faces
+}

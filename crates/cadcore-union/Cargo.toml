@@ -13,9 +13,9 @@ keywords     = ["cad", "brep", "boolean", "union", "geometry"]
 categories   = ["science"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math", version = "0.1.22" }
-cadcore-geom = { path = "../cadcore-geom", version = "0.1.22" }
-cadcore-topo = { path = "../cadcore-topo", version = "0.1.22" }
+cadcore-math = { path = "../cadcore-math", version = "0.1.23" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.1.23" }
+cadcore-topo = { path = "../cadcore-topo", version = "0.1.23" }
 
 [dev-dependencies]
-cadcore-step = { path = "../cadcore-step", version = "0.1.22" }
+cadcore-step = { path = "../cadcore-step", version = "0.1.23" }

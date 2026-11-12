@@ -320,6 +320,12 @@ pub fn check_face(brep: &BRep, fid: FaceId, issues: &mut Vec<String>) {
                     continue;
                 }
                 if seg_intersect(a[ai], a[ai + 1], a[bi], a[bi + 1]) {
+                    if std::env::var("CADCORE_DUMP_WIRES").is_ok() {
+                        eprintln!(
+                            "[wires] {fid:?} {:?} n={n} self-intersection: seg {ai} ({:.6},{:.6})->({:.6},{:.6}) × seg {bi} ({:.6},{:.6})->({:.6},{:.6})",
+                            w.lp, a[ai].0, a[ai].1, a[ai + 1].0, a[ai + 1].1, a[bi].0, a[bi].1, a[bi + 1].0, a[bi + 1].1
+                        );
+                    }
                     issues.push(format!(
                         "face {fid:?} loop {:?}: wire SELF-INTERSECTS in uv",
                         w.lp

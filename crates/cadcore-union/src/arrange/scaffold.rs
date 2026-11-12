@@ -47,7 +47,12 @@ impl Filament {
             let din = dir(verts[k - 1], verts[k]);
             let dout = dir(verts[k], verts[k + 1]);
             let turn = din.dot_vec(dout.as_vec()).clamp(-1.0, 1.0).acos();
-            let t = fillet / (turn / 2.0).tan();
+            // Tangent length of a fillet of radius `fillet` across a corner
+            // deflecting by `turn`: R·tan(turn/2).  (R/tan(turn/2) is only
+            // equal at 90°; on the slanted connectors a real generator emits
+            // it put the leg start 0.07 mm past the elbow's end, leaving the
+            // junction circles of leg and elbow on different circles.)
+            let t = fillet * (turn / 2.0).tan();
             let pin = verts[k] - din.as_vec() * t;
             let pout = verts[k] + dout.as_vec() * t;
             let axis = UnitVec3::try_from_vec(din.as_vec().cross(dout.as_vec())).unwrap();

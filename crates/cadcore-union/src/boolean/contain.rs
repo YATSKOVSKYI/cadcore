@@ -44,6 +44,7 @@ pub fn point_in_solid(brep: &BRep, faces: &[FaceId], p: Point3) -> bool {
     cast_once_unchecked(brep, faces, p, dir)
 }
 
+
 /// One ray cast.  Returns `Some(inside)` if the count was clean, `None` if the
 /// ray grazed a surface or skimmed a face boundary (caller re-casts).
 fn cast_once(brep: &BRep, faces: &[FaceId], p: Point3, dir: UnitVec3) -> Option<bool> {
@@ -251,16 +252,237 @@ pub(crate) fn face_contains_hit(brep: &BRep, fid: FaceId, hit: Point3) -> Member
             let d_in = ax.min(*length - ax);
             inside_outside(d_in)
         }
-        // Trimmed cylinder band (output of a prior union): a periodic band is
-        // NOT a uv polygon — test the axial range recovered from its loops and
-        // exclude any LOCALISED window holes.  (Falling back to point_in_loops
-        // would treat a rim circle as a containing polygon, which is wrong.)
-        (FaceGeom::Cylinder(s), _) => cylinder_band_membership(brep, fid, s, hit),
+        // Trimmed periodic faces (output of a prior union / fuse / cut): the
+        // real loops are exact uv polygons once each is unwrapped CONTINUOUSLY
+        // along its traversal and the query is tested on every branch.  This
+        // also covers a window that the periodic DCEL merged into the OUTER
+        // loop through the seam (a hole that happens to straddle u = 0 is not
+        // an inner loop any more — the span heuristics below would miss it).
+        (FaceGeom::Cylinder(s), _) => periodic_loops_membership(brep, fid, hit)
+            .unwrap_or_else(|| cylinder_band_membership(brep, fid, s, hit)),
         (FaceGeom::Sphere(_), _) => Membership::Inside, // a full sphere face
-        (FaceGeom::Torus(t), _) => torus_patch_membership(brep, fid, t, hit),
+        (FaceGeom::Torus(t), _) => periodic_loops_membership(brep, fid, hit)
+            .unwrap_or_else(|| torus_patch_membership(brep, fid, t, hit)),
         // Trimmed / unknown templates: defer to the explicit loops.
         _ => point_in_loops(brep, fid, hit),
     }
+}
+
+/// Exact membership for a face with real loops on a periodic carrier.
+///
+/// Each loop is sampled into uv and unwrapped continuously (every periodic
+/// coordinate is moved onto the branch nearest the previous vertex), so a
+/// band's outer loop — two rims joined by the two seam traversals — becomes a
+/// plain rectangle spanning one period, and a window split by the seam becomes
+/// one polygon.  The query is tested on the branches `q`, `q ± 2π` (per
+/// periodic axis); exactly one lands inside a one-period polygon.
+///
+/// `None` when the face carries no real loops (template faces).
+fn periodic_loops_membership(brep: &BRep, fid: FaceId, hit: Point3) -> Option<Membership> {
+    use std::f64::consts::TAU;
+    let f = &brep.faces[fid];
+    let dom = FaceUv::from_face(&f.geom);
+    let (per_u, per_v) = match &f.geom {
+        FaceGeom::Cylinder(_) | FaceGeom::Sphere(_) => (true, false),
+        FaceGeom::Torus(_) => (true, true),
+        FaceGeom::Plane(_) => (false, false),
+    };
+    let (qu, qv) = dom.uv(hit);
+    let sample_loop = |lid: cadcore_topo::LoopId| -> Vec<(f64, f64)> {
+        let mut out: Vec<(f64, f64)> = Vec::new();
+        let Some(lp) = brep.loops.get(lid) else { return out };
+        let start = lp.start;
+        if brep.coedges.get(start).is_none() {
+            return out;
+        }
+        let mut c = start;
+        loop {
+            let ce = &brep.coedges[c];
+            let mut sp = super::aabb::sample_edge(brep, ce.edge);
+            if ce.sense == cadcore_topo::CoEdgeSense::Opposite {
+                sp.reverse();
+            }
+            for p3 in sp {
+                let (mut u, mut v) = dom.uv(p3);
+                if let Some(&(pu, pv)) = out.last() {
+                    if per_u {
+                        u -= TAU * ((u - pu) / TAU).round();
+                    }
+                    if per_v {
+                        v -= TAU * ((v - pv) / TAU).round();
+                    }
+                }
+                out.push((u, v));
+            }
+            c = ce.next;
+            if c == start {
+                break;
+            }
+        }
+        out
+    };
+    let branches = |per: bool| -> Vec<f64> {
+        if per {
+            vec![-TAU, 0.0, TAU]
+        } else {
+            vec![0.0]
+        }
+    };
+    let test = |poly: &[(f64, f64)]| -> Membership {
+        let mut inside = false;
+        for du in branches(per_u) {
+            for dv in branches(per_v) {
+                match pip(poly, qu + du, qv + dv) {
+                    Membership::OnBoundary => return Membership::OnBoundary,
+                    Membership::Inside => inside = true,
+                    Membership::Outside => {}
+                }
+            }
+        }
+        if inside {
+            Membership::Inside
+        } else {
+            Membership::Outside
+        }
+    };
+    let outer = sample_loop(f.outer_loop);
+    if outer.len() < 3 {
+        return None;
+    }
+    // A SEAMLESS band: the outer loop is one rim ring wrapping the periodic
+    // axis (unwrapped, its ends differ by a period), the other rim is an inner
+    // loop.  The two rings bound the face between them: close them into ONE
+    // polygon through the (virtual) seam — ring A forward, ring B backward,
+    // shifted onto A's branch — and test that; every remaining loop is a hole.
+    let wraps = |ring: &[(f64, f64)]| -> bool {
+        let (f, l) = (ring[0], ring[ring.len() - 1]);
+        (per_u && (l.0 - f.0).abs() > 1.0) || (per_v && (l.1 - f.1).abs() > 1.0)
+    };
+    if wraps(&outer) {
+        let mut rings: Vec<Vec<(f64, f64)>> = vec![outer.clone()];
+        let mut holes: Vec<Vec<(f64, f64)>> = Vec::new();
+        for &lid in &f.inner_loops {
+            let lp = sample_loop(lid);
+            if lp.len() < 3 {
+                continue;
+            }
+            if wraps(&lp) {
+                rings.push(lp);
+            } else {
+                holes.push(lp);
+            }
+        }
+        if rings.len() != 2 {
+            return None; // not a plain band — span heuristics
+        }
+        // which coordinate wraps
+        let pidx = if per_u && (rings[0][rings[0].len() - 1].0 - rings[0][0].0).abs() > 1.0 { 0 } else { 1 };
+        let get = |p: (f64, f64)| if pidx == 0 { p.0 } else { p.1 };
+        let shift = |p: (f64, f64), d: f64| if pidx == 0 { (p.0 + d, p.1) } else { (p.0, p.1 + d) };
+        let mut a = rings[0].clone();
+        let mut b = rings[1].clone();
+        // The OTHER axis may be periodic too (a torus patch's θ): the two
+        // junction rings must then sit on the same branch, or the polygon spans
+        // the complement of the patch.
+        let other_periodic = if pidx == 0 { per_v } else { per_u };
+        if other_periodic {
+            let mean = |r: &[(f64, f64)]| -> f64 {
+                let s: f64 = r.iter().map(|p| if pidx == 0 { p.1 } else { p.0 }).sum();
+                s / r.len() as f64
+            };
+            let k = ((mean(&a) - mean(&b)) / TAU).round();
+            if k != 0.0 {
+                for p in b.iter_mut() {
+                    if pidx == 0 {
+                        p.1 += k * TAU;
+                    } else {
+                        p.0 += k * TAU;
+                    }
+                }
+            }
+        }
+        // both increasing along the periodic axis
+        if get(a[a.len() - 1]) < get(a[0]) {
+            a.reverse();
+        }
+        if get(b[b.len() - 1]) < get(b[0]) {
+            b.reverse();
+        }
+        // Close the two rings into one polygon through a VIRTUAL seam.  Its
+        // position is free, so put it opposite the query (u* = q + π): the
+        // closing segments then can never pass near the probe and be mistaken
+        // for a real boundary.  Each ring is shifted onto the branch holding
+        // u*, its point AT u* interpolated, and rotated to start there, so both
+        // span exactly [u*, u* + 2π].
+        let qper = if pidx == 0 { qu } else { qv };
+        let u_star = qper + std::f64::consts::PI;
+        let recut = |ring: &[(f64, f64)]| -> Option<Vec<(f64, f64)>> {
+            let n = ring.len();
+            let k = ((u_star - get(ring[0])) / TAU).floor();
+            let r: Vec<(f64, f64)> = ring.iter().map(|&p| shift(p, k * TAU)).collect();
+            let at = |i: usize| -> (f64, f64) {
+                if i < n {
+                    r[i]
+                } else {
+                    shift(r[i - n], TAU)
+                }
+            };
+            let mut si = None;
+            for i in 0..n {
+                let (p, q) = (at(i), at(i + 1));
+                if get(p) <= u_star && u_star < get(q) {
+                    si = Some(i);
+                    break;
+                }
+            }
+            let si = si?;
+            let (p, q) = (at(si), at(si + 1));
+            let t = if (get(q) - get(p)).abs() > 1e-15 { (u_star - get(p)) / (get(q) - get(p)) } else { 0.0 };
+            let ps = (p.0 + (q.0 - p.0) * t, p.1 + (q.1 - p.1) * t);
+            let mut out = vec![ps];
+            for i in (si + 1)..(si + 1 + n) {
+                let x = at(i);
+                if get(x) < u_star + TAU - 1e-12 {
+                    out.push(x);
+                }
+            }
+            out.push(shift(ps, TAU));
+            Some(out)
+        };
+        let (Some(a2), Some(b2)) = (recut(&a), recut(&b)) else { return None };
+        let mut poly = a2;
+        poly.extend(b2.iter().rev().copied());
+        match test(&poly) {
+            Membership::Outside => return Some(Membership::Outside),
+            Membership::OnBoundary => return Some(Membership::OnBoundary),
+            Membership::Inside => {}
+        }
+        for hole in &holes {
+            match test(hole) {
+                Membership::Inside => return Some(Membership::Outside),
+                Membership::OnBoundary => return Some(Membership::OnBoundary),
+                Membership::Outside => {}
+            }
+        }
+        return Some(Membership::Inside);
+    }
+    match test(&outer) {
+        Membership::Outside => return Some(Membership::Outside),
+        Membership::OnBoundary => return Some(Membership::OnBoundary),
+        Membership::Inside => {}
+    }
+    for &lid in &f.inner_loops {
+        let hole = sample_loop(lid);
+        if hole.len() < 3 {
+            continue;
+        }
+        match test(&hole) {
+            Membership::Inside => return Some(Membership::Outside),
+            Membership::OnBoundary => return Some(Membership::OnBoundary),
+            Membership::Outside => {}
+        }
+    }
+    Some(Membership::Inside)
 }
 
 /// Membership for a trimmed cylinder band: axial range from its loops, minus

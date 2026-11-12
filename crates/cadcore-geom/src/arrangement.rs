@@ -448,25 +448,49 @@ fn interior_point_of(outer: &[P], holes: &[Vec<P>]) -> Option<(f64, f64)> {
             && dist_to_polygon(p, outer) > margin
             && holes.iter().all(|h| dist_to_polygon(p, h) > margin)
     };
-    if ok(c) {
-        return Some(c);
-    }
+    let centroid_ok = ok(c);
     let (ymin, ymax) = outer
         .iter()
         .fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
     let (xmin, xmax) = outer
         .iter()
         .fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
-    for fy in [0.5, 0.37, 0.63, 0.21, 0.79] {
+    // Not the first admissible grid point but the one DEEPEST inside: the
+    // caller classifies the whole cell by this single probe, and a probe a
+    // micron from the boundary sits on a trim curve — i.e. ON the surface of
+    // the very body the classification asks about, where "inside?" is noise.
+    // (A notched half-band used to be probed in its thinnest neck and dropped
+    // whole.)
+    let clearance = |p: P| -> f64 {
+        holes
+            .iter()
+            .map(|h| dist_to_polygon(p, h))
+            .fold(dist_to_polygon(p, outer), f64::min)
+    };
+    let mut best: Option<(f64, P)> = None;
+    if centroid_ok {
+        let d = clearance(c);
+        // A centroid comfortably inside is as good as any probe; one that
+        // merely passes the 1e-6 margin (it can land within a chord sagitta of
+        // a trim curve) competes with the grid.
+        if d > 0.05 * (xmax - xmin).min(ymax - ymin) {
+            return Some(c);
+        }
+        best = Some((d, c));
+    }
+    for fy in [0.5, 0.37, 0.63, 0.21, 0.79, 0.08, 0.92] {
         let y = ymin + (ymax - ymin) * fy;
         for fx in 1..40 {
             let x = xmin + (xmax - xmin) * (fx as f64) / 40.0;
             if ok((x, y)) {
-                return Some((x, y));
+                let d = clearance((x, y));
+                if best.map_or(true, |(bd, _)| d > bd) {
+                    best = Some((d, (x, y)));
+                }
             }
         }
     }
-    None
+    best.map(|(_, p)| p)
 }
 
 /// Build an arrangement on a **u-periodic** domain (cylinder θ, torus φ) by
@@ -564,13 +588,22 @@ pub fn build_periodic_u(
             flush(&mut piece);
         }
     }
-    // 3. Seam chains at u=0 and u=period.
+    // 3. Seam chains at u=0 and u=period, spanning at least every chain
+    //    vertex (a boundary vertex a hair past `v_range` must still meet the
+    //    seam, or the ring it belongs to floats free of the rectangle).
+    let (mut vlo, mut vhi) = v_range;
+    for ch in &out {
+        for p in &ch.pts {
+            vlo = vlo.min(p.1);
+            vhi = vhi.max(p.1);
+        }
+    }
     out.push(ChainInput {
-        pts: vec![(0.0, v_range.0), (0.0, v_range.1)],
+        pts: vec![(0.0, vlo), (0.0, vhi)],
         tag: seam_tag,
     });
     out.push(ChainInput {
-        pts: vec![(period, v_range.0), (period, v_range.1)],
+        pts: vec![(period, vlo), (period, vhi)],
         tag: seam_tag,
     });
     Arrangement::build(&out, opt)

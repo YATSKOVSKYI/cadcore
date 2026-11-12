@@ -22,15 +22,17 @@ pub mod contain;
 pub mod halfspace;
 pub mod ssi;
 pub mod union;
+pub mod weld;
 
 #[cfg(test)]
 pub(crate) mod tests_support;
 
 pub use aabb::{candidate_pairs, face_aabb, Aabb};
 pub use contain::point_in_solid;
-pub use halfspace::{half_space_cut, CutOutcome};
+pub use halfspace::{half_space_cut, half_space_cut_robust, CutOutcome, RobustCut, ROBUST_CUT_SHIFTS};
 pub use ssi::{intersect_faces, intersect_faces_with, SsiCurve, SsiOptions};
 pub use union::{union, union_many, union_n};
+pub use weld::{weld_plate, PlateBox, WeldOutcome};
 
 #[cfg(test)]
 mod tests {

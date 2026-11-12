@@ -65,35 +65,29 @@ fn fit_circle(poly: &[Point3]) -> Option<Circle3> {
     if n < 6 {
         return None;
     }
-    // centroid
-    let mut c = cadcore_math::Vec3::new(0.0, 0.0, 0.0);
-    for p in &pts {
-        c = c + (*p - Point3::new(0.0, 0.0, 0.0));
-    }
-    let centre = Point3::new(0.0, 0.0, 0.0) + c * (1.0 / n as f64);
-    // radius mean + variance check
-    let radii: Vec<f64> = pts.iter().map(|p| (*p - centre).length()).collect();
-    let r = radii.iter().sum::<f64>() / n as f64;
-    if r < 1e-9 {
+    // EXACT fit: the circumcircle of three well-separated samples, then every
+    // sample verified against it to machine-level tolerance.  (A centroid /
+    // mean-radius fit is biased by 1e-6 on any non-uniform run — a notched
+    // rim — and the face that resamples the edge from the circle then
+    // disagrees with the face that keeps the vertices by exactly that bias,
+    // which a tight weld rightly refuses to hide.)
+    const FTOL: f64 = 5e-6;
+    let (a, b, c) = (pts[0], pts[n / 3], pts[(2 * n) / 3]);
+    let (centre, axis, r) = circumcircle(a, b, c)?;
+    if !(r.is_finite() && r > 1e-9 && r < 1e6) {
         return None;
     }
-    if radii.iter().any(|d| (d - r).abs() > 1e-3 * r) {
-        return None; // not a constant-radius loop (e.g. a window / miter)
-    }
-    // plane normal via the summed cross products of consecutive spokes
-    let mut nrm = cadcore_math::Vec3::new(0.0, 0.0, 0.0);
-    for i in 0..n {
-        let a = pts[i] - centre;
-        let b = pts[(i + 1) % n] - centre;
-        nrm = nrm + a.cross(b);
-    }
-    let axis = nrm.try_normalize()?;
-    // planarity: every point close to the plane through `centre`
-    if pts.iter().any(|p| axis.dot(*p - centre).abs() > 1e-3 * r) {
+    let ok = pts.iter().all(|&p| {
+        let w = p - centre;
+        let planar = dot3(axis.as_vec(), w).abs();
+        let radial = ((w - axis.as_vec() * dot3(axis.as_vec(), w)).length() - r).abs();
+        planar < FTOL && radial < FTOL
+    });
+    if !ok {
         return None;
     }
     // sign-normalise the axis (largest |component| positive)
-    let (ax, ay, az) = (axis.x, axis.y, axis.z);
+    let (ax, ay, az) = (axis.as_vec().x, axis.as_vec().y, axis.as_vec().z);
     let flip = if ax.abs() >= ay.abs() && ax.abs() >= az.abs() {
         ax < 0.0
     } else if ay.abs() >= az.abs() {
@@ -101,7 +95,7 @@ fn fit_circle(poly: &[Point3]) -> Option<Circle3> {
     } else {
         az < 0.0
     };
-    let axis = if flip { axis * -1.0 } else { axis };
+    let axis = if flip { axis.as_vec() * -1.0 } else { axis.as_vec() };
     Some(Circle3::new(centre, cadcore_math::UnitVec3::try_from_vec(axis)?, r))
 }
 
@@ -580,10 +574,16 @@ impl<'b> Assembler<'b> {
         // emit one shared analytic EDGE_CURVE.  A 2-point arc segment is exact
         // because its circle is known from the parent run, not inferred from the
         // two points.
-        let ftol = (50.0 * self.tol).max(1e-5);
+        // Fit tolerance is GEOMETRIC, independent of the weld tolerance: an
+        // analytic arc/line is recovered only when every sample lies on it to
+        // machine-level precision.  (Tying it to the weld tolerance let the
+        // cut — which welds at 0.5 µm — accept 25 µm "circles" through
+        // transcendental trim curves; the next consumer then resampled those
+        // edges on the wrong curve.)
+        let ftol = 5e-6_f64;
         let order = tag_run_order(steps);
         let mut coedges: Vec<CoEdgeId> = Vec::with_capacity(steps.len());
-        let mut push_coedge = |brep: &mut BRep, coedges: &mut Vec<CoEdgeId>, edge, sense| {
+        let push_coedge = |brep: &mut BRep, coedges: &mut Vec<CoEdgeId>, edge, sense| {
             let ce = brep.add_coedge(CoEdge {
                 edge,
                 sense,
@@ -620,6 +620,41 @@ impl<'b> Assembler<'b> {
                     EdgeShape::Line => RunCurve::Line,
                     EdgeShape::Free => RunCurve::Free,
                 }
+            };
+            // A fitted circle is only trusted when it holds BETWEEN the samples
+            // too.  Three points always lie on a circle, and a short run of a
+            // transcendental trim curve fits one to nanometres at its samples
+            // while the arc between them leaves the surface by 0.1 µm and more
+            // — every consumer that then evaluates the edge (the next cut's
+            // plane crossing, the STEP reader) gets a point off the face.  So
+            // the arc's mid-chord points must lie on this face's carrier; on a
+            // plane (where every circle does) the run must be long enough for
+            // the fit itself to mean something.
+            let rc = match rc {
+                RunCurve::Circle(c) => {
+                    let ok = match domain {
+                        FaceDomain::Plane { .. } => run_pts.len() >= 6,
+                        _ => run_pts.windows(2).all(|w| {
+                            let (t0, mut t1) = (circle_angle(&c, w[0]), circle_angle(&c, w[1]));
+                            let pi = std::f64::consts::PI;
+                            while t1 - t0 > pi {
+                                t1 -= 2.0 * pi;
+                            }
+                            while t1 - t0 < -pi {
+                                t1 += 2.0 * pi;
+                            }
+                            let m = c.point_at(0.5 * (t0 + t1));
+                            let (u, v) = domain.uv(m);
+                            (domain.lift(u, v) - m).length() < ftol
+                        }),
+                    };
+                    if ok {
+                        RunCurve::Circle(c)
+                    } else {
+                        RunCurve::Free
+                    }
+                }
+                other => other,
             };
             for k in seg_lo..seg_hi {
                 let poly3 = &step_poly[order[k]];
@@ -1074,17 +1109,141 @@ impl<'b> Assembler<'b> {
             shell: Default::default(),
             extent: FaceExtent::Trimmed,
         });
-        let outer = self.build_loop(domain, &cell.cell.outer, face);
-        let holes: Vec<LoopId> = cell
-            .cell
-            .holes
-            .iter()
-            .map(|h| self.build_loop(domain, h, face))
-            .collect();
+        // SEAMLESS periodic faces: the DCEL's cell boundary runs along both
+        // copies of the parametric seam (u = 0 and u = period), which lift to
+        // ONE 3-D line traversed twice by the same face — a "slit" receiving
+        // CADs read as a self-intersecting wire.  Dropping the seam steps and
+        // re-chaining what is left turns a wrapped band into its natural STEP
+        // form: one rim ring as the outer bound, the other rim and every
+        // window as inner bounds (the representation the analytic fuse always
+        // shipped).  A window the seam happened to cross comes out as its own
+        // ring too.
+        let mut rings: Vec<Vec<LoopStep>> = seamless_rings(domain, &cell.cell.outer);
+        for h in &cell.cell.holes {
+            rings.extend(seamless_rings(domain, h));
+        }
+        let mut loop_ids: Vec<LoopId> = Vec::with_capacity(rings.len());
+        for ring in &rings {
+            loop_ids.push(self.build_loop(domain, ring, face));
+        }
+        let outer = loop_ids.remove(0);
         self.brep.faces[face].outer_loop = outer;
-        self.brep.faces[face].inner_loops = holes;
+        self.brep.faces[face].inner_loops = loop_ids;
         self.faces.push(face);
         face
+    }
+}
+
+/// Remove the steps lying ON the domain's parametric seam and re-chain the
+/// remaining steps into closed rings (points at `u = 0` and `u = period` are
+/// the same 3-D point and join).  Non-periodic domains and loops without seam
+/// steps come back unchanged, as one ring.
+fn seamless_rings(domain: &FaceDomain, steps: &[LoopStep]) -> Vec<Vec<LoopStep>> {
+    use std::f64::consts::TAU;
+    // periodic coordinate index in the step points, and its period
+    let per: Option<usize> = match domain {
+        FaceDomain::CylinderBand { .. } => Some(0),
+        FaceDomain::TorusPatch { .. } => Some(1),
+        _ => None,
+    };
+    let Some(pi) = per else {
+        return vec![steps.to_vec()];
+    };
+    let coord = |p: (f64, f64)| if pi == 0 { p.0 } else { p.1 };
+    let on_seam = |x: f64| x.abs() < 1e-9 || (x - TAU).abs() < 1e-9;
+    let is_seam_step = |st: &LoopStep| {
+        st.pts.len() >= 2 && st.pts.iter().all(|&p| on_seam(coord(p)))
+    };
+    if !steps.iter().any(is_seam_step) {
+        return vec![steps.to_vec()];
+    }
+    // Only a SLIT is removed: the loop must run the seam on BOTH copies
+    // (u = 0 and u = period) over the same span, i.e. the cell lies on both
+    // sides of the seam.  A cell that merely ends at the seam shares that edge
+    // with the cell across it — a legitimate edge between two faces.
+    let other = |p: (f64, f64)| if pi == 0 { p.1 } else { p.0 };
+    let mut span0: Vec<(f64, f64)> = Vec::new();
+    let mut span1: Vec<(f64, f64)> = Vec::new();
+    for st in steps.iter().filter(|st| is_seam_step(st)) {
+        let (a, b) = (other(st.pts[0]), other(*st.pts.last().unwrap()));
+        let iv = (a.min(b), a.max(b));
+        if coord(st.pts[0]).abs() < 1e-9 {
+            span0.push(iv);
+        } else {
+            span1.push(iv);
+        }
+    }
+    let covered = |mut ivs: Vec<(f64, f64)>| -> Vec<(f64, f64)> {
+        ivs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut out: Vec<(f64, f64)> = Vec::new();
+        for iv in ivs {
+            if let Some(last) = out.last_mut() {
+                if iv.0 <= last.1 + 1e-9 {
+                    last.1 = last.1.max(iv.1);
+                    continue;
+                }
+            }
+            out.push(iv);
+        }
+        out
+    };
+    let (c0, c1) = (covered(span0), covered(span1));
+    let same_cover = c0.len() == c1.len()
+        && c0.iter().zip(c1.iter()).all(|(a, b)| (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6);
+    if !same_cover || c0.is_empty() {
+        return vec![steps.to_vec()];
+    }
+    let keep: Vec<&LoopStep> = steps.iter().filter(|st| !is_seam_step(st)).collect();
+    if keep.is_empty() {
+        return vec![steps.to_vec()];
+    }
+    // equality of two uv points modulo the period on the periodic axis
+    let same = |a: (f64, f64), b: (f64, f64)| {
+        let (pa, pb) = (coord(a), coord(b));
+        let dp = (pa - pb).rem_euclid(TAU);
+        let dp = dp.min(TAU - dp);
+        let (oa, ob) = if pi == 0 { (a.1, b.1) } else { (a.0, b.0) };
+        dp < 1e-9 && (oa - ob).abs() < 1e-9
+    };
+    let n = keep.len();
+    let mut used = vec![false; n];
+    let mut rings: Vec<Vec<LoopStep>> = Vec::new();
+    for start in 0..n {
+        if used[start] {
+            continue;
+        }
+        used[start] = true;
+        let mut ring: Vec<LoopStep> = vec![keep[start].clone()];
+        loop {
+            let tail = *ring.last().unwrap().pts.last().unwrap();
+            let head = ring[0].pts[0];
+            if same(tail, head) && ring.len() > 1 {
+                break;
+            }
+            // the loop order is preserved: the successor is the next unused
+            // step whose start meets our tail — search forward cyclically.
+            let mut found = None;
+            for k in 1..n {
+                let j = (start + k) % n;
+                if !used[j] && same(keep[j].pts[0], tail) {
+                    found = Some(j);
+                    break;
+                }
+            }
+            match found {
+                Some(j) => {
+                    used[j] = true;
+                    ring.push(keep[j].clone());
+                }
+                None => break, // open chain — emit as is, the gate will tell
+            }
+        }
+        rings.push(ring);
+    }
+    if rings.is_empty() {
+        vec![steps.to_vec()]
+    } else {
+        rings
     }
 }
 

@@ -179,14 +179,45 @@ fn torus_theta_range(brep: &BRep, face: FaceId, t: &cadcore_geom::TorusSurf) -> 
 /// Sample an edge's curve into a few world-space points (endpoints + interior
 /// for curved edges).  Shared with the containment loop-fallback path.
 pub(crate) fn sample_edge(brep: &BRep, edge: cadcore_topo::EdgeId) -> Vec<Point3> {
+    let e = &brep.edges[edge];
+    let mut pts = sample_edge_geom(brep, edge);
+    // The VERTICES are the authoritative endpoints: an analytic edge whose
+    // curve was fitted to its samples reproduces them only to the fit
+    // tolerance, and every consumer must see the same endpoint.
+    if let (Some(vs), Some(ve)) = (brep.vertices.get(e.v_start), brep.vertices.get(e.v_end)) {
+        if pts.len() >= 2 {
+            pts[0] = vs.point;
+            let n = pts.len();
+            pts[n - 1] = ve.point;
+        }
+    }
+    pts
+}
+
+fn sample_edge_geom(brep: &BRep, edge: cadcore_topo::EdgeId) -> Vec<Point3> {
     use cadcore_topo::EdgeGeom;
     let e = &brep.edges[edge];
     match &e.geom {
         EdgeGeom::Line(l) => vec![l.point_at(e.t_start), l.point_at(e.t_end)],
-        EdgeGeom::Circle(c) => sample_param(e.t_start, e.t_end, 16, |t| c.point_at(t)),
-        EdgeGeom::Ellipse(el) => sample_param(e.t_start, e.t_end, 16, |t| el.point_at(t)),
+        // Resolution follows the ARC: a full circle gets 16 chords, a short
+        // arc (a fused rim is ~48 arcs of 7.5°) stays one segment, so copying a
+        // fused shell through the assembler reproduces its edges 1:1 instead
+        // of shattering every arc into 16 slivers.
+        EdgeGeom::Circle(c) => {
+            let n = arc_segments(e.t_end - e.t_start);
+            sample_param(e.t_start, e.t_end, n, |t| c.point_at(t))
+        }
+        EdgeGeom::Ellipse(el) => {
+            let n = arc_segments(e.t_end - e.t_start);
+            sample_param(e.t_start, e.t_end, n, |t| el.point_at(t))
+        }
         EdgeGeom::Polyline(pts) => pts.clone(),
     }
+}
+
+/// Chords for an arc of `sweep` radians: 16 per full turn, at least one.
+fn arc_segments(sweep: f64) -> usize {
+    ((sweep.abs() / (std::f64::consts::TAU / 16.0)).ceil() as usize).clamp(1, 16)
 }
 
 fn sample_param(t0: f64, t1: f64, n: usize, f: impl Fn(f64) -> Point3) -> Vec<Point3> {

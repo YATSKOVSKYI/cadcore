@@ -22,7 +22,7 @@ fn fuse_leg_band(
     asm: &mut Assembler,
     leg: CylSurf,
     length: f64,
-    self_tube: &CompositeTube,
+    loops: &[cadcore_union::geom::intersect::TracedCurve],
     other_tube: &CompositeTube,
 ) -> usize {
     let domain = FaceDomain::CylinderBand { surf: leg, length };
@@ -41,7 +41,6 @@ fn fuse_leg_band(
     let mut chains = vec![rim(0.0, 1), rim(length as f64, 2)];
 
     // every crossing loop of this leg with the other tube, projected to uv
-    let loops = closed_loops_between(self_tube, other_tube, &TraceOptions::default());
     for (i, c) in loops.iter().enumerate() {
         let mut w: Vec<(f64, f64)> = c.points.iter().map(|&p| domain.uv(p)).collect();
         w.push(w[0]);
@@ -71,8 +70,14 @@ fn two_crossing_legs_form_watertight_lateral() {
 
     let mut brep = BRep::new();
     let mut asm = Assembler::new(&mut brep, 1e-7);
-    let na = fuse_leg_band(&mut asm, leg_a, 4.0, &a, &b);
-    let nb = fuse_leg_band(&mut asm, leg_b, 4.0, &b, &a);
+    // ONE traced crossing curve, imprinted on BOTH bands: the shared edges
+    // can only weld when the two faces present byte-identical sample points
+    // (tracing per face starts at a different point and samples a different
+    // set — the edges then never share, and only the parametric-seam slit used
+    // to make the "shared" count non-zero).
+    let loops = closed_loops_between(&a, &b, &TraceOptions::default());
+    let na = fuse_leg_band(&mut asm, leg_a, 4.0, &loops, &b);
+    let nb = fuse_leg_band(&mut asm, leg_b, 4.0, &loops, &a);
     let faces = asm.faces().to_vec();
 
     // Each band keeps exactly one cell (the material outside the crosser).
@@ -117,4 +122,8 @@ fn two_crossing_legs_form_watertight_lateral() {
     // the two window holes (one per leg) share their boundary edges
     let shared = uses.values().filter(|&&n| n == 2).count();
     assert!(shared > 0, "the two bands must share the crossing curve");
+    // every window edge is shared, nothing else is (no caps on the bands)
+    let single = uses.values().filter(|&&n| n == 1).count();
+    eprintln!("edges: {shared} shared, {single} single (two open rims)");
+    assert!(shared >= 100, "the whole crossing curve is shared: {shared}");
 }

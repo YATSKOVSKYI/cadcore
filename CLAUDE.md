@@ -112,3 +112,40 @@ referenced by exactly two `ORIENTED_EDGE`s with opposite senses.  Covered by:
 
 Run `cargo test -p cadcore-step` after ANY change to the box/cap/cylinder
 emitters.
+
+## cadcore-union — fuse → cut invariants (0.1.23)
+
+The export order is **universal fuse → `half_space_cut_robust` per trim plane →
+`merge_shell_edges` → plates as separate solids**.  Things that broke it once
+and must not come back:
+
+* **Every wrapped tube face is emitted as TWO half faces** (seam ruling + the
+  ruling half a period away; outer + inner equator on a torus).  A face that
+  wraps its surface makes an OpenCASCADE reader invent a seam and split shared
+  edges on one side only → free edges in FreeCAD.  Both lines need exact shared
+  vertices on every chain they cross (`split_piece_at_seam` with `side = ±1`,
+  `seam_points_at`).
+* **Pcurve branch per FACE, not per edge.**  An edge on the inner equator has
+  φ = ±π; the writer puts each edge on the branch nearest the middle of its
+  face (`torus_phi_ref`).  A 2π jump inside a wire = the reader takes the
+  face's complement (volume off, body still "valid").
+* **`sample_circle_edge` gets endpoints already in co-edge order** — never swap
+  them again for `Opposite`.  Reversed arcs flip the loop's signed area once
+  the merge pass makes them long, and the bound goes out `.F.`.
+* **A merged arc with no analytic pcurve is SAMPLED, not chorded.**
+* **A fitted circle must hold between its samples** (mid-chord points on the
+  face's carrier).  Three points always fit a circle.
+* **Classification probes go to the deepest point of a cell**, not the first
+  admissible one: a probe a chord-sagitta from a trim curve lies ON the other
+  body.
+* **`LINE` references a `VECTOR`**, never a `DIRECTION` (OCC access violation).
+* **End stubs too short for an elbow of radius ≥ 1.05 r are dropped** when
+  filaments are built (`brep::pipeline::build_scaffold_filaments`); otherwise
+  one stub clamps every elbow of the filament into a spindle torus.
+
+Checks that mean something: the STEP-text manifold gate, **and** an external
+read (FreeCAD: closed shell, 0 free edges excluding seams, no face with a
+parameter range wider than π) **and** the volume against the sampled reference
+printed by the `replay_filament_dump` test (`CADCORE_FILAMENTS=<pipeline log>`,
+`CADCORE_CUTS=y:1.0:+,y:5.0:-`).  "isValid" alone passed files whose volume was
+off by 80 %.

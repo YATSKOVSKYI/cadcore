@@ -533,9 +533,9 @@ fn union_torus_on_torus_exports_step() {
         let (clo, tlo) = minor(lo);
         let (chi, thi) = minor(hi);
         let mut asm = Assembler::new(brep, 1e-7);
-        asm.emit_torus_fillet(tor, clo, chi);
-        asm.emit_disk_cap(Plane3::from_origin_normal(clo.frame.origin, UnitVec3::try_from_vec(tlo.as_vec() * -1.0).unwrap()), clo);
-        asm.emit_disk_cap(Plane3::from_origin_normal(chi.frame.origin, thi), chi);
+        asm.emit_torus_fillet(tor, clo, chi, 0, 0);
+        asm.emit_disk_cap(Plane3::from_origin_normal(clo.frame.origin, UnitVec3::try_from_vec(tlo.as_vec() * -1.0).unwrap()), clo, 0);
+        asm.emit_disk_cap(Plane3::from_origin_normal(chi.frame.origin, thi), chi, 0);
         let faces = asm.faces().to_vec();
         let shell = brep.add_shell(Shell { faces: faces.clone(), is_outer: true, solid: Default::default() });
         for &f in &faces { brep.faces[f].shell = shell; }

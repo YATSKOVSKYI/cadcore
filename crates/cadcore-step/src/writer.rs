@@ -40,6 +40,13 @@ struct PcurveCtx {
     /// distinct edge.  `edge_faces` only covers `Trimmed` faces, so it
     /// under-counts junction circles (leg↔elbow) and disk rims (leg↔disk).
     edge_coedges: HashMap<EdgeId, usize>,
+    /// For every trimmed TORUS face that does not wrap its tube: the minor
+    /// angle φ at the middle of the face.  Each edge's pcurve is put on the φ
+    /// branch nearest this value.  Without it an edge lying exactly on the
+    /// inner equator (φ = ±π — the boundary of the two half faces a tube is
+    /// emitted as) takes whichever sign `atan2` rounds to, the wire jumps 2π in
+    /// parameter space, and the reader takes the face for its own complement.
+    torus_phi_ref: HashMap<FaceId, f64>,
     /// Branch-continuous `(u,v)` chains per `(face, polyline edge)`, computed
     /// by walking every wire with a running cursor: each edge's `u` branch is
     /// chained to the previous edge's end (±2π).  Independently-anchored
@@ -620,10 +627,64 @@ impl<'a> StepWriter<'a> {
                     }
                 }
             }
+            // Per torus face: the φ at the middle of the face (see PcurveCtx).
+            let mut torus_phi_ref: HashMap<FaceId, f64> = HashMap::new();
+            for &face_id in &shell.faces {
+                let Some(face) = self.brep.faces.get(face_id) else { continue };
+                if !matches!(face.extent, FaceExtent::Trimmed) {
+                    continue;
+                }
+                let FaceGeom::Torus(t) = &face.geom else { continue };
+                let mut phis: Vec<f64> = Vec::new();
+                for &lp in std::iter::once(&face.outer_loop).chain(face.inner_loops.iter()) {
+                    let Some(coedges) = self.brep.loop_coedges(lp) else { continue };
+                    for ce_id in coedges {
+                        let Some(ce) = self.brep.coedges.get(ce_id) else { continue };
+                        let Some(edge) = self.brep.edges.get(ce.edge) else { continue };
+                        let mut pts: Vec<Point3> = Vec::new();
+                        if let EdgeGeom::Polyline(pl) = &edge.geom {
+                            pts.extend(pl.iter().copied());
+                        }
+                        for v in [edge.v_start, edge.v_end] {
+                            if let Some(vx) = self.brep.vertices.get(v) {
+                                pts.push(vx.point);
+                            }
+                        }
+                        for q in pts {
+                            let l = t.frame.to_local_point(q);
+                            let rho = (l.x * l.x + l.y * l.y).sqrt();
+                            phis.push(l.z.atan2(rho - t.major_radius));
+                        }
+                    }
+                }
+                if phis.len() < 3 {
+                    continue;
+                }
+                // non-wrapping ⇔ the samples leave a clear gap on the φ circle
+                let tau = 2.0 * std::f64::consts::PI;
+                let mut sorted: Vec<f64> = phis.iter().map(|x| x.rem_euclid(tau)).collect();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let (mut gap, mut gap_end) = (0.0_f64, 0.0_f64);
+                for i in 0..sorted.len() {
+                    let (a, b) = (sorted[i], if i + 1 < sorted.len() { sorted[i + 1] } else { sorted[0] + tau });
+                    if b - a > gap {
+                        gap = b - a;
+                        gap_end = b;
+                    }
+                }
+                if gap > 0.5 {
+                    // middle of the occupied arc, which starts at `gap_end`
+                    let mid = gap_end + 0.5 * (tau - gap);
+                    // report it on the principal branch
+                    let mid = (mid + std::f64::consts::PI).rem_euclid(tau) - std::f64::consts::PI;
+                    torus_phi_ref.insert(face_id, mid);
+                }
+            }
             let pc = PcurveCtx {
                 face_surf,
                 edge_faces,
                 edge_coedges,
+                torus_phi_ref,
                 wire_uv,
             };
 
@@ -925,6 +986,14 @@ impl<'a> StepWriter<'a> {
             return (wv > 0.0) == (face_mu < loop_mu);
         }
         let area = signed_area_2d(&uv);
+        if std::env::var("CADCORE_DUMP_STEP").is_ok() && matches!(face.geom, FaceGeom::Torus(_)) {
+            let (ul, uh) = uv.iter().fold((f64::MAX, f64::MIN), |a, q| (a.0.min(q.0), a.1.max(q.0)));
+            let (vl, vh) = uv.iter().fold((f64::MAX, f64::MIN), |a, q| (a.0.min(q.1), a.1.max(q.1)));
+            eprintln!(
+                "[step][torus-loop] {:?} outer={} n={} area={area:.5} wu={wu:.3} wv={wv:.3} θ[{ul:.3}..{uh:.3}] φ[{vl:.3}..{vh:.3}] first=({:.4},{:.4},{:.4})",
+                loop_id, face.outer_loop == loop_id, uv.len(), pts[0].x, pts[0].y, pts[0].z
+            );
+        }
         if area.abs() < 1e-9 {
             return true;
         }
@@ -1133,7 +1202,28 @@ impl<'a> StepWriter<'a> {
                                     let mut uv: Vec<(f64, f64)> =
                                         pts.iter().map(|&p| torus_uv_in_band(t, p, lo, hi)).collect();
                                     unwrap_torus_pcurve(&mut uv);
-                                    let c2d = emit_polyline2d(ctx, &uv)?;
+                                    if let Some(&phi_ref) = pc.torus_phi_ref.get(&f) {
+                                        // whole edge onto the φ branch nearest
+                                        // the middle of the face
+                                        let tau = 2.0 * std::f64::consts::PI;
+                                        let mean = uv.iter().map(|q| q.1).sum::<f64>() / uv.len() as f64;
+                                        let k = ((mean - phi_ref) / tau).round();
+                                        if k != 0.0 {
+                                            for q in uv.iter_mut() {
+                                                q.1 -= k * tau;
+                                            }
+                                        }
+                                    }
+                                    // The pcurve must share the 3-D curve's degree and
+                                    // parameterisation: a degree-1 pcurve under a cubic
+                                    // 3-D curve puts the surface point a chord-sagitta
+                                    // (~1e-4 mm) off the curve between samples — OCC
+                                    // and SolidWorks read that as a curve not on its
+                                    // surface.
+                                    let c2d = match &cubic {
+                                        Some((_, tt, uu)) => crate::interp::emit_cubic_curve2d(ctx, &uv, tt, uu)?,
+                                        None => emit_polyline2d(ctx, &uv)?,
+                                    };
                                     pcurves.push(emit_pcurve(ctx, surf_id, c2d)?);
                                 }
                             } else if let Some((lo, hi)) = self.torus_arc_range(face) {
@@ -1143,7 +1233,10 @@ impl<'a> StepWriter<'a> {
                                 let patch = torus_patch_nurbs(t, lo, hi);
                                 let uv: Vec<(f64, f64)> =
                                     pts.iter().map(|&p| patch.project_point(p)).collect();
-                                let c2d = emit_polyline2d(ctx, &uv)?;
+                                let c2d = match &cubic {
+                                    Some((_, tt, uu)) => crate::interp::emit_cubic_curve2d(ctx, &uv, tt, uu)?,
+                                    None => emit_polyline2d(ctx, &uv)?,
+                                };
                                 pcurves.push(emit_pcurve(ctx, surf_id, c2d)?);
                             }
                         }
@@ -1291,11 +1384,39 @@ impl<'a> StepWriter<'a> {
             })
         });
         if needs_polyline {
-            // Reproduce the pre-analytic output EXACTLY for torus/sphere-adjacent
-            // arcs: emit the segment's own endpoints as a degree-1 edge with the
-            // surface's matching polyline pcurve.  (Re-sampling the arc here would
-            // perturb the shared geometry and reopen the shell.)
-            return self.emit_polyline_edge_pc(ctx, edge_id, &[p_from, p_to], oe_ids, pc);
+            // No analytic pcurve exists for this arc on one of its faces, so it
+            // goes out as a sampled curve with the surface's matching sampled
+            // pcurve.  A single arrangement step (a couple of degrees) is its
+            // own chord; but the edge-merge pass joins those steps into arcs of
+            // up to 0.9π, and the chord of such an arc cuts straight across
+            // the face (a section disc read at a third of its area).  Sample
+            // the arc at the arrangement's own angular step instead — the
+            // edge is shared through the cache by its topological id, so both
+            // faces reference the one curve whatever its sampling.
+            let ang = |q: Point3| -> f64 {
+                let d = q - c.frame.origin;
+                c.frame.y.dot_vec(d).atan2(c.frame.x.dot_vec(d))
+            };
+            let a0 = ang(p_from);
+            let mut d = ang(p_to) - a0;
+            while d > std::f64::consts::PI {
+                d -= 2.0 * std::f64::consts::PI;
+            }
+            while d <= -std::f64::consts::PI {
+                d += 2.0 * std::f64::consts::PI;
+            }
+            const STEP: f64 = 0.065; // ≈ 2π/96, the arrangement's rim sampling
+            let n = ((d.abs() / STEP).ceil() as usize).max(1);
+            if n == 1 {
+                return self.emit_polyline_edge_pc(ctx, edge_id, &[p_from, p_to], oe_ids, pc);
+            }
+            let mut pts: Vec<Point3> = Vec::with_capacity(n + 1);
+            pts.push(p_from);
+            for k in 1..n {
+                pts.push(c.point_at(a0 + d * k as f64 / n as f64));
+            }
+            pts.push(p_to);
+            return self.emit_polyline_edge_pc(ctx, edge_id, &pts, oe_ids, pc);
         }
         let (centre, axis, xref, r) = (c.frame.origin, c.frame.z, c.frame.x, c.radius);
         let v_from = emit_vertex_point(ctx, p_from)?;
@@ -1386,15 +1507,35 @@ impl<'a> StepWriter<'a> {
                             let Some((lo, hi)) = self.torus_arc_range(face) else {
                                 continue;
                             };
-                            let (u0, v0) = torus_uv_in_band(t, c.point_at(0.0), lo, hi);
+                            let (mut u0, mut v0) = torus_uv_in_band(t, c.point_at(0.0), lo, hi);
                             let (u1, v1) = torus_uv_in_band(t, c.point_at(1e-3), lo, hi);
                             let du = unwrap_pi(u1 - u0);
                             let dv = unwrap_pi(v1 - v0);
+                            // The line is evaluated at the CIRCLE's parameter,
+                            // which a reader takes in [0, 2π) from the edge's
+                            // first vertex: put the middle of THIS arc — not
+                            // the circle's arbitrary θ = 0 point — on the
+                            // face's own (θ, φ) branch.
+                            let theta_mid = if dtheta >= 0.0 {
+                                ang(p_from).rem_euclid(two_pi) + 0.5 * dtheta
+                            } else {
+                                ang(p_to).rem_euclid(two_pi) - 0.5 * dtheta
+                            };
+                            let phi_ref = pc.torus_phi_ref.get(&f).copied();
                             if du.abs() >= dv.abs() {
                                 let s = if du >= 0.0 { 1.0 } else { -1.0 };
+                                let u_mid = u0 + s * theta_mid;
+                                u0 -= two_pi * ((u_mid - 0.5 * (lo + hi)) / two_pi).round();
+                                if let Some(pr) = phi_ref {
+                                    v0 -= two_pi * ((v0 - pr) / two_pi).round();
+                                }
                                 emit_line2d(ctx, u0, v0, s, 0.0)?
                             } else {
                                 let s = if dv >= 0.0 { 1.0 } else { -1.0 };
+                                if let Some(pr) = phi_ref {
+                                    let v_mid = v0 + s * theta_mid;
+                                    v0 -= two_pi * ((v_mid - pr) / two_pi).round();
+                                }
                                 emit_line2d(ctx, u0, v0, 0.0, s)?
                             }
                         }
@@ -1603,8 +1744,10 @@ fn emit_face_bounds(ctx: &mut Ctx, face: &cadcore_topo::Face) -> Result<Vec<usiz
                 } else {
                     let lp_id = emit_point(ctx, p_start, "lp")?;
                     let ld_id = emit_unit_direction(ctx, dir, "ld")?;
+                    // STEP `LINE` takes a VECTOR, not a bare DIRECTION (OCC access-violates).
+                    let lv_id = emit_vector(ctx, ld_id, 1.0, "lv")?;
                     let line_id = ctx.next_id();
-                    writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
+                    writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{lv_id});")?;
                     let ec_id = ctx.next_id();
                     writeln!(
                         ctx.out,
@@ -1760,8 +1903,10 @@ fn emit_partial_cylinder_bounds(
         } else {
             let lp_id = emit_point(ctx, p_start, "lp")?;
             let ld_id = emit_unit_direction(ctx, dir, "ld")?;
+            // STEP `LINE` takes a VECTOR, not a bare DIRECTION (OCC access-violates).
+            let lv_id = emit_vector(ctx, ld_id, 1.0, "lv")?;
             let line_id = ctx.next_id();
-            writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
+            writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{lv_id});")?;
             let ec_id = ctx.next_id();
             writeln!(
                 ctx.out,
@@ -1855,8 +2000,10 @@ fn emit_partial_disk_bound(
         } else {
             let lp_id = emit_point(ctx, p_start, "lp")?;
             let ld_id = emit_unit_direction(ctx, dir, "ld")?;
+            // STEP `LINE` takes a VECTOR, not a bare DIRECTION (OCC access-violates).
+            let lv_id = emit_vector(ctx, ld_id, 1.0, "lv")?;
             let line_id = ctx.next_id();
-            writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{ld_id});")?;
+            writeln!(ctx.out, "#{line_id} = LINE('',#{lp_id},#{lv_id});")?;
             let ec_id = ctx.next_id();
             writeln!(
                 ctx.out,
@@ -2624,7 +2771,14 @@ fn sample_circle_edge(
             a1 += 2.0 * std::f64::consts::PI;
         }
     }
-    if matches!(sense, CoEdgeSense::Opposite) {
+    // `p_from → p_to` already IS the co-edge's traversal (the callers resolve
+    // the sense into the endpoints), so an open arc runs a0 → a1 as it stands;
+    // swapping it again listed every `Opposite` arc backwards, and once the
+    // edge-merge pass made such arcs long the loop's signed area changed sign
+    // — a half-torus face went out with its bound flagged `.F.` and readers
+    // took its complement.  Only a CLOSED circle has no endpoints to carry the
+    // direction.
+    if closed && matches!(sense, CoEdgeSense::Opposite) {
         std::mem::swap(&mut a0, &mut a1);
     }
     let n = if closed { 32 } else { 8 };
@@ -2654,7 +2808,14 @@ fn sample_ellipse_edge(
             a1 += 2.0 * std::f64::consts::PI;
         }
     }
-    if matches!(sense, CoEdgeSense::Opposite) {
+    // `p_from → p_to` already IS the co-edge's traversal (the callers resolve
+    // the sense into the endpoints), so an open arc runs a0 → a1 as it stands;
+    // swapping it again listed every `Opposite` arc backwards, and once the
+    // edge-merge pass made such arcs long the loop's signed area changed sign
+    // — a half-torus face went out with its bound flagged `.F.` and readers
+    // took its complement.  Only a CLOSED circle has no endpoints to carry the
+    // direction.
+    if closed && matches!(sense, CoEdgeSense::Opposite) {
         std::mem::swap(&mut a0, &mut a1);
     }
     let n = if closed { 32 } else { 8 };

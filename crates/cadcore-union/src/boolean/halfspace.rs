@@ -33,28 +33,27 @@
 //!             cut plane and emit the cells that carry material
 //! ```
 //!
-//! ## TODO — the seam split point (gate 4)
+//! ## What makes it hold on a real lattice
 //!
-//! The periodic DCEL splits a chain where it crosses the band's seam, placing
-//! that vertex by interpolating uv linearly along the chord.  The point is exact
-//! on the cylinder but up to a chord sagitta off the curve it split, and
-//! [`insert_joints`] must graft it into the partner face's copy of that curve
-//! (or the shell opens), which drags the polyline that far off any OTHER face
-//! the edge bounds.  The shell is manifold and its wires are wound correctly,
-//! but gate 4 (edge-to-surface deviation) reports ~10 µm on those edges, over
-//! SolidWorks' 1 µm knit.
-//!
-//! Substituting the mathematically exact crossing — solved on the source edge's
-//! own curve, which is easy (`(p−o)·y = 0`, `(p−o)·x > 0`) — does NOT fix it:
-//! measured, it re-opens 12 edges, because the DCEL still places its own
-//! interpolated vertex on the arranged side and the two no longer coincide.
-//! The split point therefore has to be made exact **inside the arrangement**
-//! (`cadcore_geom::arrangement::build_periodic_u`), so both sides move together;
-//! patching it downstream cannot work.
+//! * **Joints are computed once per edge.**  Where a boundary edge of a
+//!   straddling face crosses the plane, the crossing is solved as a triple
+//!   point (plane + the carriers of every face on that edge, Newton on the
+//!   tangent planes; exact circle ∩ plane on a rim) and that ONE point is
+//!   grafted into every chain and section curve that passes there.
+//! * **Section curves are clipped run by run.**  A section can only change
+//!   between material and void at a joint, so it is cut into runs between
+//!   joints and each run is classified once, at its middle — never chord by
+//!   chord against a boundary that is itself a chord polygon.
+//! * **Sections are sampled by arc length** and closed exactly at band ends,
+//!   so a plane grazing a tube lengthwise (a 30:1 ellipse) is resolved as
+//!   finely as one slicing it across.
+//! * **Faces that do not wrap are arranged as plain regions** (the two half
+//!   faces the universal fuse emits per tube): no seam, no seam bookkeeping.
+//! * **Near-degenerate planes are perturbed** — see [`half_space_cut_robust`].
 
 use std::collections::HashMap;
 
-use cadcore_geom::Plane3;
+use cadcore_geom::{Circle3, Plane3};
 use cadcore_math::{Point3, UnitVec3};
 use cadcore_topo::{
     BRep, Face, FaceExtent, FaceGeom, FaceId, FaceNormal, Shell, ShellId, Solid,
@@ -64,7 +63,8 @@ use super::aabb::{face_aabb, Aabb};
 use super::contain::{face_contains_hit, point_in_solid, Membership};
 use super::ssi::{intersect_faces_with, SsiCurve, SsiOptions};
 use super::union::{
-    face_boundary_chains, face_domain, snap_ssi_endpoints, unwrap_torus_band_chains,
+    face_boundary_chains, face_domain, face_loop_points, snap_ssi_endpoints,
+    unwrap_torus_band_chains,
 };
 use crate::arrange::assembly::Assembler;
 use crate::arrange::cells::{arrange_and_classify_with, FaceChain};
@@ -81,6 +81,59 @@ pub struct CutOutcome {
     pub caps: usize,
     /// Faces of the input that were dropped whole (entirely on the cut side).
     pub dropped: usize,
+}
+
+/// Outcome of [`half_space_cut_robust`].
+pub struct RobustCut {
+    /// The cut that came out watertight (or, failing every attempt, the one
+    /// with the fewest open edges).
+    pub outcome: CutOutcome,
+    /// How far the plane was moved along its normal to get it (mm; `0.0` when
+    /// the requested plane cut cleanly).  Positive = towards the kept side.
+    pub shift: f64,
+    /// Manifold violations left in `outcome` (`0` = watertight).
+    pub violations: usize,
+}
+
+/// The plane shifts [`half_space_cut_robust`] tries, in order (mm).
+pub const ROBUST_CUT_SHIFTS: [f64; 7] = [0.0, 0.01, -0.01, 0.02, -0.02, 0.04, -0.04];
+
+/// [`half_space_cut`] that escapes NEAR-DEGENERATE plane positions.
+///
+/// A trim plane specified from the part's own dimensions lands, more often
+/// than chance, within microns of a feature of that part: a leg's junction rim
+/// (the plane through the axis of the outermost filament), a filament's end
+/// cap.  Such a feature is never exactly parallel to the plane, so the two
+/// cross at a grazing angle and the exact cut contains a sliver a micron thick
+/// — smaller than the chord error of the boundary it has to be classified
+/// against, useless to a mesher, and unrepresentable at STEP tolerance.
+///
+/// The standard answer is a tolerance-sized perturbation: when the exact plane
+/// does not give a closed shell, the plane is moved along its normal by
+/// ±10, ±20, ±40 µm ([`ROBUST_CUT_SHIFTS`]) and the first watertight result is
+/// returned together with the shift, so the caller can place whatever mates
+/// with the cut face (an electrode plate) on the plane actually used.
+pub fn half_space_cut_robust(src: &BRep, faces: &[FaceId], keep: &Plane3, knit: f64) -> Option<RobustCut> {
+    let n = keep.normal();
+    let mut best: Option<RobustCut> = None;
+    for &shift in ROBUST_CUT_SHIFTS.iter() {
+        let plane = Plane3::from_origin_normal(keep.frame.origin + n.as_vec() * shift, n);
+        // a panic inside one attempt (a degenerate arrangement) is just a
+        // failed attempt
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            half_space_cut(src, faces, &plane, knit)
+        }));
+        let Ok(Some(outcome)) = attempt else { continue };
+        let violations = crate::validate::manifold::check(&outcome.brep, outcome.shell).violations.len();
+        let better = best.as_ref().map_or(true, |b| violations < b.violations);
+        if better {
+            best = Some(RobustCut { outcome, shift, violations });
+        }
+        if violations == 0 {
+            break;
+        }
+    }
+    best
 }
 
 /// Cut the solid bounded by `faces` with `keep`, retaining the material on the
@@ -138,13 +191,68 @@ pub fn half_space_cut(
         },
     });
 
-    // ── 2. Section curves ────────────────────────────────────────────────────
-    // Only faces that actually straddle the plane can contribute; the AABB test
-    // keeps the cut O(faces touching the plane) instead of O(all faces).
+    // ── 2. Classify faces and section the straddling ones ───────────────────
+    // Classification is by the face's SAMPLED geometry (boundary loops plus a
+    // coarse grid on the carrier, so a fillet's belly bulging past its junction
+    // circles is seen) with an ON-plane band of `TAU_ON`: a face that merely
+    // TOUCHES the plane — a leg whose junction circle lies exactly in it, the
+    // everyday case when the trim offset equals edge offset + bend radius — is
+    // kept or dropped WHOLE, never sectioned along its own edge.
+    const TAU_ON: f64 = 1e-6;
+    let mut sides: HashMap<FaceId, Side> = HashMap::new();
+    for &fid in faces {
+        sides.insert(fid, face_side(src, fid, keep, TAU_ON));
+    }
     let mut ssi: Vec<HashMap<FaceId, Vec<SsiCurve>>> = vec![HashMap::new()];
     let mut dropped = 0usize;
+    // edge → the faces using it (real-loop faces only).
+    let mut edge_faces: HashMap<cadcore_topo::EdgeId, Vec<FaceId>> = HashMap::new();
     for &fid in faces {
-        let bb = face_aabb(src, fid);
+        if !has_real_loops(src, fid) {
+            continue;
+        }
+        let f = &src.faces[fid];
+        let mut ls = vec![f.outer_loop];
+        ls.extend(f.inner_loops.iter().copied());
+        for lid in ls {
+            let Some(lp) = src.loops.get(lid) else { continue };
+            let st = lp.start;
+            if src.coedges.get(st).is_none() {
+                continue;
+            }
+            let mut c = st;
+            loop {
+                edge_faces.entry(src.coedges[c].edge).or_default().push(fid);
+                c = src.coedges[c].next;
+                if c == st {
+                    break;
+                }
+            }
+        }
+    }
+    let carrier = |fid: FaceId| -> Option<crate::geom::refine::AnalyticSurface> {
+        use crate::geom::refine::AnalyticSurface;
+        match &src.faces[fid].geom {
+            FaceGeom::Plane(p) => Some(AnalyticSurface::Plane(*p)),
+            FaceGeom::Cylinder(c) => Some(AnalyticSurface::Cylinder(*c)),
+            FaceGeom::Torus(t) => Some(AnalyticSurface::Torus(*t)),
+            FaceGeom::Sphere(_) => None,
+        }
+    };
+    // Boundary vertices of straddling faces that lie IN the plane, and the
+    // points where their boundary edges CROSS it: the section curve must pass
+    // through them exactly (they are where a fused neighbour's edge meets the
+    // plane — a triple point every consumer has to share).  A crossing is
+    // computed ONCE PER EDGE, from the plane and the carriers of every face
+    // using the edge in a canonical order, so the two faces sharing the edge
+    // (and the cap) get the identical point: computed per face, the surface
+    // order differed and an ill-conditioned triple point (a leg's rim, where
+    // the elbow torus is TANGENT to the leg) came out 1e-5 apart.  On a rim
+    // edge carrying analytic circle geometry the exact circle ∩ plane point
+    // is used outright.
+    let mut plane_joints: Vec<Point3> = Vec::new();
+    for &fid in faces {
+        let side = sides[&fid];
         if std::env::var("CADCORE_DUMP_CUT").is_ok() {
             let kind = match &src.faces[fid].geom {
                 FaceGeom::Plane(_) => "plane",
@@ -152,34 +260,239 @@ pub fn half_space_cut(
                 FaceGeom::Torus(_) => "torus",
                 FaceGeom::Sphere(_) => "sphere",
             };
-            let side = match straddle(&bb, keep, knit.max(1e-9)) {
-                Side::Kept => "kept",
-                Side::Cut => "cut",
-                Side::Straddles => "STRADDLES",
-            };
+            let bb = face_aabb(src, fid);
             eprintln!(
-                "[cut][bp] {fid:?} {kind} {side} bb y[{:.3}..{:.3}]",
-                bb.min.y, bb.max.y
+                "[cut][bp] {fid:?} {kind} {} bb y[{:.3}..{:.3}]",
+                match side {
+                    Side::Kept => "kept",
+                    Side::Cut => "cut",
+                    Side::Straddles => "STRADDLES",
+                },
+                bb.min.y,
+                bb.max.y
             );
         }
-        match straddle(&bb, keep, knit.max(1e-9)) {
+        match side {
             Side::Kept => {}
             Side::Cut => dropped += 1,
             Side::Straddles => {
                 let curves = intersect_faces_with(src, fid, &cut_brep, cut_face, SsiOptions::all());
                 if std::env::var("CADCORE_DUMP_CUT").is_ok() {
-                    let kind = match &src.faces[fid].geom {
-                        FaceGeom::Plane(_) => "plane",
-                        FaceGeom::Cylinder(_) => "cyl",
-                        FaceGeom::Torus(_) => "torus",
-                        FaceGeom::Sphere(_) => "sphere",
-                    };
-                    eprintln!("[cut][ssi] {fid:?} {kind} straddles → {} curves", curves.len());
+                    eprintln!("[cut][ssi] {fid:?} straddles → {} curves", curves.len());
                 }
                 if !curves.is_empty() {
                     ssi[0].insert(fid, curves);
                 }
             }
+        }
+    }
+    let mut edges_done: std::collections::HashSet<cadcore_topo::EdgeId> =
+        std::collections::HashSet::new();
+    for &fid in faces {
+        if sides[&fid] != Side::Straddles || !has_real_loops(src, fid) {
+            continue;
+        }
+        for (eid, pts) in face_edge_polylines(src, fid) {
+            if !edges_done.insert(eid) {
+                continue;
+            }
+            let mut users: Vec<FaceId> = edge_faces.get(&eid).cloned().unwrap_or_default();
+            if !users.contains(&fid) {
+                users.push(fid);
+            }
+            users.sort();
+            users.dedup();
+            let mut onto: Vec<crate::geom::refine::AnalyticSurface> =
+                vec![crate::geom::refine::AnalyticSurface::Plane(*keep)];
+            for &u in &users {
+                if let Some(sf) = carrier(u) {
+                    onto.push(sf);
+                }
+            }
+            let circle = match &src.edges[eid].geom {
+                cadcore_topo::EdgeGeom::Circle(c) => Some(*c),
+                _ => None,
+            };
+            let push = |p: Point3, plane_joints: &mut Vec<Point3>| {
+                if !plane_joints.iter().any(|&q| (q - p).length() < 1e-9) {
+                    plane_joints.push(p);
+                }
+            };
+            for w in pts.windows(2) {
+                let (da, db) = (keep.signed_distance(w[0]), keep.signed_distance(w[1]));
+                if da.abs() <= TAU_ON {
+                    push(w[0], &mut plane_joints);
+                } else if (da > 0.0) != (db > 0.0) && db.abs() > TAU_ON {
+                    let approx = w[0].lerp(w[1], da / (da - db));
+                    let exact_circle = circle.and_then(|c| {
+                        circle_plane_points(&c, keep).map(|(q1, q2)| {
+                            if (q1 - approx).length() <= (q2 - approx).length() {
+                                q1
+                            } else {
+                                q2
+                            }
+                        })
+                    });
+                    let p = match exact_circle {
+                        Some(q) if (q - approx).length() < 0.05 => q,
+                        _ => {
+                            let (exact, res) = crate::geom::refine::refine_triple_point(
+                                approx, &onto, 1e-13, 50,
+                            );
+                            // accept only a genuine triple point; otherwise
+                            // the chord crossing is the best shared estimate
+                            let ok = res < 1e-9 && (exact - approx).length() < 0.05;
+                            if std::env::var("CADCORE_DUMP_CUT").is_ok() && !ok {
+                                eprintln!(
+                                    "[cut][joint-unrefined] {fid:?} edge {eid:?} approx ({:.6},{:.6},{:.6}) res={res:.2e} moved={:.2e} onto={} surfaces",
+                                    approx.x, approx.y, approx.z, (exact - approx).length(), onto.len()
+                                );
+                            }
+                            if ok { exact } else { approx }
+                        }
+                    };
+                    if std::env::var("CADCORE_DUMP_SEAM").is_ok() {
+                        let ds: Vec<String> = onto.iter().map(|sf| format!("{:.1e}", sf.distance(p))).collect();
+                        eprintln!(
+                            "[cut][jointsrc] ({:.6},{:.6},{:.6}) edge {eid:?} circle={} users={users:?} dist={ds:?} approx-moved={:.2e} seg ({:.6},{:.6},{:.6})->({:.6},{:.6},{:.6})",
+                            p.x, p.y, p.z, circle.is_some(), (p - approx).length(), w[0].x, w[0].y, w[0].z, w[1].x, w[1].y, w[1].z
+                        );
+                    }
+                    push(p, &mut plane_joints);
+                }
+            }
+            if let Some(&last) = pts.last() {
+                if keep.signed_distance(last).abs() <= TAU_ON {
+                    push(last, &mut plane_joints);
+                }
+            }
+        }
+    }
+    if std::env::var("CADCORE_DUMP_CUT").is_ok() {
+        for j in &plane_joints {
+            eprintln!("[cut][joint] ({:.6},{:.6},{:.6})", j.x, j.y, j.z);
+        }
+    }
+    // Graft the in-plane vertices into every section curve that passes through
+    // them, so the arranged face, the cap and the copied neighbour all split
+    // there identically.
+    if !plane_joints.is_empty() {
+        for curves in ssi[0].values_mut() {
+            for c in curves.iter_mut() {
+                if c.closed && c.points.len() >= 3 {
+                    let first = c.points[0];
+                    c.points.push(first);
+                    insert_joints(&mut c.points, &plane_joints);
+                    c.points.pop();
+                } else {
+                    insert_joints(&mut c.points, &plane_joints);
+                }
+            }
+        }
+    }
+    // Clip every section curve to its face's TRIMMED region.  The SSI knows
+    // only the carrier band; on a fused shell the face may have a notch or a
+    // window exactly where the plane passes (a neighbouring tube welded in), and
+    // the piece of section running through that void is not on the solid's
+    // boundary — the lateral DCEL drops it, so the cap must never see it either
+    // (it would tile the neighbour's section twice).
+    //
+    // The curve can only change between material and void where a boundary
+    // edge of the face crosses the plane — and every such crossing is a joint
+    // grafted into the curve above.  So the curve is cut into RUNS between
+    // consecutive joints and each run is classified ONCE, at its middle: a
+    // per-chord test would ask the membership oracle (a chord polygon of the
+    // boundary, a sagitta off the true curve) about points a fraction of a
+    // sample from the boundary, where it is wrong as often as right — and a
+    // run then starts one chord early, on a vertex no other face has.
+    for (fid, curves) in ssi[0].iter_mut() {
+        let mut clipped: Vec<SsiCurve> = Vec::new();
+        for c in curves.drain(..) {
+            let n = c.points.len();
+            if n < 2 {
+                continue;
+            }
+            let is_joint =
+                |p: Point3| plane_joints.iter().any(|&j| (j - p).length() < 1e-9);
+            let jidx: Vec<usize> = (0..n).filter(|&i| is_joint(c.points[i])).collect();
+            let material = |run: &[Point3]| -> bool {
+                // probe at half the arc length — as far from both ends as the
+                // run allows
+                let total: f64 = run.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+                let mut acc = 0.0;
+                let mut probe = run[0].lerp(run[run.len() - 1], 0.5);
+                for w in run.windows(2) {
+                    let l = (w[1] - w[0]).length();
+                    if acc + l >= 0.5 * total {
+                        let t = if l > 0.0 { (0.5 * total - acc) / l } else { 0.5 };
+                        probe = w[0].lerp(w[1], t);
+                        break;
+                    }
+                    acc += l;
+                }
+                !matches!(face_contains_hit(src, *fid, probe), Membership::Outside)
+            };
+            let mut runs: Vec<(Vec<Point3>, bool)> = Vec::new(); // (points, closed)
+            if c.closed {
+                if jidx.is_empty() {
+                    runs.push((c.points.clone(), true));
+                } else {
+                    for k in 0..jidx.len() {
+                        let (i0, i1) = (jidx[k], jidx[(k + 1) % jidx.len()]);
+                        let mut run = vec![c.points[i0]];
+                        let mut i = i0;
+                        loop {
+                            i = (i + 1) % n;
+                            run.push(c.points[i]);
+                            if i == i1 {
+                                break;
+                            }
+                        }
+                        runs.push((run, false));
+                    }
+                }
+            } else {
+                let mut bounds: Vec<usize> = vec![0];
+                bounds.extend(jidx.iter().copied().filter(|&i| i != 0 && i != n - 1));
+                bounds.push(n - 1);
+                for w in bounds.windows(2) {
+                    runs.push((c.points[w[0]..=w[1]].to_vec(), false));
+                }
+            }
+            for (run, closed) in runs {
+                if run.len() < 2 {
+                    continue;
+                }
+                let keep_run = material(&run);
+                if std::env::var("CADCORE_DUMP_CUT").is_ok() && !keep_run {
+                    let (a, b) = (run[0], run[run.len() - 1]);
+                    eprintln!(
+                        "[cut][clip] {fid:?} run ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4}) n={} VOID",
+                        a.x, a.y, a.z, b.x, b.y, b.z, run.len()
+                    );
+                }
+                if keep_run {
+                    clipped.push(SsiCurve { points: run, closed });
+                }
+            }
+        }
+        *curves = clipped;
+    }
+    ssi[0].retain(|_, v| !v.is_empty());
+    // Edges of KEPT faces lying in the plane whose other face is DROPPED: the
+    // plane passes exactly along a junction, and that junction circle IS the
+    // section there.  The cap is built from the very same sampled points the
+    // copied face emits, so they weld.
+    let mut rim_curves: Vec<Vec<Point3>> = Vec::new();
+    for (eid, users) in &edge_faces {
+        let kept = users.iter().any(|f| sides[f] == Side::Kept);
+        let cut = users.iter().any(|f| sides[f] == Side::Cut) || users.len() < 2;
+        if !(kept && cut) {
+            continue;
+        }
+        let pts = super::aabb::sample_edge(src, *eid);
+        if pts.len() >= 2 && pts.iter().all(|p| keep.signed_distance(*p).abs() <= TAU_ON) {
+            rim_curves.push(pts);
         }
     }
     // Where a section crosses a welded junction (a leg's rim circle onto its
@@ -193,13 +506,21 @@ pub fn half_space_cut(
 
     // ── 3. Trim every face ───────────────────────────────────────────────────
     let mut out = BRep::new();
-    let weld = knit.clamp(5e-4, 1e-2);
+    // Weld tolerance = the knit tolerance, floored at 1 nm.  A fused input
+    // built by the universal fuse presents shared points exact to ~1e-12, and
+    // a coarse weld (the 0.5 µm the hole-imprint fuse needed) would drag rim
+    // vertices off their circles — the arcs then no longer fit and are written
+    // as B-splines.
+    // Two faces present a shared point through different fitted curves
+    // (each exact to the assembler's fit tolerance), so the weld floor sits a
+    // little above twice that — still three orders below any feature.
+    let weld = knit.clamp(1e-5, 1e-2);
     let mut asm = Assembler::new(&mut out, weld);
-    emit_cut_faces(src, faces, &ssi[0], keep, &mut asm);
+    emit_cut_faces(src, faces, &mut ssi[0], &sides, &plane_joints, keep, &mut asm);
 
     // ── 4. Section caps ──────────────────────────────────────────────────────
     let lateral = asm.faces().len();
-    let loops = section_loops(&ssi[0], weld);
+    let loops = section_loops(&ssi[0], &rim_curves, weld);
     let caps = emit_section_caps(src, faces, &cut_plane, n, half, &loops, &mut asm);
 
     let out_faces = asm.faces().to_vec();
@@ -241,6 +562,88 @@ pub fn half_space_cut(
         for (k, n) in per_face.iter().take(12) {
             eprintln!("[cut]   {n:>4} × {k}");
         }
+        // Every open edge with its endpoints and geometry kind, so the
+        // arranged↔copied disagreement can be located in space.
+        let mut uses: HashMap<cadcore_topo::EdgeId, Vec<FaceId>> = HashMap::new();
+        for &fid in &out_faces {
+            let f = &out.faces[fid];
+            let mut ls = vec![f.outer_loop];
+            ls.extend(f.inner_loops.iter().copied());
+            for lid in ls {
+                let Some(lp) = out.loops.get(lid) else { continue };
+                let st = lp.start;
+                if out.coedges.get(st).is_none() {
+                    continue;
+                }
+                let mut c = st;
+                loop {
+                    let ce = &out.coedges[c];
+                    uses.entry(ce.edge).or_default().push(fid);
+                    c = ce.next;
+                    if c == st {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut open: Vec<_> = uses.iter().filter(|(_, u)| u.len() != 2).collect();
+        open.sort_by_key(|(e, _)| format!("{e:?}"));
+        // nearest foreign open-edge vertex to each open edge's start: how far
+        // apart the two sides' versions of a shared point really are.
+        {
+            let verts: Vec<(FaceId, Point3)> = open
+                .iter()
+                .flat_map(|(eid, fs)| {
+                    let e = &out.edges[**eid];
+                    let f = fs[0];
+                    [(f, out.vertices[e.v_start].point), (f, out.vertices[e.v_end].point)]
+                })
+                .collect();
+            let mut shown = 0;
+            for (eid, fs) in &open {
+                let e = &out.edges[**eid];
+                let a = out.vertices[e.v_start].point;
+                let best = verts
+                    .iter()
+                    .filter(|(f, _)| *f != fs[0])
+                    .map(|(_, q)| (*q - a).length())
+                    .fold(f64::MAX, f64::min);
+                if shown < 6 {
+                    eprintln!("[cut][open-gap] {eid:?} start ({:.6},{:.6},{:.6}) nearest foreign vertex {best:.3e}", a.x, a.y, a.z);
+                    shown += 1;
+                }
+            }
+        }
+        for (eid, fs) in open {
+            let e = &out.edges[*eid];
+            let a = out.vertices[e.v_start].point;
+            let b = out.vertices[e.v_end].point;
+            let kind = match &e.geom {
+                cadcore_topo::EdgeGeom::Line(_) => "line",
+                cadcore_topo::EdgeGeom::Circle(_) => "circle",
+                cadcore_topo::EdgeGeom::Polyline(_) => "poly",
+                _ => "other",
+            };
+            let kinds: Vec<String> = fs
+                .iter()
+                .map(|f| {
+                    let g = match &out.faces[*f].geom {
+                        FaceGeom::Plane(_) => "pl",
+                        FaceGeom::Cylinder(_) => "cyl",
+                        FaceGeom::Torus(_) => "tor",
+                        FaceGeom::Sphere(_) => "sph",
+                    };
+                    format!("{f:?}/{g}")
+                })
+                .collect();
+            eprintln!(
+                "[cut][open] {kind} ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4}) len={:.2e} used {} by {:?}",
+                a.x, a.y, a.z, b.x, b.y, b.z,
+                (b - a).length(),
+                fs.len(),
+                kinds
+            );
+        }
     }
 
     Some(CutOutcome {
@@ -266,13 +669,20 @@ pub fn half_space_cut(
 fn emit_cut_faces(
     src: &BRep,
     faces: &[FaceId],
-    ssi: &HashMap<FaceId, Vec<SsiCurve>>,
+    ssi: &mut HashMap<FaceId, Vec<SsiCurve>>,
+    sides: &HashMap<FaceId, Side>,
+    plane_joints: &[Point3],
     keep: &Plane3,
     asm: &mut Assembler,
 ) {
     // Where a section arc lands on a boundary curve, that curve must be split —
     // on BOTH the arranged face and the copied one across the same window.
     let mut joints = section_joints(ssi);
+    for &p in plane_joints {
+        if !joints.iter().any(|&q| (q - p).length() < 1e-9) {
+            joints.push(p);
+        }
+    }
 
     // Pass 1: settle each arranged face's seam and publish where it crosses the
     // face's boundary.  The seam is invisible to the face on the other side of
@@ -289,15 +699,56 @@ fn emit_cut_faces(
             continue; // only a periodic band has a seam to park
         }
         let mut chains = arranged_chains(src, fid, &domain, ssi, &joints);
+        // A face that does not wrap its cylinder (one half of a band the fuse
+        // split along two rulings) is arranged as a plain region: it has no
+        // seam to park and nothing to publish.
+        if crate::arrange::cells::is_non_wrapping(&domain, &chains) {
+            continue;
+        }
         // No usable gap ⇒ keep the default seam (rotation 0) — but STILL publish
         // where it cuts, or the copied partner keeps that edge whole.
         let rot = seam_rotation(&domain, &chains).unwrap_or(0.0);
         let seamed = apply_seam_rotation(&domain, &mut chains, rot);
         seams.insert(fid, rot);
+        if std::env::var("CADCORE_DUMP_SEAM").is_ok() {
+            eprintln!("[cut][seam] {fid:?} rot={rot:.6}");
+        }
         for p in seam_crossings(&seamed, &chains) {
+            // The crossing is exact on THIS face's carrier only; the chain it
+            // split is an edge shared with a neighbour on another carrier, and
+            // the neighbour will lift the same vertex onto ITS surface.  Slide
+            // the point along the seam ruling line onto the neighbour's carrier
+            // as well, so both lifts coincide.
+            let p0 = p;
+            let p = refine_seam_point_onto_partner(src, faces, fid, &seamed, p);
+            if std::env::var("CADCORE_DUMP_SEAM").is_ok() {
+                eprintln!(
+                    "[cut][seam]   crossing ({:.6},{:.6},{:.6}) → ({:.6},{:.6},{:.6})",
+                    p0.x, p0.y, p0.z, p.x, p.y, p.z
+                );
+            }
             if !joints.iter().any(|&q| (q - p).length() < 1e-9) {
                 joints.push(p);
             }
+        }
+        // A SECTION curve the seam crosses is split by the DCEL at an
+        // interpolated point the cap (which consumes the same curve) would never
+        // see.  Put the EXACT point — the seam ruling line ∩ the cut plane, on
+        // both surfaces to machine precision — into the curve itself, so the
+        // lateral face and the cap partition it identically.
+        if let Some(curves) = ssi.get_mut(&fid) {
+            split_sections_at_seam(curves, &seamed, keep);
+        }
+    }
+    // Torus patches are arranged with their φ = 0 (outer equator) seam; a
+    // section crossing it needs the same treatment.
+    for &fid in faces {
+        let Some(domain) = face_domain(src, fid) else { continue };
+        if !matches!(domain, FaceDomain::TorusPatch { .. }) {
+            continue;
+        }
+        if let Some(curves) = ssi.get_mut(&fid) {
+            split_sections_at_seam(curves, &domain, keep);
         }
     }
 
@@ -315,9 +766,13 @@ fn emit_cut_faces(
         // would present the whole rim against the neighbour's trimmed half —
         // one user each, i.e. an open shell.  Arranging it costs nothing extra
         // and lets the keep predicate trim it.
+        let side = sides.get(&fid).copied().unwrap_or(Side::Straddles);
+        if side == Side::Cut {
+            continue; // wholly behind the plane
+        }
         if !ssi.contains_key(&fid) && has_real_loops(src, fid) {
-            match straddle(&face_aabb(src, fid), keep, 1e-9) {
-                Side::Cut => continue, // wholly behind the plane
+            match side {
+                Side::Cut => continue,
                 Side::Kept => {
                     asm.emit_face_copy(src, fid, &joints);
                     continue;
@@ -347,13 +802,133 @@ fn emit_cut_faces(
             Some(&rot) => apply_seam_rotation(&domain, &mut chains, rot),
             None => domain,
         };
+        // A closed chain must not START on the seam: `build_periodic_u`
+        // unwraps every chain from its first sample, and a first sample sitting
+        // exactly on u = 0 leaves the branch of the whole ring ambiguous.
+        // Rotate the start to the sample farthest from the seam.
+        if matches!(domain, FaceDomain::CylinderBand { .. }) {
+            for ch in chains.iter_mut() {
+                let n = ch.pts.len();
+                if n < 4 {
+                    continue;
+                }
+                let (a, b) = (ch.pts[0], ch.pts[n - 1]);
+                let closed = (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+                if !closed || a.0.abs() > 1e-6 {
+                    continue;
+                }
+                let k = (0..n - 1)
+                    .max_by(|&i, &j| ch.pts[i].0.abs().partial_cmp(&ch.pts[j].0.abs()).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or(0);
+                let mut rotated: Vec<(f64, f64)> = Vec::with_capacity(n);
+                for i in 0..n - 1 {
+                    rotated.push(ch.pts[(k + i) % (n - 1)]);
+                }
+                rotated.push(rotated[0]);
+                ch.pts = rotated;
+            }
+        }
         unwrap_torus_band_chains(&domain, &mut chains);
 
+        if std::env::var("CADCORE_DUMP_CHAINS").is_ok() {
+            for ch in &chains {
+                let a = domain.lift(ch.pts[0].0, ch.pts[0].1);
+                let b = domain.lift(ch.pts[ch.pts.len() - 1].0, ch.pts[ch.pts.len() - 1].1);
+                let us: Vec<f64> = ch.pts.iter().map(|p| p.0).collect();
+                let (ulo, uhi) = us.iter().fold((f64::MAX, f64::MIN), |(l, h), &u| (l.min(u), h.max(u)));
+                eprintln!(
+                    "[cut][chain] {fid:?} tag={} n={} u[{ulo:.3}..{uhi:.3}] ({:.4},{:.4},{:.4})..({:.4},{:.4},{:.4})",
+                    ch.tag, ch.pts.len(), a.x, a.y, a.z, b.x, b.y, b.z
+                );
+                if ch.tag < 1000 {
+                    for w in ch.pts.windows(2) {
+                        let p = domain.lift(w[0].0, w[0].1);
+                        let q = domain.lift(w[1].0, w[1].1);
+                        if (q - p).length() > 0.3 {
+                            eprintln!("[cut][chain]   long step ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4}) len={:.3}", p.x, p.y, p.z, q.x, q.y, q.z, (q - p).length());
+                        }
+                    }
+                }
+            }
+        }
+        if std::env::var("CADCORE_DUMP_CUT").is_ok() {
+            for ch in &chains {
+                let (ulo, uhi) = ch.pts.iter().fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+                let (vlo, vhi) = ch.pts.iter().fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
+                let closed = ch.pts.len() >= 2 && {
+                    let (a, b) = (ch.pts[0], *ch.pts.last().unwrap());
+                    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
+                };
+                eprintln!(
+                    "[cut][chain] {fid:?} tag={} n={} closed={closed} u[{ulo:.3}..{uhi:.3}] v[{vlo:.3}..{vhi:.3}] first=({:.3},{:.3}) last=({:.3},{:.3})",
+                    ch.tag, ch.pts.len(), ch.pts[0].0, ch.pts[0].1, ch.pts.last().unwrap().0, ch.pts.last().unwrap().1
+                );
+                if std::env::var("CADCORE_DUMP_CHAINS_FULL").is_ok() {
+                    let body: Vec<String> = ch.pts.iter().map(|p| format!("({:.9},{:.9})", p.0, p.1)).collect();
+                    eprintln!("[cut][chainpts] {fid:?} {} {}", ch.tag, body.join(","));
+                }
+            }
+        }
+        if std::env::var("CADCORE_DUMP_CUT").is_ok() {
+            // every SSI endpoint must sit ON a boundary chain (a joint), or it
+            // dangles in the DCEL and the face is never split there
+            let bnd: Vec<&FaceChain> = chains.iter().filter(|c| c.tag < 1000).collect();
+            for ch in chains.iter().filter(|c| c.tag >= 1000) {
+                let n = ch.pts.len();
+                let closed = n >= 2 && {
+                    let (a, b) = (ch.pts[0], ch.pts[n - 1]);
+                    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
+                };
+                if closed {
+                    continue;
+                }
+                for &e in &[ch.pts[0], ch.pts[n - 1]] {
+                    let pe = domain.lift(e.0, e.1);
+                    let mut best = f64::MAX;
+                    let mut best_exact = f64::MAX;
+                    for b in &bnd {
+                        for p in &b.pts {
+                            let d = (domain.lift(p.0, p.1) - pe).length();
+                            best_exact = best_exact.min(d);
+                        }
+                        for w in b.pts.windows(2) {
+                            let (a, c) = (domain.lift(w[0].0, w[0].1), domain.lift(w[1].0, w[1].1));
+                            let ab = c - a;
+                            let t = ((pe - a).dot(ab) / ab.dot(ab)).clamp(0.0, 1.0);
+                            best = best.min((a + ab * t - pe).length());
+                        }
+                    }
+                    if best_exact > 1e-6 {
+                        eprintln!(
+                            "[cut][dangle] {fid:?} ssi tag={} end ({:.4},{:.4},{:.4}) nearest bnd vertex {best_exact:.2e} nearest bnd segment {best:.2e}",
+                            ch.tag, pe.x, pe.y, pe.z
+                        );
+                    }
+                }
+            }
+        }
+        if std::env::var("CADCORE_DUMP_SEAM").is_ok() {
+            for ch in &chains {
+                for (i, p) in ch.pts.iter().enumerate() {
+                    let q = domain.lift(p.0, p.1);
+                    for j in &joints {
+                        let d = (q - *j).length();
+                        if d < 0.012 {
+                            eprintln!(
+                                "[cut][nearjoint] {fid:?} tag={} #{i} ({:.6},{:.6},{:.6}) d={d:.2e} to joint ({:.4},{:.4},{:.4})",
+                                ch.tag, q.x, q.y, q.z, j.x, j.y, j.z
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let cells = arrange_and_classify_with(&domain, &chains, 1e-3, &drop);
         let mut emitted = 0usize;
+        let mut out_ids: Vec<cadcore_topo::FaceId> = Vec::new();
         for cell in &cells {
             if cell.keep {
-                asm.emit_cell(&domain, f.geom.clone(), f.normal, cell);
+                out_ids.push(asm.emit_cell(&domain, f.geom.clone(), f.normal, cell));
                 emitted += 1;
             }
         }
@@ -365,7 +940,7 @@ fn emit_cut_faces(
                 FaceGeom::Sphere(_) => "sphere",
             };
             eprintln!(
-                "cut face {fid:?} {kind}: bnd={} ssi={} cells={} emitted={} areas={:?}",
+                "cut face {fid:?} {kind}: bnd={} ssi={} cells={} emitted={} → {out_ids:?} areas={:?}",
                 chains.len() - (stag - 1000) as usize,
                 stag - 1000,
                 cells.len(),
@@ -413,19 +988,6 @@ fn arranged_chains(
     chains
 }
 
-/// Rotate a cylinder band's parameter frame so the u = ±π seam falls in the
-/// widest gap between chain points, and shift the chains onto the new frame.
-///
-/// Returns `None` for non-cylinder domains (nothing to do) and when the chains
-/// leave no usable gap.
-///
-/// The rotation is exact: turning `frame.x` by `rot` maps every parameter
-/// `u → u − rot`, so the chains only need shifting, never re-projecting, and
-/// `lift` still lands on the identical 3-D points.
-fn reseam_cylinder(domain: &FaceDomain, chains: &mut [FaceChain]) -> Option<FaceDomain> {
-    let rot = seam_rotation(domain, chains)?;
-    Some(apply_seam_rotation(domain, chains, rot))
-}
 
 /// Pick the rotation that parks the u = ±π seam in the widest empty gap.
 fn seam_rotation(domain: &FaceDomain, chains: &[FaceChain]) -> Option<f64> {
@@ -437,16 +999,28 @@ fn seam_rotation(domain: &FaceDomain, chains: &[FaceChain]) -> Option<f64> {
     // seam has to cross them wherever it goes (both faces sharing a rim split
     // it the same way, so that is harmless).  What must not be split is a
     // window loop or a section curve, which occupies a limited arc.
+    // A full-wrap chain is skipped only where it IS the rim: its vertices
+    // strictly inside the band (the notches a fused outline carries where a
+    // neighbour was welded in) are features the seam must avoid like any
+    // window.
+    let (vlo, vhi) = domain.open_range();
+    let eps = 1e-6 * (vhi - vlo).abs().max(1.0);
     let mut us: Vec<f64> = Vec::new();
     for c in chains.iter() {
         let (lo, hi) = c
             .pts
             .iter()
             .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
-        if hi - lo > 0.9 * TAU {
-            continue; // full-wrap rim
+        let full_wrap = hi - lo > 0.9 * TAU;
+        if full_wrap && c.tag >= 1000 {
+            continue; // a transversal section: crossed at an exact inserted point
         }
-        us.extend(c.pts.iter().map(|p| p.0.rem_euclid(TAU)));
+        for p in &c.pts {
+            if full_wrap && !(p.1 > vlo + eps && p.1 < vhi - eps) {
+                continue; // on a rim: harmless to cross
+            }
+            us.push(p.0.rem_euclid(TAU));
+        }
     }
     if us.is_empty() {
         return None;
@@ -466,6 +1040,29 @@ fn seam_rotation(domain: &FaceDomain, chains: &[FaceChain]) -> Option<f64> {
     if best_gap < 1e-6 {
         return None;
     }
+    // Snap the seam onto an EXISTING vertex inside the gap (a rim sample —
+    // every rim has one every few degrees): the seam then passes through a
+    // vertex exactly instead of 1e-6 beside it, so no near-duplicate vertex
+    // and no sliver segment is created where it crosses the rims.
+    let gap_lo = seam_u - 0.5 * best_gap;
+    let mut snap: Option<(f64, f64)> = None; // (distance to centre, u)
+    for c in chains.iter() {
+        for p in &c.pts {
+            let u = p.0.rem_euclid(TAU);
+            let rel = (u - gap_lo).rem_euclid(TAU);
+            if rel <= 1e-9 || rel >= best_gap - 1e-9 {
+                continue; // not strictly inside the gap
+            }
+            let d = (rel - 0.5 * best_gap).abs();
+            if snap.map_or(true, |(bd, _)| d < bd) {
+                snap = Some((d, p.0));
+            }
+        }
+    }
+    let seam_u = match snap {
+        Some((_, u)) => u,
+        None => seam_u,
+    };
     // `build_periodic_u` unwraps each chain from its own first sample and then
     // splits at every multiple of the period, so the seam it cuts along is
     // u = 0 — the frame's x direction — NOT u = ±π.  Rotating by `seam_u` puts
@@ -530,6 +1127,9 @@ fn seam_crossings(domain: &FaceDomain, chains: &[FaceChain]) -> Vec<Point3> {
     };
     let mut out = Vec::new();
     for ch in chains {
+        if ch.tag >= 1000 {
+            continue; // section curves get exact seam points (`split_sections_at_seam`)
+        }
         for w in ch.pts.windows(2) {
             let (a, b) = (w[0], w[1]);
             // A jump larger than π is the atan2 wrap, not a real step across 0.
@@ -547,6 +1147,173 @@ fn seam_crossings(domain: &FaceDomain, chains: &[FaceChain]) -> Vec<Point3> {
         }
     }
     out
+}
+
+/// Move a seam-crossing point `p` (on face `fid`'s seam ruling line) along
+/// that line onto the carrier of the neighbouring face whose edge the seam
+/// crossed there.  The neighbour is found as the other face whose surface
+/// passes within a sagitta of `p`; the result lies on both carriers.
+fn refine_seam_point_onto_partner(
+    src: &BRep,
+    faces: &[FaceId],
+    fid: FaceId,
+    domain: &FaceDomain,
+    p: Point3,
+) -> Point3 {
+    use crate::geom::refine::AnalyticSurface;
+    let FaceDomain::CylinderBand { surf, .. } = domain else {
+        return p;
+    };
+    let axis = surf.axis().as_vec();
+    let base = surf.frame.origin + surf.frame.x * surf.radius;
+    let t0 = axis.dot(p - base);
+    let carrier = |g: &FaceGeom| -> Option<AnalyticSurface> {
+        match g {
+            FaceGeom::Plane(pl) => Some(AnalyticSurface::Plane(*pl)),
+            FaceGeom::Cylinder(c) => Some(AnalyticSurface::Cylinder(*c)),
+            FaceGeom::Torus(t) => Some(AnalyticSurface::Torus(*t)),
+            FaceGeom::Sphere(_) => None,
+        }
+    };
+    let mut best: Option<(f64, Point3)> = None;
+    for &g in faces {
+        if g == fid {
+            continue;
+        }
+        let Some(sg) = carrier(&src.faces[g].geom) else { continue };
+        let d0 = sg.distance(p);
+        if d0 > 5e-3 {
+            continue; // not the neighbour across this edge
+        }
+        if d0 < 1e-8 {
+            return p; // already on the partner (an existing vertex) — keep it
+        }
+        let bb = face_aabb(src, g).pad(1e-2);
+        if !(bb.min.x <= p.x && p.x <= bb.max.x && bb.min.y <= p.y && p.y <= bb.max.y && bb.min.z <= p.z && p.z <= bb.max.z) {
+            continue;
+        }
+        let f = |t: f64| sg.distance(base + axis * t);
+        let t = golden_min_1d(t0 - 2e-2, t0 + 2e-2, 80, f);
+        let q = base + axis * t;
+        let d = sg.distance(q);
+        if d < 1e-9 && d < d0 && best.map_or(true, |(bd, _)| d < bd) {
+            best = Some((d, q));
+        }
+    }
+    best.map_or(p, |(_, q)| q)
+}
+
+fn golden_min_1d(mut a: f64, mut b: f64, iters: usize, f: impl Fn(f64) -> f64) -> f64 {
+    let gr = (5f64.sqrt() - 1.0) / 2.0;
+    let mut c = b - gr * (b - a);
+    let mut d = a + gr * (b - a);
+    let (mut fc, mut fd) = (f(c), f(d));
+    for _ in 0..iters {
+        if fc < fd {
+            b = d;
+            d = c;
+            fd = fc;
+            c = b - gr * (b - a);
+            fc = f(c);
+        } else {
+            a = c;
+            c = d;
+            fc = fd;
+            d = a + gr * (b - a);
+            fd = f(d);
+        }
+    }
+    0.5 * (a + b)
+}
+
+/// Insert, into every section curve of a face, the exact point where it
+/// crosses the face's parametric seam: for a cylinder band the seam ruling
+/// line (`u = 0` of the seamed frame) ∩ the cut plane; for a torus patch the
+/// outer-equator circle (`φ = 0`) ∩ the cut plane, nearest the crossing.
+fn split_sections_at_seam(curves: &mut [SsiCurve], domain: &FaceDomain, keep: &Plane3) {
+    use std::f64::consts::PI;
+    let n_plane = keep.normal().as_vec();
+    for c in curves.iter_mut() {
+        let m = c.points.len();
+        if m < 2 {
+            continue;
+        }
+        let nseg = if c.closed { m } else { m - 1 };
+        let mut inserts: Vec<(usize, Point3)> = Vec::new();
+        for i in 0..nseg {
+            let (pa, pb) = (c.points[i], c.points[(i + 1) % m]);
+            let (ua, va) = domain.uv(pa);
+            let (ub, vb) = domain.uv(pb);
+            // the periodic coordinate of this domain
+            let (sa, sb) = match domain {
+                FaceDomain::CylinderBand { .. } => (ua, ub),
+                FaceDomain::TorusPatch { .. } => (va, vb),
+                _ => continue,
+            };
+            if (sa - sb).abs() > PI || (sa > 0.0) == (sb > 0.0) || sa == 0.0 || sb == 0.0 {
+                continue;
+            }
+            let exact = match domain {
+                FaceDomain::CylinderBand { surf, .. } => {
+                    // seam ruling line o + r·x + axis·t  ∩  plane
+                    let base = surf.frame.origin + surf.frame.x * surf.radius;
+                    let d = surf.axis().as_vec();
+                    let den = n_plane.dot(d);
+                    if den.abs() < 1e-12 {
+                        continue;
+                    }
+                    let t = -keep.signed_distance(base) / den;
+                    base + d * t
+                }
+                FaceDomain::TorusPatch { surf, .. } => {
+                    // outer equator: circle of radius R + r in the ring plane ∩
+                    // cut plane — take the solution nearest the chord crossing.
+                    let t = sa / (sa - sb);
+                    let approx = pa.lerp(pb, t);
+                    let eq = Circle3::new(
+                        surf.frame.origin,
+                        surf.frame.z,
+                        surf.major_radius + surf.minor_radius,
+                    );
+                    match circle_plane_points(&eq, keep) {
+                        Some((q1, q2)) => {
+                            if (q1 - approx).length() <= (q2 - approx).length() {
+                                q1
+                            } else {
+                                q2
+                            }
+                        }
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if (exact - pa).length() > 1e-9 && (exact - pb).length() > 1e-9 {
+                inserts.push((i, exact));
+            }
+        }
+        for (k, (i, q)) in inserts.into_iter().enumerate() {
+            c.points.insert(i + 1 + k, q);
+        }
+    }
+}
+
+/// The two points where a circle meets a plane (`None` when it misses or lies
+/// in the plane).
+fn circle_plane_points(c: &Circle3, plane: &Plane3) -> Option<(Point3, Point3)> {
+    // c(θ) = o + r(x cosθ + y sinθ);  n·(c(θ) − p0) = 0
+    //  ⇒ A cosθ + B sinθ = −D  with A = r n·x, B = r n·y, D = n·(o − p0)
+    let n = plane.normal().as_vec();
+    let a = c.radius * n.dot(c.frame.x.as_vec());
+    let b = c.radius * n.dot(c.frame.y.as_vec());
+    let d = plane.signed_distance(c.frame.origin);
+    let amp = (a * a + b * b).sqrt();
+    if amp < 1e-15 || d.abs() > amp {
+        return None;
+    }
+    let phi = b.atan2(a);
+    let alpha = (-d / amp).acos();
+    Some((c.point_at(phi + alpha), c.point_at(phi - alpha)))
 }
 
 // ── Joints ───────────────────────────────────────────────────────────────────
@@ -585,10 +1352,25 @@ pub(crate) fn insert_joints(poly: &mut Vec<Point3>, joints: &[Point3]) {
     if joints.is_empty() || poly.len() < 2 {
         return;
     }
+    // A joint a hair off an existing vertex REPLACES it: the joint is the exact
+    // triple point every consumer shares, the vertex is a sample (a band-end
+    // crossing of a 1e-5-fuzzy rim, a seam snap) that would otherwise become a
+    // second vertex a sliver away — below the DCEL tolerance on one face and
+    // above it on the next, i.e. a mismatched edge.  Every face grafts the same
+    // joints, so the replacement is identical on all of them.
+    for q in poly.iter_mut() {
+        if let Some(j) = joints.iter().find(|j| (**j - *q).length() < JOINT_SNAP) {
+            *q = *j;
+        }
+    }
     let mut out: Vec<Point3> = Vec::with_capacity(poly.len() + joints.len());
     for w in 0..poly.len() - 1 {
         let (a, b) = (poly[w], poly[w + 1]);
-        out.push(a);
+        if out.last().map_or(false, |&q| (q - a).length() < 1e-9) {
+            // the replacement above can fold two vertices into one
+        } else {
+            out.push(a);
+        }
         let seg = b - a;
         let len2 = seg.dot(seg);
         if len2 < 1e-24 {
@@ -616,9 +1398,18 @@ pub(crate) fn insert_joints(poly: &mut Vec<Point3>, joints: &[Point3]) {
             }
         }
     }
-    out.push(*poly.last().unwrap());
+    let last = *poly.last().unwrap();
+    if out.last().map_or(true, |&q| (q - last).length() > 1e-9) {
+        out.push(last);
+    }
     *poly = out;
 }
+
+/// Distance below which a chain vertex is taken to BE a joint (mm).
+///
+/// Well above the weld (1e-5) and the fit tolerance (5e-6) that make a sampled
+/// vertex miss the exact triple point, and three orders below any feature.
+pub(crate) const JOINT_SNAP: f64 = 1e-4;
 
 /// The face's boundary loops as uv chains, with the section joints inserted.
 ///
@@ -632,7 +1423,23 @@ fn boundary_chains_with_joints(
     joints: &[Point3],
 ) -> Vec<Vec<(f64, f64)>> {
     if !has_real_loops(brep, fid) {
-        return face_boundary_chains(brep, fid, domain);
+        // Template face: synthesise its rings in 3-D first so the joints can be
+        // grafted in exactly like on a real loop (an arranged neighbour's seam
+        // crossing of a shared rim must be a vertex here too).
+        let rings = synthesize_rings_3d(brep, fid);
+        if rings.is_empty() {
+            return face_boundary_chains(brep, fid, domain);
+        }
+        let mut out = Vec::new();
+        for mut ring in rings {
+            insert_joints(&mut ring, joints);
+            let mut pts: Vec<(f64, f64)> = ring.iter().map(|&p| domain.uv(p)).collect();
+            if pts.first() != pts.last() {
+                pts.push(pts[0]);
+            }
+            out.push(pts);
+        }
+        return out;
     }
     let f = &brep.faces[fid];
     let mut loops = Vec::new();
@@ -644,10 +1451,46 @@ fn boundary_chains_with_joints(
         if brep.coedges.get(start).is_none() {
             continue;
         }
-        let mut pts3: Vec<Point3> = Vec::new();
+        // The loop's co-edges in order, and how often each edge appears in
+        // it.  An edge the SAME loop traverses twice is a parametric seam
+        // slit left by a previous arrangement (the two borders of a periodic
+        // DCEL lifted onto one 3-D line).  It is not geometry: the DCEL here
+        // puts its own seam where it wants, so the slit is dropped and the
+        // loop handed over as the open chains between its two traversals.
+        let mut ces: Vec<cadcore_topo::CoEdgeId> = Vec::new();
         let mut c = start;
         loop {
-            let ce = &brep.coedges[c];
+            ces.push(c);
+            c = brep.coedges[c].next;
+            if c == start || ces.len() > 100_000 {
+                break;
+            }
+        }
+        let mut count: HashMap<cadcore_topo::EdgeId, usize> = HashMap::new();
+        for &ce in &ces {
+            *count.entry(brep.coedges[ce].edge).or_default() += 1;
+        }
+        let is_slit = |ce: cadcore_topo::CoEdgeId| count[&brep.coedges[ce].edge] >= 2;
+        let has_slit = ces.iter().any(|&ce| is_slit(ce));
+        let n = ces.len();
+        let first = if has_slit {
+            (0..n).find(|&i| is_slit(ces[i])).map(|i| (i + 1) % n).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut chains3: Vec<Vec<Point3>> = Vec::new();
+        let mut pts3: Vec<Point3> = Vec::new();
+        for k in 0..n {
+            let ce_id = ces[(first + k) % n];
+            if is_slit(ce_id) {
+                if pts3.len() >= 2 {
+                    chains3.push(std::mem::take(&mut pts3));
+                } else {
+                    pts3.clear();
+                }
+                continue;
+            }
+            let ce = &brep.coedges[ce_id];
             let mut sp = super::aabb::sample_edge(brep, ce.edge);
             if ce.sense == cadcore_topo::CoEdgeSense::Opposite {
                 sp.reverse();
@@ -658,23 +1501,79 @@ fn boundary_chains_with_joints(
                     pts3.push(p);
                 }
             }
-            c = ce.next;
-            if c == start {
-                break;
-            }
         }
-        if pts3.len() >= 3 {
-            let mut pts: Vec<(f64, f64)> = pts3.iter().map(|&p| domain.uv(p)).collect();
-            if pts.first() != pts.last() {
-                pts.push(pts[0]);
+        if pts3.len() >= 2 {
+            chains3.push(pts3);
+        }
+        for ch in chains3 {
+            let mut pts: Vec<(f64, f64)> = ch.iter().map(|&p| domain.uv(p)).collect();
+            if !has_slit && pts.len() >= 3 && pts.first() != pts.last() {
+                pts.push(pts[0]); // close the ring
             }
-            loops.push(pts);
+            if pts.len() >= 2 {
+                loops.push(pts);
+            }
         }
     }
     if loops.is_empty() {
         return face_boundary_chains(brep, fid, domain);
     }
     loops
+}
+
+/// The boundary rings of a TEMPLATE face (no real loops) as 3-D polylines:
+/// the two rims of a `Cylinder` extent, the circle of a `Disk`, the polygon of
+/// a `Polygon`.  Sampled exactly as `union::synthesize_boundary` does (64 per
+/// circle, starting at the circle's own `point_at(0)`).
+fn synthesize_rings_3d(brep: &BRep, fid: FaceId) -> Vec<Vec<Point3>> {
+    use cadcore_topo::FaceBoundary;
+    let ring = |c: &Circle3| -> Vec<Point3> {
+        (0..64)
+            .map(|k| c.point_at(k as f64 / 64.0 * std::f64::consts::TAU))
+            .collect()
+    };
+    let f = &brep.faces[fid];
+    match (&f.geom, &f.extent) {
+        (_, FaceExtent::Cylinder { start, end, .. }) => {
+            let mut out = Vec::new();
+            for b in [start, end] {
+                if let FaceBoundary::Circle(c) = b {
+                    out.push(ring(c));
+                }
+            }
+            out
+        }
+        (FaceGeom::Plane(pl), FaceExtent::Disk { radius }) => {
+            vec![ring(&Circle3::new(pl.frame.origin, pl.normal(), *radius))]
+        }
+        (_, FaceExtent::Polygon { points }) if points.len() >= 3 => vec![points.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Every boundary edge of a face with its sampled polyline, in loop order.
+fn face_edge_polylines(brep: &BRep, fid: FaceId) -> Vec<(cadcore_topo::EdgeId, Vec<Point3>)> {
+    let f = &brep.faces[fid];
+    let mut out = Vec::new();
+    let mut ls = vec![f.outer_loop];
+    ls.extend(f.inner_loops.iter().copied());
+    for lid in ls {
+        let Some(lp) = brep.loops.get(lid) else { continue };
+        let st = lp.start;
+        if brep.coedges.get(st).is_none() {
+            continue;
+        }
+        let mut c = st;
+        loop {
+            let eid = brep.coedges[c].edge;
+            out.push((eid, super::aabb::sample_edge(brep, eid)));
+            c = brep.coedges[c].next;
+            if c == st {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Does this face carry explicit B-Rep topology (as opposed to being an
@@ -688,10 +1587,58 @@ fn has_real_loops(brep: &BRep, fid: FaceId) -> bool {
 
 // ── Broad phase ──────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
     Kept,
     Cut,
     Straddles,
+}
+
+/// Which side of `keep` a face lies on, from its sampled geometry: boundary
+/// loop samples plus a coarse grid on the carrier surface within the face's
+/// domain (a torus fillet bulges past its junction circles, so loops alone
+/// under-report its reach).  `|d| ≤ tau` counts as ON the plane.
+fn face_side(src: &BRep, fid: FaceId, keep: &Plane3, tau: f64) -> Side {
+    if !has_real_loops(src, fid) {
+        return straddle(&face_aabb(src, fid), keep, tau.max(1e-9));
+    }
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    let mut take = |p: Point3| {
+        let d = keep.signed_distance(p);
+        lo = lo.min(d);
+        hi = hi.max(d);
+    };
+    for p in face_loop_points(src, fid) {
+        take(p);
+    }
+    if let Some(domain) = face_domain(src, fid) {
+        let (ulo, uhi, vlo, vhi, nu, nv) = match domain {
+            FaceDomain::CylinderBand { length, .. } => {
+                (0.0, std::f64::consts::TAU, 0.0, length, 16usize, 2usize)
+            }
+            FaceDomain::TorusPatch { theta_lo, theta_hi, .. } => {
+                (theta_lo, theta_hi, 0.0, std::f64::consts::TAU, 8usize, 16usize)
+            }
+            FaceDomain::TorusBand { .. } => {
+                (0.0, std::f64::consts::TAU, 0.0, std::f64::consts::TAU, 16usize, 16usize)
+            }
+            FaceDomain::Plane { .. } => (0.0, 0.0, 0.0, 0.0, 0usize, 0usize),
+        };
+        for i in 0..=nu {
+            for k in 0..=nv {
+                let u = ulo + (uhi - ulo) * i as f64 / nu.max(1) as f64;
+                let v = vlo + (vhi - vlo) * k as f64 / nv.max(1) as f64;
+                take(domain.lift(u, v));
+            }
+        }
+    }
+    if lo >= -tau {
+        Side::Kept
+    } else if hi <= tau {
+        Side::Cut
+    } else {
+        Side::Straddles
+    }
 }
 
 /// Which side of `keep` an axis-aligned box lies on.
@@ -796,19 +1743,62 @@ fn presplit_sections(ssi: &mut HashMap<FaceId, Vec<SsiCurve>>, cut_plane: &Plane
     for i in 0..work.len() {
         for j in (i + 1)..work.len() {
             let mut found: Vec<(usize, f64, usize, f64, (f64, f64))> = Vec::new();
+            const END: f64 = 1e-9;
             for si in 0..work[i].pts.len().saturating_sub(1) {
                 let (a0, a1) = (work[i].pts[si], work[i].pts[si + 1]);
                 for sj in 0..work[j].pts.len().saturating_sub(1) {
                     let (b0, b1) = (work[j].pts[sj], work[j].pts[sj + 1]);
                     if let Some((ta, tb)) = seg_cross(a0, a1, b0, b1) {
-                        let p = (a0.0 + (a1.0 - a0.0) * ta, a0.1 + (a1.1 - a0.1) * ta);
+                        let a_end = ta < END || ta > 1.0 - END;
+                        let b_end = tb < END || tb > 1.0 - END;
+                        if a_end && b_end {
+                            continue; // they already share this vertex
+                        }
+                        // the shared point: an existing vertex when one curve
+                        // ends here (T-junction), else the computed crossing
+                        let p = if a_end {
+                            if ta < END { a0 } else { a1 }
+                        } else if b_end {
+                            if tb < END { b0 } else { b1 }
+                        } else {
+                            (a0.0 + (a1.0 - a0.0) * ta, a0.1 + (a1.1 - a0.1) * ta)
+                        };
                         found.push((si, ta, sj, tb, p));
                     }
                 }
             }
             for (si, ta, sj, tb, p) in found {
-                work[i].cuts.push((si, ta, p));
-                work[j].cuts.push((sj, tb, p));
+                // Two curves that already MEET at a vertex (a joint grafted into
+                // both) also cross a hair away from it: each is a chord
+                // approximation of its curve, and the chords on either side of
+                // the joint overshoot differently.  That second crossing is an
+                // artefact — splitting there creates a sliver piece shorter
+                // than the weld tolerance.  Skip a crossing within a fraction
+                // of the sample spacing of a vertex both curves carry.
+                let near = (0.25 * super::ssi::SSI_SPACING).max(tol);
+                let shared_vertex = work[i].pts.iter().any(|&a| {
+                    let d = ((a.0 - p.0).powi(2) + (a.1 - p.1).powi(2)).sqrt();
+                    d < near
+                        && work[j].pts.iter().any(|&b| {
+                            ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt() < 1e-9
+                        })
+                });
+                if shared_vertex {
+                    continue;
+                }
+                if std::env::var("CADCORE_DUMP_CUT").is_ok() {
+                    let q = lift(p);
+                    eprintln!(
+                        "[cut][presplit] {:?}#{si} t={ta:.3e} x {:?}#{sj} t={tb:.3e} at ({:.4},{:.4},{:.4})",
+                        work[i].face, work[j].face, q.x, q.y, q.z
+                    );
+                }
+                if ta > END && ta < 1.0 - END {
+                    work[i].cuts.push((si, ta, p));
+                }
+                if tb > END && tb < 1.0 - END {
+                    work[j].cuts.push((sj, tb, p));
+                }
             }
         }
     }
@@ -897,9 +1887,18 @@ fn dist2(a: (f64, f64), b: (f64, f64)) -> f64 {
 /// have to be walked end-to-end.  Curves whose ends do not meet anything are
 /// dropped rather than guessed at — an unclosed cap is worse than a missing one
 /// (it would emit a face with an open wire).
-fn section_loops(ssi: &HashMap<FaceId, Vec<SsiCurve>>, tol: f64) -> Vec<Vec<Point3>> {
+fn section_loops(
+    ssi: &HashMap<FaceId, Vec<SsiCurve>>,
+    rim_curves: &[Vec<Point3>],
+    tol: f64,
+) -> Vec<Vec<Point3>> {
     let mut open: Vec<Vec<Point3>> = Vec::new();
     let mut closed: Vec<Vec<Point3>> = Vec::new();
+    for pts in rim_curves {
+        if pts.len() >= 2 {
+            open.push(pts.clone());
+        }
+    }
     for curves in ssi.values() {
         for c in curves {
             if c.points.len() < 2 {
@@ -937,6 +1936,44 @@ fn section_loops(ssi: &HashMap<FaceId, Vec<SsiCurve>>, tol: f64) -> Vec<Vec<Poin
             }
         }
     }
+
+    // A closed section through which OPEN curves end (a rim circle lying in
+    // the plane that meets a tube's section, two fused tubes' sections meeting
+    // at their shared channel) is not a loop of its own: the outline runs
+    // along part of it and leaves along the open curve.  Break it at those
+    // junction vertices into arcs so the walk below can route through them;
+    // the arcs that end up inside the neighbour simply dangle and are dropped.
+    let ends: Vec<Point3> = open
+        .iter()
+        .flat_map(|c| [c[0], *c.last().unwrap()])
+        .collect();
+    let mut still_closed: Vec<Vec<Point3>> = Vec::new();
+    for lp in closed.drain(..) {
+        let n = lp.len();
+        let cuts: Vec<usize> = (0..n)
+            .filter(|&i| ends.iter().any(|&e| (e - lp[i]).length() <= tol))
+            .collect();
+        if cuts.len() < 2 {
+            still_closed.push(lp);
+            continue;
+        }
+        for k in 0..cuts.len() {
+            let (i0, i1) = (cuts[k], cuts[(k + 1) % cuts.len()]);
+            let mut arc = vec![lp[i0]];
+            let mut i = i0;
+            loop {
+                i = (i + 1) % n;
+                arc.push(lp[i]);
+                if i == i1 {
+                    break;
+                }
+            }
+            if arc.len() >= 2 {
+                open.push(arc);
+            }
+        }
+    }
+    closed = still_closed;
 
     // Walk the open arcs end-to-end.  Each arc is used once; a chain that comes
     // back to its own start is a loop, anything else is discarded.
@@ -1449,7 +2486,10 @@ mod tests {
         // Keep x <= -0.7: severs A's two X-legs clear of their U-turn fillets,
         // drops A's connector, leaves every crossing with B intact.
         let keep = Plane3::from_origin_normal(Point3::new(-0.7, 0.0, 0.0), -UnitVec3::X);
-        let cut = half_space_cut(&fused, &faces, &keep, 1e-6).expect("cut runs");
+        // The hole-imprint fuse carries ~1e-4 of seam-interpolation noise on
+        // its shared points, so its knit is the half-micron the legacy export
+        // path uses (the universal fuse is exact and cuts at 1e-6).
+        let cut = half_space_cut(&fused, &faces, &keep, 5e-4).expect("cut runs");
 
         // Three tubes are severed — a transverse disk through each of A's two
         // X-legs, plus a longitudinal chord through B's leg at x = -0.8 (its
@@ -1457,11 +2497,10 @@ mod tests {
         // OVERLAP at the plane, so the arrangement tiles the section into a few
         // coplanar cells rather than one face per tube; what matters is that
         // they tile it completely, which the watertight assertion below proves.
-        assert!(
-            cut.caps >= 3,
-            "at least one flat section per severed tube, got {}",
-            cut.caps
-        );
+        // Every section curve is clipped to its face's trimmed region, so the
+        // cap tiles the UNION outline of the three overlapping sections once —
+        // one cell, not one per tube.
+        assert!(cut.caps >= 1, "the section must be capped, got {}", cut.caps);
         assert!(cut.dropped > 0, "A's connector and fillets must be dropped");
         assert_eq!(
             open_edges(&cut.brep, cut.shell),
@@ -1522,3 +2561,4 @@ mod tests {
         );
     }
 }
+

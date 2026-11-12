@@ -530,7 +530,10 @@ fn cyl_band(brep: &BRep, fid: FaceId) -> Option<(CylSurf, f64)> {
     if hi <= lo {
         return None;
     }
-    let shifted = CylSurf::new(surf.frame.origin + axis.as_vec() * lo, axis, surf.radius);
+    let shifted = CylSurf {
+        frame: cadcore_math::Frame3 { origin: surf.frame.origin + axis.as_vec() * lo, ..surf.frame },
+        radius: surf.radius,
+    };
     Some((shifted, hi - lo))
 }
 
@@ -716,9 +719,24 @@ fn plane_cylinder(
     };
     let poly2: Vec<(f64, f64)> = poly.iter().map(|&q| to_uv(q)).collect();
 
-    let pts: Vec<Point3> = match &conic {
-        CylPlaneCurve::Circle(c) => (0..96).map(|i| c.point_at(i as f64 / 96.0 * std::f64::consts::TAU)).collect(),
-        CylPlaneCurve::Ellipse(e) => (0..96).map(|i| e.point_at(i as f64 / 96.0 * std::f64::consts::TAU)).collect(),
+    // Sample the conic by ARC LENGTH, not by a fixed count: an oblique plane
+    // that grazes a tube lengthwise gives an ellipse tens of millimetres long,
+    // and 96 samples of it are chords of half a millimetre — longer than the
+    // windows a fused band carries, so the midpoint classification downstream
+    // would skip whole features.
+    let point = |th: f64| -> Point3 {
+        match &conic {
+            CylPlaneCurve::Circle(c) => c.point_at(th),
+            CylPlaneCurve::Ellipse(e) => e.point_at(th),
+            _ => unreachable!("handled below"),
+        }
+    };
+    let thetas: Vec<f64> = match &conic {
+        CylPlaneCurve::Circle(c) => {
+            let n = ((std::f64::consts::TAU * c.radius / SSI_SPACING).ceil() as usize).max(96);
+            (0..n).map(|i| i as f64 / n as f64 * std::f64::consts::TAU).collect()
+        }
+        CylPlaneCurve::Ellipse(e) => ellipse_thetas_by_spacing(e, SSI_SPACING),
         // Plane PARALLEL to the axis: the section is one or two straight ruling
         // lines, not a closed conic — the tube is grazed lengthwise rather than
         // sliced across.  Each line is clipped to the finite band and to the
@@ -734,15 +752,14 @@ fn plane_cylinder(
         }
         CylPlaneCurve::None => return Vec::new(),
     };
+    let pts: Vec<Point3> = thetas.iter().map(|&th| point(th)).collect();
     let axis = cyl.axis();
     // a sample is "in" when it lies inside the plane polygon AND the cyl band.
-    let inside: Vec<bool> = pts
-        .iter()
-        .map(|&p| {
-            let v = axis.dot_vec(p - cyl.frame.origin);
-            v >= -1e-9 && v <= length + 1e-9 && point_in_polygon_2d(&poly2, to_uv(p))
-        })
-        .collect();
+    let is_in = |p: Point3| -> bool {
+        let v = axis.dot_vec(p - cyl.frame.origin);
+        v >= -1e-9 && v <= length + 1e-9 && point_in_polygon_2d(&poly2, to_uv(p))
+    };
+    let inside: Vec<bool> = pts.iter().map(|&p| is_in(p)).collect();
     if inside.iter().all(|&b| b) {
         return vec![SsiCurve { points: pts, closed: true }]; // fully contained loop
     }
@@ -751,8 +768,37 @@ fn plane_cylinder(
     }
     // PARTIAL: keep the maximal runs of in-samples as open arcs (the conic
     // clipped to the polygon / band — e.g. a stacked tube's end cap cutting its
-    // neighbour).  The shared sample points weld on both faces.
+    // neighbour).  Every run is closed off EXACTLY where the conic leaves the
+    // band / polygon (bisection on the parameter between the last in-sample
+    // and the first out-sample): a band's end is a junction rim the next face
+    // shares, and the point where the section meets it is a vertex both faces
+    // must present identically — a run stopping one sample short leaves the
+    // section outline open there.
     let n = pts.len();
+    let crossing = |i_in: usize, i_out: usize| -> Point3 {
+        use std::f64::consts::TAU;
+        let (mut a, mut b) = (thetas[i_in], thetas[i_out]);
+        // the two samples are parametric neighbours; unwrap across θ = 0
+        if (b - a).abs() > std::f64::consts::PI {
+            if b < a {
+                b += TAU;
+            } else {
+                a += TAU;
+            }
+        }
+        for _ in 0..60 {
+            let m = 0.5 * (a + b);
+            if is_in(point(m)) {
+                a = m;
+            } else {
+                b = m;
+            }
+            if (b - a).abs() < 1e-15 {
+                break;
+            }
+        }
+        point(a)
+    };
     let start = (0..n).find(|&i| inside[i] && !inside[(i + n - 1) % n]);
     let Some(start) = start else { return Vec::new() };
     let mut arcs = Vec::new();
@@ -760,8 +806,20 @@ fn plane_cylinder(
     for k in 0..=n {
         let i = (start + k) % n;
         if inside[i] {
+            if cur.is_empty() {
+                let prev = (i + n - 1) % n;
+                let x = crossing(i, prev);
+                if (x - pts[i]).length() > 1e-9 {
+                    cur.push(x);
+                }
+            }
             cur.push(pts[i]);
         } else if !cur.is_empty() {
+            let prev = (i + n - 1) % n;
+            let x = crossing(prev, i);
+            if (x - *cur.last().unwrap()).length() > 1e-9 {
+                cur.push(x);
+            }
             if cur.len() >= 2 {
                 arcs.push(SsiCurve { points: std::mem::take(&mut cur), closed: false });
             } else {
@@ -770,6 +828,48 @@ fn plane_cylinder(
         }
     }
     arcs
+}
+
+/// Target chord length of a sampled section curve (mm).
+///
+/// Matches the universal fuse's junction sampling (`FuseOptions::sample_spacing`
+/// is 0.03; a 0.275 mm filament's rim circle at 96 samples is 0.018), so a
+/// section and the boundary it meets are resolved alike.
+pub(crate) const SSI_SPACING: f64 = 0.02;
+
+/// Parameters of an ellipse sampled at (close to) uniform arc length.
+///
+/// `point_at` is uniform in the *parameter*; on an elongated ellipse that
+/// packs the samples at the ends of the major axis and spreads them along the
+/// flanks, so the parameter is walked finely and a sample is emitted every
+/// `spacing` of accumulated chord length.  Always starts at θ = 0 and never
+/// leaves a short last gap back to it.
+fn ellipse_thetas_by_spacing(e: &cadcore_geom::Ellipse3, spacing: f64) -> Vec<f64> {
+    use std::f64::consts::{PI, TAU};
+    let (a, b) = (e.semi_major, e.semi_minor);
+    // Ramanujan's perimeter approximation — only used for the step count.
+    let h = ((a - b) / (a + b)).powi(2);
+    let perimeter = PI * (a + b) * (1.0 + 3.0 * h / (10.0 + (4.0 - 3.0 * h).sqrt()));
+    let n_target = ((perimeter / spacing).ceil() as usize).max(96);
+    let n_fine = (n_target * 16).max(4096);
+    let mut out = vec![0.0];
+    let mut acc = 0.0;
+    let mut prev = e.point_at(0.0);
+    for i in 1..=n_fine {
+        let th = i as f64 / n_fine as f64 * TAU;
+        let p = e.point_at(th);
+        acc += (p - prev).length();
+        prev = p;
+        if acc >= spacing && i < n_fine {
+            out.push(th);
+            acc = 0.0;
+        }
+    }
+    // the closing gap back to θ = 0 must not be a sliver
+    if out.len() > 1 && acc < 0.3 * spacing {
+        out.pop();
+    }
+    out
 }
 
 /// Solve the linear system of three plane equations `ni·x = di` for x.

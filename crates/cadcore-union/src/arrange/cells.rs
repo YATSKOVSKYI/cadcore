@@ -71,6 +71,21 @@ pub fn arrange_and_classify_with(
 
     // The DCEL is periodic in u; when the face is periodic in v (torus
     // patch), swap axes for the arrangement and swap back on lift.
+    // A face that does NOT wrap around its periodic direction (a torus patch
+    // between two crossing windows, a band a previous Boolean split along its
+    // seam) is not periodic at all: its chains fit in one continuous window of
+    // the parameter, and the periodic DCEL would only add a seam — which, when
+    // the face's own boundary runs along that seam (two faces of one torus
+    // sharing the equator), coincides with a chain and wrecks the cells.  Such
+    // a face is unwrapped onto one branch and arranged as a plain region.
+    let unwrapped: Option<Vec<FaceChain>> = if plane {
+        None
+    } else {
+        unwrap_non_wrapping(chains, periodic_axis, period)
+    };
+    let plane = plane || unwrapped.is_some();
+    let chains: &[FaceChain] = unwrapped.as_deref().unwrap_or(chains);
+
     let swap = periodic_axis == 1 && !plane;
     let to_arr = |&(u, v): &(f64, f64)| if swap { (v, u) } else { (u, v) };
     let from_arr = |(x, y): (f64, f64)| if swap { (y, x) } else { (x, y) };
@@ -115,9 +130,155 @@ pub fn arrange_and_classify_with(
                     unswap_step(st);
                 }
             }
+            // The DCEL hands back CCW outer loops / CW holes in ITS axes.  On a
+            // swapped domain those axes are (v, u), and swapping back mirrors
+            // the loops: CCW in (v, u) is CW in (u, v) — the face would be wound
+            // INWARD (∂u × ∂v is the outward normal on every carrier here).
+            // Reverse the traversal so the loop is CCW in the domain's own uv.
+            if swap {
+                let rev = |steps: &mut Vec<cadcore_geom::arrangement::LoopStep>| {
+                    steps.reverse();
+                    for st in steps.iter_mut() {
+                        st.pts.reverse();
+                        st.forward = !st.forward;
+                    }
+                };
+                rev(&mut cell.outer);
+                for h in cell.holes.iter_mut() {
+                    rev(h);
+                }
+            }
             Some(ClassifiedCell { cell, keep })
         })
         .collect()
+}
+
+/// Tag of the half-period line [`arrange_and_classify_halved`] adds.
+pub const HALF_TAG: u32 = u32::MAX - 7;
+
+/// [`arrange_and_classify_with`] for a face that is to be emitted as TWO
+/// non-periodic halves: besides the parametric seam, the face is also cut
+/// along the line half a period away (the `u = π` ruling of a cylinder, the
+/// inner equator of a torus).
+///
+/// A face that wraps its surface completely has no boundary to anchor its
+/// parameterisation, and every consumer invents one: the STEP reader of an
+/// OpenCASCADE-based CAD inserts a seam of its own choosing and splits
+/// whatever crosses it — per face, so an edge that a long window curve shares
+/// with the neighbouring face is split on one side only and the shell opens.
+/// Two half faces, each a plain four-sided patch bounded by real ruling-line
+/// edges, leave nothing to invent; it is what the mainstream kernels write
+/// for a full cylinder for the same reason.
+///
+/// The caller must have put a vertex on every chain where it crosses EITHER
+/// line (see `universal::split_piece_at_seam`), so the two halves and the
+/// faces across the chains subdivide identically.
+pub fn arrange_and_classify_halved(
+    domain: &FaceDomain,
+    chains: &[FaceChain],
+    inside_other: &dyn Fn(Point3) -> bool,
+) -> Vec<ClassifiedCell> {
+    if matches!(domain, FaceDomain::Plane { .. } | FaceDomain::TorusBand { .. }) {
+        return arrange_and_classify_with(domain, chains, 0.0, inside_other);
+    }
+    let (axis, period) = domain.periodic_axis();
+    let other = |p: &(f64, f64)| if axis == 0 { p.1 } else { p.0 };
+    let (mut lo, mut hi) = domain.open_range();
+    for c in chains {
+        for p in &c.pts {
+            lo = lo.min(other(p));
+            hi = hi.max(other(p));
+        }
+    }
+    let half = 0.5 * period;
+    let mut all: Vec<FaceChain> = chains.to_vec();
+    all.push(FaceChain {
+        pts: if axis == 0 { vec![(half, lo), (half, hi)] } else { vec![(lo, half), (hi, half)] },
+        tag: HALF_TAG,
+    });
+    arrange_and_classify_with(domain, &all, 0.0, inside_other)
+}
+
+/// Does this set of chains describe a face that does NOT wrap its periodic
+/// direction (see [`arrange_and_classify_with`])?
+pub fn is_non_wrapping(domain: &FaceDomain, chains: &[FaceChain]) -> bool {
+    if matches!(domain, FaceDomain::Plane { .. } | FaceDomain::TorusBand { .. }) {
+        return true;
+    }
+    let (axis, period) = domain.periodic_axis();
+    unwrap_non_wrapping(chains, axis, period).is_some()
+}
+
+/// If no chain wraps the periodic direction and together they leave a clear
+/// gap in it, return the chains shifted onto ONE continuous branch (each chain
+/// unwrapped along itself, then moved by whole periods to start just past the
+/// gap).  `None` when the face genuinely wraps.
+fn unwrap_non_wrapping(chains: &[FaceChain], axis: usize, period: f64) -> Option<Vec<FaceChain>> {
+    const MARGIN: f64 = 0.2;
+    if chains.is_empty() || !(period > 0.0) {
+        return None;
+    }
+    let get = |p: &(f64, f64)| if axis == 0 { p.0 } else { p.1 };
+    // per-chain continuous unwrap
+    let mut un: Vec<Vec<f64>> = Vec::with_capacity(chains.len());
+    for c in chains {
+        let mut vals: Vec<f64> = Vec::with_capacity(c.pts.len());
+        for (i, p) in c.pts.iter().enumerate() {
+            let x = get(p);
+            if i == 0 {
+                vals.push(x);
+            } else {
+                let prev = vals[i - 1];
+                let mut d = (x - prev) % period;
+                if d > 0.5 * period {
+                    d -= period;
+                } else if d < -0.5 * period {
+                    d += period;
+                }
+                vals.push(prev + d);
+            }
+        }
+        let (lo, hi) = vals.iter().fold((f64::MAX, f64::MIN), |a, &x| (a.0.min(x), a.1.max(x)));
+        if hi - lo > period - MARGIN {
+            return None; // this chain wraps (a rim ring)
+        }
+        un.push(vals);
+    }
+    // widest circular gap of everything, modulo the period
+    let mut all: Vec<f64> = un.iter().flatten().map(|x| x.rem_euclid(period)).collect();
+    if all.is_empty() {
+        return None;
+    }
+    all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (mut gap, mut base) = (0.0_f64, 0.0_f64);
+    for i in 0..all.len() {
+        let (a, b) = (all[i], if i + 1 < all.len() { all[i + 1] } else { all[0] + period });
+        if b - a > gap {
+            gap = b - a;
+            base = b.rem_euclid(period); // the occupied stretch starts here
+        }
+    }
+    if gap < MARGIN {
+        return None;
+    }
+    let start = base - 0.5 * gap.min(MARGIN); // tolerance below the first sample
+    let out = chains
+        .iter()
+        .zip(un.iter())
+        .map(|(c, vals)| {
+            // shift so the chain's first sample falls in [start, start + period)
+            let k = ((vals[0] - start) / period).floor();
+            let shift = -k * period;
+            let pts = c
+                .pts
+                .iter()
+                .zip(vals.iter())
+                .map(|(p, &x)| if axis == 0 { (x + shift, p.1) } else { (p.0, x + shift) })
+                .collect();
+            FaceChain { pts, tag: c.tag }
+        })
+        .collect();
+    Some(out)
 }
 
 #[cfg(test)]

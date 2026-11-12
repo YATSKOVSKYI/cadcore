@@ -316,6 +316,11 @@ pub(crate) fn snap_ssi_endpoints(ssi: &mut [HashMap<FaceId, Vec<SsiCurve>>], tol
     for map in ssi.iter() {
         for curves in map.values() {
             for c in curves.iter() {
+                // a CLOSED curve has no ends: its first/last samples are
+                // interior points and must not be dragged onto a nearby joint
+                if c.closed {
+                    continue;
+                }
                 if c.points.len() >= 2 {
                     let exact = c.points.len() == 2;
                     pts.push((c.points[0], exact));
@@ -356,6 +361,9 @@ pub(crate) fn snap_ssi_endpoints(ssi: &mut [HashMap<FaceId, Vec<SsiCurve>>], tol
     for map in ssi.iter_mut() {
         for curves in map.values_mut() {
             for c in curves.iter_mut() {
+                if c.closed {
+                    continue;
+                }
                 let m = c.points.len();
                 if m >= 2 {
                     c.points[0] = nearest(c.points[0]);
@@ -590,7 +598,17 @@ pub(crate) fn face_domain(brep: &BRep, fid: FaceId) -> Option<FaceDomain> {
             if hi <= lo {
                 return None;
             }
-            let shifted = cadcore_geom::CylSurf::new(surf.frame.origin + axis.as_vec() * lo, axis, surf.radius);
+            // Keep the face's OWN frame (only the origin slides along the
+            // axis): the fuse parks each band's parametric seam in the gap
+            // between its trim curves, and rebuilding the frame from the axis
+            // would put the seam back through a notch.
+            let shifted = cadcore_geom::CylSurf {
+                frame: cadcore_math::Frame3 {
+                    origin: surf.frame.origin + axis.as_vec() * lo,
+                    ..surf.frame
+                },
+                radius: surf.radius,
+            };
             Some(FaceDomain::CylinderBand { surf: shifted, length: hi - lo })
         }
         (FaceGeom::Torus(surf), ext) => {

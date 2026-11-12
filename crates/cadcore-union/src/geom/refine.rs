@@ -181,6 +181,57 @@ pub fn refine_point_dyn(
     (p, residual)
 }
 
+/// Refine `p` onto the common point of three (or more) surfaces by Newton's
+/// method on their tangent planes.
+///
+/// Cyclic projection ([`refine_point`]) converges linearly at a rate set by
+/// the angles between the surfaces, and a junction curve that meets the cut
+/// plane at a grazing angle leaves it 1e-7 short after 60 sweeps — a point
+/// each face then lifts onto *its* surface differently.  Newton's step is the
+/// intersection of the three tangent planes at the current feet and converges
+/// quadratically; a singular configuration (two tangent surfaces) falls back
+/// to cyclic projection.  Only the first three surfaces drive the iteration;
+/// the residual is measured against all of them.
+pub fn refine_triple_point(
+    p: Point3,
+    surfaces: &[AnalyticSurface],
+    tol: f64,
+    max_iter: usize,
+) -> (Point3, f64) {
+    if surfaces.len() < 3 {
+        return refine_point(p, surfaces, tol, max_iter);
+    }
+    let residual = |q: Point3| -> f64 {
+        surfaces.iter().map(|s| s.distance(q)).fold(0.0, f64::max)
+    };
+    let mut q = p;
+    for _ in 0..max_iter {
+        let mut planes: Vec<(Vec3, f64)> = Vec::with_capacity(3);
+        for s in &surfaces[..3] {
+            let foot = s.project(q);
+            let Some(n) = s.normal_at(foot) else {
+                return refine_point(p, surfaces, tol, max_iter);
+            };
+            planes.push((n, n.dot(foot - Point3::new(0.0, 0.0, 0.0))));
+        }
+        let (n0, d0) = planes[0];
+        let (n1, d1) = planes[1];
+        let (n2, d2) = planes[2];
+        let det = n0.dot(n1.cross(n2));
+        if det.abs() < 1e-9 {
+            return refine_point(p, surfaces, tol, max_iter);
+        }
+        let x = (n1.cross(n2) * d0 + n2.cross(n0) * d1 + n0.cross(n1) * d2) * (1.0 / det);
+        let next = Point3::new(0.0, 0.0, 0.0) + x;
+        let step = (next - q).length();
+        q = next;
+        if step < tol {
+            break;
+        }
+    }
+    (q, residual(q))
+}
+
 /// Refine a cut point that must live ON a shared boundary circle while also
 /// lying on the surfaces of `others`.
 ///

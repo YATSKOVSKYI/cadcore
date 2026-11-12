@@ -19,7 +19,10 @@
 pub mod assembly;
 pub mod cells;
 pub mod filament;
+pub mod fixtures;
+pub mod merge;
 pub mod domain;
 pub mod registry;
 pub mod scaffold;
 pub mod solid;
+pub mod universal;
