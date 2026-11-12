@@ -28,6 +28,7 @@ pub mod arrange;
 pub mod boolean;
 pub mod config;
 pub mod diag;
+pub(crate) mod fasthash;
 pub mod geom;
 pub mod lattice;
 pub mod tolerance;

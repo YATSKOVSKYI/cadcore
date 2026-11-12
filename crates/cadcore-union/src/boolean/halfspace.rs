@@ -124,7 +124,11 @@ pub fn half_space_cut_robust(src: &BRep, faces: &[FaceId], keep: &Plane3, knit: 
             half_space_cut(src, faces, &plane, knit)
         }));
         let Ok(Some(outcome)) = attempt else { continue };
+        let t_chk = std::time::Instant::now();
         let violations = crate::validate::manifold::check(&outcome.brep, outcome.shell).violations.len();
+        if std::env::var("CADCORE_TIME").is_ok() {
+            eprintln!("[cut][time] robust manifold check: {} ms", t_chk.elapsed().as_millis());
+        }
         let better = best.as_ref().map_or(true, |b| violations < b.violations);
         if better {
             best = Some(RobustCut { outcome, shift, violations });
@@ -208,9 +212,20 @@ pub fn half_space_cut(
     // kept or dropped WHOLE, never sectioned along its own edge.
     const TAU_ON: f64 = 1e-6;
     let mut sides: HashMap<FaceId, Side> = HashMap::new();
-    for &fid in faces {
-        sides.insert(fid, face_side(src, fid, keep, TAU_ON));
+    let side_list = crate::fasthash::par_map(faces, |&fid| face_side(src, fid, keep, TAU_ON));
+    for (&fid, side) in faces.iter().zip(side_list) {
+        sides.insert(fid, side);
     }
+    // Section every straddling face with the plane up front, on all cores —
+    // each is independent and only reads `src`; consumed in face order below.
+    let straddlers: Vec<FaceId> = faces.iter().copied().filter(|f| sides[f] == Side::Straddles).collect();
+    let mut sections: HashMap<FaceId, Vec<SsiCurve>> = straddlers
+        .iter()
+        .copied()
+        .zip(crate::fasthash::par_map(&straddlers, |&fid| {
+            intersect_faces_with(src, fid, &cut_brep, cut_face, SsiOptions::all())
+        }))
+        .collect();
     let mut ssi: Vec<HashMap<FaceId, Vec<SsiCurve>>> = vec![HashMap::new()];
     let mut dropped = 0usize;
     // edge → the faces using it (real-loop faces only).
@@ -284,7 +299,7 @@ pub fn half_space_cut(
             Side::Kept => {}
             Side::Cut => dropped += 1,
             Side::Straddles => {
-                let curves = intersect_faces_with(src, fid, &cut_brep, cut_face, SsiOptions::all());
+                let curves = sections.remove(&fid).unwrap_or_default();
                 if std::env::var("CADCORE_DUMP_CUT").is_ok() {
                     eprintln!("[cut][ssi] {fid:?} straddles → {} curves", curves.len());
                 }
@@ -794,8 +809,12 @@ fn emit_cut_faces(
         }
     }
 
+    let prof = std::env::var("CADCORE_TIME").is_ok();
+    let (mut t_copy, mut n_copy, mut t_arr, mut n_arr) = (0.0f64, 0usize, 0.0f64, 0usize);
+    let t_pass1 = std::time::Instant::now();
     for &fid in faces {
         let f = &src.faces[fid];
+        let t_face = std::time::Instant::now();
         // Faces the plane does not touch AT ALL and that carry real topology are
         // copied verbatim — see `Assembler::emit_face_copy` for why re-arranging
         // them is NOT a no-op on a fused shell.  Template faces (no loops) have
@@ -817,6 +836,8 @@ fn emit_cut_faces(
                 Side::Cut => continue,
                 Side::Kept => {
                     asm.emit_face_copy(src, fid, &joints);
+                    t_copy += t_face.elapsed().as_secs_f64();
+                    n_copy += 1;
                     continue;
                 }
                 Side::Straddles => {} // fall through to the arrangement
@@ -993,6 +1014,16 @@ fn emit_cut_faces(
                     .collect::<Vec<_>>()
             );
         }
+        t_arr += t_face.elapsed().as_secs_f64();
+        n_arr += 1;
+    }
+    if prof {
+        eprintln!(
+            "[cut][time]   copied {n_copy} faces {:.0} ms, arranged {n_arr} faces {:.0} ms, other {:.0} ms",
+            t_copy * 1e3,
+            t_arr * 1e3,
+            (t_pass1.elapsed().as_secs_f64() - t_copy - t_arr) * 1e3
+        );
     }
 }
 
@@ -1394,6 +1425,36 @@ pub(crate) fn insert_joints(poly: &mut Vec<Point3>, joints: &[Point3]) {
     if joints.is_empty() || poly.len() < 2 {
         return;
     }
+    // Only joints near the polyline can act on it: both tests below accept a
+    // joint at most max(JOINT_SNAP, 0.01) from a vertex or a segment foot, and
+    // every foot lies inside the polyline's box.  Filtering by that box (with a
+    // margin above the widest window) keeps the result identical and turns the
+    // per-segment scan over EVERY joint of the cut into a scan over a handful —
+    // the copy of an untouched face was O(samples × all joints).
+    const NEAR: f64 = 0.011;
+    let near: Vec<Point3>;
+    let joints: &[Point3] = if joints.len() > 8 {
+        let (mut lo, mut hi) = (poly[0], poly[0]);
+        for p in poly.iter() {
+            lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+            hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+        }
+        near = joints
+            .iter()
+            .copied()
+            .filter(|j| {
+                j.x >= lo.x - NEAR
+                    && j.x <= hi.x + NEAR
+                    && j.y >= lo.y - NEAR
+                    && j.y <= hi.y + NEAR
+                    && j.z >= lo.z - NEAR
+                    && j.z <= hi.z + NEAR
+            })
+            .collect();
+        &near
+    } else {
+        joints
+    };
     // A joint a hair off an existing vertex REPLACES it: the joint is the exact
     // triple point every consumer shares, the vertex is a sample (a band-end
     // crossing of a 1e-5-fuzzy rim, a seam snap) that would otherwise become a

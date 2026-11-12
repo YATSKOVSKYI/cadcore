@@ -16,7 +16,9 @@
 //! third edge arrives (joints, seam touches, triple points) are kept, so the
 //! shell's topology stays exactly what the Boolean computed.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
+
+use crate::fasthash::FastMap as HashMap;
 
 use cadcore_geom::Line3;
 use cadcore_math::Point3;
@@ -34,8 +36,15 @@ pub fn merge_shell_edges(brep: &mut BRep, shell: ShellId) -> usize {
         }
     }
     let mut removed = 0usize;
+    // The incidence maps are built once and kept current by `try_merge`.
+    // Passes keep their old semantics exactly: within one pass an edge created
+    // by a merge is not merged again (the per-pass rebuild this replaces left
+    // such edges out of the maps until the next pass), and each ring merges at
+    // most once per pass.  Same merges in the same order, without rebuilding
+    // ~10⁵ entries after every pass.
+    let (mut edge_coedges, mut vertex_edges) = incidence(brep, &loops);
     loop {
-        let (edge_coedges, vertex_edges) = incidence(brep, &loops);
+        let mut created: HashSet<EdgeId> = HashSet::new();
         let mut did = 0usize;
         for &lid in &loops {
             // Walk the ring; after a merge the ring changed, so restart it.
@@ -52,9 +61,11 @@ pub fn merge_shell_edges(brep: &mut BRep, shell: ShellId) -> usize {
                     if n == c || n == start && guard == 0 && brep.coedges[start].next == start {
                         break 'ring;
                     }
-                    if try_merge(brep, lid, c, n, &edge_coedges, &vertex_edges) {
+                    if let Some(merged) =
+                        try_merge(brep, lid, c, n, &mut edge_coedges, &mut vertex_edges, &created)
+                    {
+                        created.insert(merged);
                         did += 1;
-                        // incidence is stale now — rebuild before continuing
                         break 'ring;
                     }
                     c = n;
@@ -78,7 +89,7 @@ fn incidence(
     brep: &BRep,
     loops: &[LoopId],
 ) -> (HashMap<EdgeId, Vec<CoEdgeId>>, HashMap<VertexId, Vec<EdgeId>>) {
-    let mut edge_coedges: HashMap<EdgeId, Vec<CoEdgeId>> = HashMap::new();
+    let mut edge_coedges: HashMap<EdgeId, Vec<CoEdgeId>> = HashMap::default();
     for &lid in loops {
         let Some(lp) = brep.loops.get(lid) else { continue };
         let start = lp.start;
@@ -96,7 +107,7 @@ fn incidence(
             }
         }
     }
-    let mut vertex_edges: HashMap<VertexId, Vec<EdgeId>> = HashMap::new();
+    let mut vertex_edges: HashMap<VertexId, Vec<EdgeId>> = HashMap::default();
     for &eid in edge_coedges.keys() {
         let e = &brep.edges[eid];
         for v in [e.v_start, e.v_end] {
@@ -161,42 +172,46 @@ fn try_merge(
     lid: LoopId,
     c1: CoEdgeId,
     c2: CoEdgeId,
-    edge_coedges: &HashMap<EdgeId, Vec<CoEdgeId>>,
-    vertex_edges: &HashMap<VertexId, Vec<EdgeId>>,
-) -> bool {
+    edge_coedges: &mut HashMap<EdgeId, Vec<CoEdgeId>>,
+    vertex_edges: &mut HashMap<VertexId, Vec<EdgeId>>,
+    created: &HashSet<EdgeId>,
+) -> Option<EdgeId> {
     let e1 = brep.coedges[c1].edge;
     let e2 = brep.coedges[c2].edge;
+    if created.contains(&e1) || created.contains(&e2) {
+        return None; // made in this pass — merged again in the next one
+    }
     if e1 == e2 {
-        return false; // a seam slit traversed twice in a row — not a chain
+        return None; // a seam slit traversed twice in a row — not a chain
     }
     let (a, v) = from_to(brep, c1);
     let (v2, b) = from_to(brep, c2);
     if v != v2 || a == b {
-        return false; // broken ring, or the merge would close the edge on itself
+        return None; // broken ring, or the merge would close the edge on itself
     }
     // exactly these two edges meet at v
     match vertex_edges.get(&v) {
         Some(list) if list.len() == 2 && list.contains(&e1) && list.contains(&e2) => {}
-        _ => return false,
+        _ => return None,
     }
     // partner co-edges, consecutive in the opposite order on the other face
     let (Some(u1), Some(u2)) = (edge_coedges.get(&e1), edge_coedges.get(&e2)) else {
-        return false;
+        return None;
     };
     if u1.len() != 2 || u2.len() != 2 {
-        return false;
+        return None;
     }
     let p1 = if u1[0] == c1 { u1[1] } else { u1[0] };
     let p2 = if u2[0] == c2 { u2[1] } else { u2[0] };
     if p1 == c1 || p2 == c2 || p1 == c2 || p2 == c1 {
-        return false;
+        return None;
     }
     if brep.coedges[p2].next != p1 {
-        return false; // partner does not traverse e2 then e1 → different faces or inconsistent
+        return None; // partner does not traverse e2 then e1 → different faces or inconsistent
     }
     let plid = brep.coedges[p1].loop_id;
     if brep.coedges[p2].loop_id != plid {
-        return false;
+        return None;
     }
     // same two faces on both sides (the partner loop may be this very loop —
     // a seam slit — which is fine)
@@ -220,19 +235,19 @@ fn try_merge(
                 }
             }
             if pts.len() < 2 {
-                return false;
+                return None;
             }
             (EdgeGeom::Polyline(pts), 0.0, 1.0)
         }
         (EdgeGeom::Line(_), EdgeGeom::Line(_)) => {
             let d = pb - pa;
             let len = d.length();
-            let Some(dir) = d.try_normalize() else { return false };
+            let Some(dir) = d.try_normalize() else { return None };
             // collinear: the middle vertex lies on the chord
             let w = pv - pa;
             let off = (w - dir * w.dot(dir)).length();
             if off > 1e-9 {
-                return false;
+                return None;
             }
             (
                 EdgeGeom::Line(Line3::new(pa, cadcore_math::UnitVec3::new_unchecked(dir))),
@@ -246,7 +261,7 @@ fn try_merge(
                 || (ca.radius - cb.radius).abs() > 1e-9
                 || !same_axis
             {
-                return false;
+                return None;
             }
             // parameterise on circle `ca`, running a → v → b
             let ang = |p: Point3| {
@@ -263,11 +278,11 @@ fn try_merge(
             // An arc is written between its two end vertices; past 180° the
             // short way round is the WRONG way, so arcs stay under it.
             if total.abs() > 0.9 * std::f64::consts::PI {
-                return false;
+                return None;
             }
             (EdgeGeom::Circle(*ca), t0, t0 + total)
         }
-        _ => return false,
+        _ => return None,
     };
 
     // ── apply ───────────────────────────────────────────────────────────────
@@ -303,7 +318,24 @@ fn try_merge(
     brep.edges.remove(e1);
     brep.edges.remove(e2);
     brep.vertices.remove(v);
-    true
+    // keep the incidence maps current
+    edge_coedges.remove(&e1);
+    edge_coedges.remove(&e2);
+    edge_coedges.insert(merged, vec![c1, p2]);
+    vertex_edges.remove(&v);
+    for (vx, old) in [(a, e1), (b, e2)] {
+        if let Some(list) = vertex_edges.get_mut(&vx) {
+            for e in list.iter_mut() {
+                if *e == old {
+                    *e = merged;
+                }
+            }
+            // a list never holds an edge twice (the rebuild deduplicated)
+            let mut seen: Vec<EdgeId> = Vec::with_capacity(list.len());
+            list.retain(|e| if seen.contains(e) { false } else { seen.push(*e); true });
+        }
+    }
+    Some(merged)
 }
 
 #[cfg(test)]

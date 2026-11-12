@@ -200,14 +200,49 @@ fn wire_uv(
 
 /// Run gates 2+3 on every supported face of `shell`.
 pub fn check(brep: &BRep, shell: ShellId) -> Vec<String> {
-    let mut issues = Vec::new();
     let Some(sh) = brep.shells.get(shell) else {
         return vec![format!("shell {shell:?} does not exist")];
     };
-    for &fid in &sh.faces {
-        check_face(brep, fid, &mut issues);
+    let faces = &sh.faces;
+    // Faces are checked independently and only read the B-Rep: spread them
+    // over the cores (dynamic hand-out — a few dense faces dominate), then put
+    // the findings back in face order so the report is exactly the serial one.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    if threads <= 1 || faces.len() < 64 {
+        let mut issues = Vec::new();
+        for &fid in faces {
+            check_face(brep, fid, &mut issues);
+        }
+        return issues;
     }
-    issues
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut per_face: Vec<(usize, Vec<String>)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done: Vec<(usize, Vec<String>)> = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= faces.len() {
+                            break;
+                        }
+                        let mut issues = Vec::new();
+                        check_face(brep, faces[i], &mut issues);
+                        if !issues.is_empty() {
+                            done.push((i, issues));
+                        }
+                    }
+                    done
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("wire check worker panicked"))
+            .collect()
+    });
+    per_face.sort_by_key(|(i, _)| *i);
+    per_face.into_iter().flat_map(|(_, v)| v).collect()
 }
 
 /// Run gates 2+3 on one face.

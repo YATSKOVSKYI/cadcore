@@ -54,13 +54,38 @@ pub fn validate_shell(
     diag: &mut Diagnostics,
 ) -> ValidationReport {
     let tol = &cfg.tol;
-    let mreport = manifold::check(brep, shell);
+    // The three checks only read the shell: run them side by side.
+    let timing = std::env::var("CADCORE_TIME").is_ok();
+    let (mreport, wire_violations, (distance_violations, max_edge_deviation)) = std::thread::scope(|s| {
+        let m = s.spawn(|| {
+            let t = std::time::Instant::now();
+            let r = manifold::check(brep, shell);
+            (r, t.elapsed())
+        });
+        let w = s.spawn(|| {
+            let t = std::time::Instant::now();
+            let r = wires::check(brep, shell);
+            (r, t.elapsed())
+        });
+        let t = std::time::Instant::now();
+        let d = distance::check(brep, shell, tol.knit);
+        let td = t.elapsed();
+        let (m, tm) = m.join().expect("manifold check panicked");
+        let (w, tw) = w.join().expect("wire check panicked");
+        if timing {
+            eprintln!(
+                "[gate][time] manifold {} ms, wires {} ms, distance {} ms",
+                tm.as_millis(),
+                tw.as_millis(),
+                td.as_millis()
+            );
+        }
+        (m, w, d)
+    });
     let manifold_violations = mreport.violations;
     for w in &mreport.sense_warnings {
         diag.event(Severity::Warning, "gate.manifold.sense", w.clone());
     }
-    let wire_violations = wires::check(brep, shell);
-    let (distance_violations, max_edge_deviation) = distance::check(brep, shell, tol.knit);
 
     for v in &manifold_violations {
         diag.event(Severity::Error, "gate.manifold", v.clone());

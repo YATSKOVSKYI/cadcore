@@ -9,7 +9,6 @@
 //! faces meeting at an edge present byte-identical endpoints, so the cache
 //! collapses them into exactly one twice-used edge — README invariants #2,#3.
 
-use std::collections::HashMap;
 
 use cadcore_geom::arrangement::LoopStep;
 use cadcore_geom::{Circle3, CylSurf, Plane3, TorusSurf};
@@ -359,9 +358,9 @@ struct EdgeKey {
 pub struct Assembler<'b> {
     brep: &'b mut BRep,
     tol: f64,
-    verts: HashMap<PtKey, VertexId>,
+    verts: crate::fasthash::FastMap<PtKey, VertexId>,
     /// edge key → (edge id, first user's start vertex)
-    edges: HashMap<EdgeKey, (EdgeId, VertexId)>,
+    edges: crate::fasthash::FastMap<EdgeKey, (EdgeId, VertexId)>,
     /// (weld group, circle key) → (edge id, first user's start vertex) — analytic
     /// rim/cap circles, shared SEAMLESSLY between a cylinder rim and its cap /
     /// elbow WITHIN one weld group.
@@ -377,7 +376,7 @@ pub struct Assembler<'b> {
     /// two independent twice-used edges the way a manifold shell requires.
     /// Crossing *windows* (which MUST weld across filaments) go through the
     /// polyline `edges` cache instead and stay global.
-    circles: HashMap<(u32, CircleKey), (EdgeId, VertexId)>,
+    circles: crate::fasthash::FastMap<(u32, CircleKey), (EdgeId, VertexId)>,
     faces: Vec<cadcore_topo::FaceId>,
 }
 
@@ -397,9 +396,9 @@ impl<'b> Assembler<'b> {
         Self {
             brep,
             tol,
-            verts: HashMap::new(),
-            edges: HashMap::new(),
-            circles: HashMap::new(),
+            verts: Default::default(),
+            edges: Default::default(),
+            circles: Default::default(),
             faces: Vec::new(),
         }
     }

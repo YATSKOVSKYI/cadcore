@@ -247,7 +247,11 @@ pub fn trim_shell(src: &BRep, shell: ShellId, planes: &[Plane3], knit: f64) -> O
         owned = Some((robust.outcome.brep, robust.outcome.shell));
     }
     let (mut brep, shell) = owned?;
+    let t_merge = std::time::Instant::now();
     let merged_edges = merge_shell_edges(&mut brep, shell);
+    if std::env::var("CADCORE_TIME").is_ok() {
+        eprintln!("[cut][time] merge_shell_edges: {} ms", t_merge.elapsed().as_millis());
+    }
     Some(TrimOutcome { brep, shell, trims, merged_edges })
 }
 

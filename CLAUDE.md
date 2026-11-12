@@ -205,3 +205,22 @@ A trim at d/2 runs ALONG the outermost filament and through its flat end cap.
 * The application must hand the kernel STRAIGHT legs: recover corners from the
   run's chord, never from the direction of its first sample (see
   `brep/tests/straight_legs.rs` in DIW Forge).
+
+## 0.2.2 — speed without changing a single result
+
+The fuse → cut → merge chain on a 15 × 15 mm, 12-layer lattice went from 6.3 s to 2.1 s
+(DIW Forge export 8.3 → 2.8 s).  The rules that keep the output identical:
+
+* **Parallel work is pure and re-ordered.**  The fuse's per-face arrangement, `fasthash::par_map`
+  (cut face classification + plane sections) and `wires::check` hand items out dynamically and
+  put results back in input order; everything that writes into an `Assembler` stays serial in
+  the original order (the shared-edge cache decides which face is the "first user").
+* **`FastMap` only for maps that are looked up, never iterated** (assembler vertex/edge/circle
+  caches, merge incidence).  Iteration order would differ from `std`'s.
+* **`merge_shell_edges` keeps its incidence current** but preserves the old pass semantics:
+  an edge created by a merge is NOT merged again in the same pass (the old per-pass rebuild left
+  it out of the maps until the next pass), one merge per ring per pass.  Same merge count.
+* **`insert_joints` pre-filters joints by the polyline's box + 0.011** (> the widest acceptance
+  window, 0.01) — and still runs the full dedup pass when no joint is near.
+* The STEP output was already order-nondeterministic run to run (~70 of 3·10⁵ points differ):
+  compare outputs geometrically (entity counts, point multiset, FreeCAD volume), not by bytes.

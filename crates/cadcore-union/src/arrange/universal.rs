@@ -119,6 +119,8 @@ pub fn fuse_filaments_with(
     opts: &FuseOptions,
 ) -> (ShellId, FuseReport) {
     let mut report = FuseReport::default();
+    let timing = std::env::var("CADCORE_TIME").is_ok();
+    let t_fuse = std::time::Instant::now();
     let bodies: Vec<Body> = filaments.iter().map(Body::new).collect();
     let nb = bodies.len();
 
@@ -153,6 +155,10 @@ pub fn fuse_filaments_with(
         }
     }
 
+    if timing {
+        eprintln!("[fuse][time] trace pairs: {} ms", t_fuse.elapsed().as_millis());
+    }
+    let t_stage = std::time::Instant::now();
     // ── 2. Shared chains: junction circles + pieces ──────────────────────────
     // Park every leg's parametric seam (u = 0) in the widest angular gap left
     // by the pieces on it.  A piece crossing the seam has to be split there on
@@ -216,42 +222,94 @@ pub fn fuse_filaments_with(
         .map(|(k, jc)| (*k, jc.sample(opts.circle_samples)))
         .collect();
 
+    if timing {
+        eprintln!("[fuse][time] chains: {} ms", t_stage.elapsed().as_millis());
+    }
+    let t_stage = std::time::Instant::now();
+    let mut t_cells = std::time::Duration::ZERO;
     // ── 3 + 4. Arrange every face and stitch the kept cells ─────────────────
-    let mut asm = Assembler::new(brep, opts.weld);
-    for (bi, b) in bodies.iter().enumerate() {
+    // Every face's arrangement + classification is independent and only reads
+    // the bodies, so it runs on all cores first; the cells are then emitted in
+    // the original (body, member) order through the one assembler, so the
+    // shared-edge cache sees exactly the serial sequence.
+    let tasks: Vec<(usize, Member)> = bodies
+        .iter()
+        .enumerate()
+        .flat_map(|(bi, b)| b.members().into_iter().map(move |m| (bi, m)))
+        .collect();
+    let arrange_one = |bi: usize, m: Member| {
+        let b = &bodies[bi];
         let drop = |p: Point3| {
             bodies
                 .iter()
                 .enumerate()
                 .any(|(k, other)| k != bi && other.tube.contains(p))
         };
-        for m in b.members() {
-            let domain = b.domain(m);
-            let mut chains: Vec<FaceChain> = Vec::new();
-            let mut tag = 1u32;
-            for key in b.junctions_of(m) {
-                let Some(pts) = sampled.get(&JunctionKey { body: bi, leg: key.0, end: key.1 }) else {
+        let domain = b.domain(m);
+        let mut chains: Vec<FaceChain> = Vec::new();
+        let mut tag = 1u32;
+        for key in b.junctions_of(m) {
+            let Some(pts) = sampled.get(&JunctionKey { body: bi, leg: key.0, end: key.1 }) else {
+                continue;
+            };
+            let uv: Vec<(f64, f64)> = pts.iter().map(|&p| domain.uv(p)).collect();
+            chains.push(FaceChain { pts: uv, tag });
+            tag += 1;
+        }
+        let mut ptag = 1000u32;
+        for lp in &loops {
+            for piece in &lp.pieces {
+                if piece.a != (bi, m) && piece.b != (bi, m) {
                     continue;
-                };
-                let uv: Vec<(f64, f64)> = pts.iter().map(|&p| domain.uv(p)).collect();
-                chains.push(FaceChain { pts: uv, tag });
-                tag += 1;
-            }
-            let mut ptag = 1000u32;
-            for lp in &loops {
-                for piece in &lp.pieces {
-                    if piece.a != (bi, m) && piece.b != (bi, m) {
-                        continue;
-                    }
-                    if piece.pts.len() < 2 {
-                        continue;
-                    }
-                    let uv: Vec<(f64, f64)> = piece.pts.iter().map(|&p| domain.uv(p)).collect();
-                    chains.push(FaceChain { pts: uv, tag: ptag });
-                    ptag += 1;
                 }
+                if piece.pts.len() < 2 {
+                    continue;
+                }
+                let uv: Vec<(f64, f64)> = piece.pts.iter().map(|&p| domain.uv(p)).collect();
+                chains.push(FaceChain { pts: uv, tag: ptag });
+                ptag += 1;
             }
-            let cells = crate::arrange::cells::arrange_and_classify_halved(&domain, &chains, &drop);
+        }
+        let cells = crate::arrange::cells::arrange_and_classify_halved(&domain, &chains, &drop);
+        (domain, chains.len(), ptag, cells)
+    };
+    let tc = std::time::Instant::now();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    let mut arranged: Vec<(usize, _)> = if threads <= 1 || tasks.len() < 8 {
+        tasks.iter().enumerate().map(|(i, &(bi, m))| (i, arrange_one(bi, m))).collect()
+    } else {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let mut done = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= tasks.len() {
+                                break;
+                            }
+                            let (bi, m) = tasks[i];
+                            done.push((i, arrange_one(bi, m)));
+                        }
+                        done
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().expect("fuse arrangement worker panicked"))
+                .collect()
+        })
+    };
+    arranged.sort_by_key(|(i, _)| *i);
+    t_cells += tc.elapsed();
+
+    let mut asm = Assembler::new(brep, opts.weld);
+    for (i, (domain, n_chains, ptag, cells)) in arranged {
+        let (bi, m) = tasks[i];
+        let b = &bodies[bi];
+        {
             let geom = match m {
                 Member::Leg(l) => FaceGeom::Cylinder(b.legs[l].surf),
                 Member::Elbow(e) => FaceGeom::Torus(b.elbows[e].surf),
@@ -260,7 +318,7 @@ pub fn fuse_filaments_with(
             if std::env::var("CADCORE_DUMP_FUSE").is_ok() {
                 eprintln!(
                     "[fuse] body {bi} {m:?}: chains={} (pieces={}) cells={} kept={}",
-                    chains.len(),
+                    n_chains,
                     ptag - 1000,
                     cells.len(),
                     cells.iter().filter(|c| c.keep).count()
@@ -286,6 +344,13 @@ pub fn fuse_filaments_with(
         }
     }
 
+    if timing {
+        eprintln!(
+            "[fuse][time] arrange + emit: {} ms (of which arrange/classify {} ms)",
+            t_stage.elapsed().as_millis(),
+            t_cells.as_millis()
+        );
+    }
     let faces = asm.faces().to_vec();
     report.faces = faces.len();
     let shell = brep.add_shell(Shell {
