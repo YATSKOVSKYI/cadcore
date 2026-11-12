@@ -19,8 +19,11 @@
 //! are NOT united with it: place them on [`TrimInfo::plane`], the plane each
 //! cut actually used.
 
-use cadcore_geom::Plane3;
+use cadcore_geom::{CylSurf, Plane3, TorusSurf};
+use cadcore_math::Point3;
 use cadcore_topo::{BRep, ShellId};
+
+use crate::geom::composite::CompositeTube;
 
 use crate::arrange::merge::merge_shell_edges;
 use crate::arrange::scaffold::Filament;
@@ -83,6 +86,129 @@ impl LatticeOutcome {
     /// `true` when no trace was abandoned and every cut is watertight.
     pub fn is_watertight(&self) -> bool {
         self.fuse.aborted == 0 && self.trims.iter().all(|t| t.violations == 0)
+    }
+}
+
+/// The same solid as [`fuse_and_trim`] builds, as a **point-membership model**:
+/// the union of the filament tubes intersected with the kept half-spaces.
+///
+/// A volume mesher (voxels, marching tetrahedra) does not need the boundary
+/// representation — it needs to ask "is this point material?" — and it must
+/// get the answer for the SAME solid the exact B-Rep describes, or the mesh
+/// and the exported model drift apart at every trimmed end.  This is that
+/// oracle: exact tubes (legs and torus elbows, no chord approximation) and
+/// flat trim planes.
+///
+/// ```no_run
+/// use cadcore_union::{fuse_and_trim, Filament, FuseOptions, LatticeModel};
+/// # let filaments: Vec<Filament> = Vec::new();
+/// # let planes = [];
+/// let part = fuse_and_trim(&filaments, &FuseOptions::default(), &planes, 1.0e-6);
+/// // membership for exactly the solid that was cut (planes as actually used)
+/// let model = LatticeModel::for_trims(&filaments, &part.trims);
+/// let (lo, hi) = model.bounds();
+/// # let _ = (lo, hi);
+/// ```
+#[derive(Debug, Clone)]
+pub struct LatticeModel {
+    tubes: Vec<CompositeTube>,
+    keep: Vec<Plane3>,
+    lo: [f64; 3],
+    hi: [f64; 3],
+}
+
+impl LatticeModel {
+    /// The union of `filaments` kept on the normal side of every plane in `keep`.
+    pub fn new(filaments: &[Filament], keep: &[Plane3]) -> Self {
+        Self::inflated(filaments, keep, 0.0)
+    }
+
+    /// As [`new`](Self::new), on the planes a trim actually used (a robust cut
+    /// may have moved them — see [`TrimInfo::plane`]).
+    pub fn for_trims(filaments: &[Filament], trims: &[TrimInfo]) -> Self {
+        let keep: Vec<Plane3> = trims.iter().map(|t| t.plane).collect();
+        Self::new(filaments, &keep)
+    }
+
+    /// As [`new`](Self::new) with every tube radius grown by `extra` (mm).
+    ///
+    /// A voxel mesher marks a cell conductive by its centre; growing the tubes
+    /// by half a cell makes a cell conductive when the cell itself reaches the
+    /// filament, which keeps thin inter-layer bonds connected on a coarse
+    /// grid.  The trim planes are NOT moved.
+    pub fn inflated(filaments: &[Filament], keep: &[Plane3], extra: f64) -> Self {
+        let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+        let mut grow = |p: Point3, r: f64| {
+            for (k, c) in [p.x, p.y, p.z].into_iter().enumerate() {
+                lo[k] = lo[k].min(c - r);
+                hi[k] = hi[k].max(c + r);
+            }
+        };
+        let mut tubes = Vec::with_capacity(filaments.len());
+        for f in filaments {
+            let mut t = CompositeTube::new();
+            for l in &f.legs {
+                let r = l.surf.radius + extra;
+                let surf = CylSurf { frame: l.surf.frame, radius: r };
+                grow(surf.frame.origin, r);
+                grow(surf.frame.origin + surf.axis().as_vec() * l.length, r);
+                t = t.with_leg(surf, l.length);
+            }
+            for e in &f.elbows {
+                let r = e.surf.minor_radius + extra;
+                let surf = TorusSurf { frame: e.surf.frame, major_radius: e.surf.major_radius, minor_radius: r };
+                for k in 0..=8 {
+                    let th = e.theta_lo + (e.theta_hi - e.theta_lo) * k as f64 / 8.0;
+                    let spine = surf.frame.origin
+                        + (surf.frame.x * th.cos() + surf.frame.y * th.sin()) * surf.major_radius;
+                    // the chord sagitta of an eighth of the arc is covered by the pad
+                    grow(spine, r + surf.major_radius * 0.02);
+                }
+                t = t.with_elbow(surf, e.theta_lo, e.theta_hi);
+            }
+            tubes.push(t);
+        }
+        Self { tubes, keep: keep.to_vec(), lo, hi }
+    }
+
+    /// Is `p` inside the solid (in some tube and on the kept side of every plane)?
+    pub fn contains(&self, p: Point3) -> bool {
+        self.keep.iter().all(|pl| pl.signed_distance(p) >= 0.0) && self.tubes.iter().any(|t| t.contains(p))
+    }
+
+    /// Axis-aligned box enclosing the untrimmed tubes (`lo`, `hi`).
+    pub fn bounds(&self) -> (Point3, Point3) {
+        (Point3::new(self.lo[0], self.lo[1], self.lo[2]), Point3::new(self.hi[0], self.hi[1], self.hi[2]))
+    }
+
+    /// The kept half-spaces.
+    pub fn keep_planes(&self) -> &[Plane3] {
+        &self.keep
+    }
+
+    /// Volume by midpoint sampling on an `n[0] × n[1] × n[2]` grid over
+    /// [`bounds`](Self::bounds) — an independent check for the volume a CAD
+    /// system reports for the exported B-Rep.
+    pub fn sampled_volume(&self, n: [usize; 3]) -> f64 {
+        let (lo, hi) = (self.lo, self.hi);
+        if n.iter().any(|&k| k == 0) || (0..3).any(|k| hi[k] <= lo[k]) {
+            return 0.0;
+        }
+        let mut inside = 0usize;
+        for i in 0..n[0] {
+            let x = lo[0] + (hi[0] - lo[0]) * (i as f64 + 0.5) / n[0] as f64;
+            for j in 0..n[1] {
+                let y = lo[1] + (hi[1] - lo[1]) * (j as f64 + 0.5) / n[1] as f64;
+                for k in 0..n[2] {
+                    let z = lo[2] + (hi[2] - lo[2]) * (k as f64 + 0.5) / n[2] as f64;
+                    if self.contains(Point3::new(x, y, z)) {
+                        inside += 1;
+                    }
+                }
+            }
+        }
+        let cell = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]) / (n[0] * n[1] * n[2]) as f64;
+        inside as f64 * cell
     }
 }
 
@@ -187,6 +313,32 @@ mod tests {
         for t in &part.trims {
             assert!((t.plane.frame.origin - t.requested.frame.origin).length() <= 0.04 + 1e-12);
         }
+    }
+
+    /// The membership model describes the solid the B-Rep bounds: a point just
+    /// inside a section cap is material, one just outside is not, and the
+    /// sampled volume is that of the lattice (20.66 mm³ for this fixture).
+    #[test]
+    fn membership_model_matches_the_trimmed_solid() {
+        let fils = gen::grid_6mm_4l();
+        let planes = [
+            Plane3::from_origin_normal(Point3::new(0.0, 1.0, 0.0), UnitVec3::Y),
+            Plane3::from_origin_normal(Point3::new(0.0, 5.0, 0.0), -UnitVec3::Y),
+        ];
+        let part = fuse_and_trim(&fils, &FuseOptions::default(), &planes, 1.0e-6);
+        let model = LatticeModel::for_trims(&fils, &part.trims);
+        // the first layer-1 leg runs along y at x = 0.275, z = 0.35
+        assert!(model.contains(Point3::new(0.275, 1.001, 0.35)));
+        assert!(!model.contains(Point3::new(0.275, 0.999, 0.35)));
+        assert!(model.contains(Point3::new(0.275, 4.999, 0.35)));
+        assert!(!model.contains(Point3::new(0.275, 5.001, 0.35)));
+        assert!(!model.contains(Point3::new(0.9, 3.0, 0.35))); // between two legs
+        let v = model.sampled_volume([160, 160, 44]);
+        assert!((v - 20.66).abs() < 0.15, "sampled volume {v}");
+        // inflating only grows it; the planes stay put
+        let fat = LatticeModel::inflated(&fils, model.keep_planes(), 0.05);
+        assert!(fat.contains(Point3::new(0.275 + 0.3, 3.0, 0.35)));
+        assert!(!fat.contains(Point3::new(0.275, 0.999, 0.35)));
     }
 
     /// No planes → the fused solid, edges merged.

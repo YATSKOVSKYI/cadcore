@@ -48,7 +48,7 @@ Add `cadcore` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cadcore = "0.1.23"
+cadcore = "0.1.24"
 ```
 
 Create a watertight U-shaped filament rod and export it to a STEP file:
@@ -126,11 +126,26 @@ let step = cadcore::step::brep_to_step(&part.brep)?;
 
 The stages are public too — `fuse_filaments_with`, `trim_shell`, `half_space_cut_robust`, `merge_shell_edges`, `validate_shell` — all re-exported from `cadcore::union`.
 
+### 🔺 7. One Solid, Every Consumer
+The exact model is the single source of geometry; everything downstream asks the kernel.
+
+* **Triangles** — `mesh::mesh_brep` turns any kernel B-Rep (trimmed half faces, section caps, plates) into per-face triangle meshes to a chord tolerance; `mesh::import_step` does the same for a STEP file written by another CAD system, and `mesh::section_outline` gives the closed outline a plane cuts out of a solid.
+* **Volume meshing** — `union::LatticeModel` is the point-membership form of the solid `fuse_and_trim` builds: exact tubes, flat trim planes. A voxel or tetrahedral mesher that asks it "is this point material?" meshes the same solid the STEP export describes. A DC-conduction solve on a voxel mesh of this model agrees with Ansys Maxwell solving the exported STEP to 2 %.
+
+```rust
+use cadcore::mesh::{mesh_brep, ImportOptions};
+use cadcore::union::LatticeModel;
+
+let (faces, _report) = mesh_brep(&part.brep, &ImportOptions::default())?;   // for display
+let model = LatticeModel::for_trims(&filaments, &part.trims);              // for meshing
+assert!(model.contains(some_point_inside));
+```
+
 ---
 
 ## Crate Architecture
 
-The kernel is modularly split into seven sub-crates:
+The kernel is modularly split into eight sub-crates:
 
 ```
 cadcore/
@@ -140,6 +155,7 @@ cadcore/
 │   ├── cadcore-topo    — Arena B-Rep database: Solid → Shell → Face → Loop → Edge
 │   ├── cadcore-ops     — High-level sweep and trimming operations
 │   ├── cadcore-union   — Booleans: universal filament fuse, planar cut, validation gates
+│   ├── cadcore-mesh    — Tessellation, STEP import, plane sections (B-Rep → triangles)
 │   ├── cadcore-step    — Watertight STEP AP203/AP214 writer
 │   └── cadcore         — Facade crate re-exporting everything under a single namespace
 ```

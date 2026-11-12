@@ -14,6 +14,7 @@
 //! | [`fuse_and_trim`] | filaments → one fused solid → planar trims → merged edges |
 //! | [`fuse_filaments_with`] | universal fuse of swept filaments into one closed shell |
 //! | [`trim_shell`] | robust planar trims of an already fused shell + edge merge |
+//! | [`LatticeModel`] | exact point membership of the same solid, for volume meshers |
 //! | [`half_space_cut_robust`] / [`half_space_cut`] | one planar cut with section caps |
 //! | [`merge_shell_edges`] | fold per-step edges back into whole curves |
 //! | [`validate_shell`] | the manifold / wire / distance gates |
@@ -37,7 +38,7 @@ pub use arrange::scaffold::Filament;
 pub use arrange::universal::{fuse_filaments, fuse_filaments_with, FuseOptions, FuseReport};
 pub use boolean::{half_space_cut, half_space_cut_robust, CutOutcome, RobustCut, ROBUST_CUT_SHIFTS};
 pub use config::UnionConfig;
-pub use lattice::{fuse_and_trim, trim_shell, LatticeOutcome, TrimInfo, TrimOutcome};
+pub use lattice::{fuse_and_trim, trim_shell, LatticeModel, LatticeOutcome, TrimInfo, TrimOutcome};
 pub use diag::{Diagnostics, Event, Severity};
 pub use pipeline::{UnionOutcome, UnionPipeline};
 pub use tolerance::Tolerances;

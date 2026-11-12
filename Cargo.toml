@@ -7,11 +7,12 @@ members  = [
     "crates/cadcore-ops",
     "crates/cadcore-union",
     "crates/cadcore-step",
+    "crates/cadcore-mesh",
     "crates/cadcore",
 ]
 
 [workspace.package]
-version      = "0.1.23"
+version      = "0.1.24"
 edition      = "2021"
 authors      = ["Dmytro Yatskovskyi <dmytroyatskovskiy@gmail.com>"]
 repository   = "https://github.com/YATSKOVSKYI/cadcore"

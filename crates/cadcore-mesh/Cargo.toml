@@ -1,0 +1,24 @@
+[package]
+name             = "cadcore-mesh"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+license.workspace    = true
+rust-version.workspace = true
+readme       = "README.md"
+description  = "Tessellation, STEP import and plane sections for the cadcore CAD kernel - exact B-Rep to triangle meshes, no OCCT dependency"
+keywords     = ["cad", "brep", "mesh", "step", "tessellation"]
+categories   = ["science", "graphics"]
+
+[dependencies]
+cadcore-math = { path = "../cadcore-math", version = "0.1.24" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.1.24" }
+cadcore-topo = { path = "../cadcore-topo", version = "0.1.24" }
+cadcore-step = { path = "../cadcore-step", version = "0.1.24" }
+serde        = { version = "1", features = ["derive"] }
+slotmap      = "1"
+
+[dev-dependencies]
+cadcore-ops  = { path = "../cadcore-ops" }

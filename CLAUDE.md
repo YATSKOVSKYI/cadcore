@@ -149,3 +149,24 @@ parameter range wider than π) **and** the volume against the sampled reference
 printed by the `replay_filament_dump` test (`CADCORE_FILAMENTS=<pipeline log>`,
 `CADCORE_CUTS=y:1.0:+,y:5.0:-`).  "isValid" alone passed files whose volume was
 off by 80 %.
+
+## One solid, every consumer (0.1.24)
+
+Geometry that an application needs downstream of the exact model belongs in the
+kernel, not in the application:
+
+* `cadcore-mesh` — `mesh_brep` (B-Rep → triangles via the kernel's own STEP
+  text, so the picture is what a CAD reads), `import_step`, `read_step_to_brep`,
+  `tessellate_brep`, `section_outline`.  These modules used to live in DIW
+  Forge's `brep` crate; it now re-exports them.
+* `cadcore_union::LatticeModel` — point membership of the fused + trimmed
+  lattice (exact tubes ∩ kept half-spaces).  DIW Forge's built-in voxel FEM
+  rasterises this model (`fem_solver::mesh::SolidOracle`), not capsules around
+  toolpath segments; `brep/tests/fem_from_kernel_model.rs` holds it to Maxwell
+  on the exported STEP (within 2–3 %).
+* `cadcore_union::{fuse_and_trim, trim_shell}` — the one-call Boolean API.
+
+Still outside the kernel in DIW Forge (do not assume otherwise): the fast tube
+preview and its STL/OBJ export (`mesh-gen`), the tetrahedral FEM mesher, the
+B-Rep voxelizer for imported STEP files, electrode placement, and the figure
+cuts in `figureCut.ts`.

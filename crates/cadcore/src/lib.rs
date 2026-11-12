@@ -38,6 +38,7 @@
 //! | [`ops`]        | `cadcore-ops`        | sweep_circle_along_polyline, …            |
 //! | [`step`]       | `cadcore-step`       | brep_to_step, StepWriter                  |
 //! | [`union`]      | `cadcore-union`      | fuse_and_trim, fuse_filaments_with, half_space_cut_robust, … |
+//! | [`mesh`]       | `cadcore-mesh`       | mesh_brep, import_step, read_step_to_brep, section_outline |
 //!
 //! ## Booleans
 //!
@@ -54,7 +55,7 @@
 //! ```
 
 #![warn(missing_docs)]
-#![doc(html_root_url = "https://docs.rs/cadcore/0.1.23")]
+#![doc(html_root_url = "https://docs.rs/cadcore/0.1.24")]
 
 /// Re-export of `cadcore-math`.
 pub mod math {
@@ -80,6 +81,11 @@ pub mod ops {
 /// Boolean-union engine (validation gates, refinement oracle, pipeline).
 pub mod union {
     pub use cadcore_union::*;
+}
+
+/// Tessellation, STEP import and plane sections (`cadcore-mesh`).
+pub mod mesh {
+    pub use cadcore_mesh::*;
 }
 
 pub mod step {
