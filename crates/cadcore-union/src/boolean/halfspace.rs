@@ -2100,7 +2100,6 @@ fn emit_section_caps(
 mod tests {
     use super::*;
     use crate::boolean::tests_support::capped_cylinder;
-    use cadcore_geom::CylSurf;
 
     /// Gate 1: every edge of the result must be used exactly twice.
     fn open_edges(brep: &BRep, shell: ShellId) -> usize {

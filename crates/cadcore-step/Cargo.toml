@@ -19,4 +19,4 @@ cadcore-topo = { path = "../cadcore-topo", version = "0.1.23" }
 slotmap      = "1"
 
 [dev-dependencies]
-cadcore-ops  = { path = "../cadcore-ops", version = "0.1.23" }
+cadcore-ops  = { path = "../cadcore-ops" }

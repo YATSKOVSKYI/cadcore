@@ -7,23 +7,37 @@
 //!
 //! See `README.md` for the architecture and the hard-won invariants.
 //!
-//! ## Status
+//! ## The API in one screen
 //!
-//! P0: tolerance model, structured diagnostics, the refinement oracle
-//! (`geom::refine`) and validation gates 1 (manifold) and 4 (edge-to-surface
-//! distance) are live.  The legacy union in `cadcore-ops` remains the
-//! production path; use [`validate::validate_shell`] on its output today.
+//! | Call | What it does |
+//! |---|---|
+//! | [`fuse_and_trim`] | filaments → one fused solid → planar trims → merged edges |
+//! | [`fuse_filaments_with`] | universal fuse of swept filaments into one closed shell |
+//! | [`trim_shell`] | robust planar trims of an already fused shell + edge merge |
+//! | [`half_space_cut_robust`] / [`half_space_cut`] | one planar cut with section caps |
+//! | [`merge_shell_edges`] | fold per-step edges back into whole curves |
+//! | [`validate_shell`] | the manifold / wire / distance gates |
+//!
+//! Input is a list of [`Filament`]s ([`LegSeg`] cylinders joined by
+//! [`ElbowSeg`] tori; [`Filament::serpentine`] builds one from a polyline).
 
 pub mod arrange;
 pub mod boolean;
 pub mod config;
 pub mod diag;
 pub mod geom;
+pub mod lattice;
 pub mod pipeline;
 pub mod tolerance;
 pub mod validate;
 
+pub use arrange::filament::{ElbowSeg, LegSeg};
+pub use arrange::merge::merge_shell_edges;
+pub use arrange::scaffold::Filament;
+pub use arrange::universal::{fuse_filaments, fuse_filaments_with, FuseOptions, FuseReport};
+pub use boolean::{half_space_cut, half_space_cut_robust, CutOutcome, RobustCut, ROBUST_CUT_SHIFTS};
 pub use config::UnionConfig;
+pub use lattice::{fuse_and_trim, trim_shell, LatticeOutcome, TrimInfo, TrimOutcome};
 pub use diag::{Diagnostics, Event, Severity};
 pub use pipeline::{UnionOutcome, UnionPipeline};
 pub use tolerance::Tolerances;

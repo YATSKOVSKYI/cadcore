@@ -37,9 +37,24 @@
 //! | [`topo`]       | `cadcore-topo`       | BRep, Solid, Shell, Face, Edge, Vertex    |
 //! | [`ops`]        | `cadcore-ops`        | sweep_circle_along_polyline, …            |
 //! | [`step`]       | `cadcore-step`       | brep_to_step, StepWriter                  |
+//! | [`union`]      | `cadcore-union`      | fuse_and_trim, fuse_filaments_with, half_space_cut_robust, … |
+//!
+//! ## Booleans
+//!
+//! ```no_run
+//! use cadcore::geom::Plane3;
+//! use cadcore::math::{Point3, UnitVec3};
+//! use cadcore::union::{fuse_and_trim, Filament, FuseOptions};
+//!
+//! # let filaments: Vec<Filament> = Vec::new();
+//! let keep = [Plane3::from_origin_normal(Point3::new(0.0, 1.0, 0.0), UnitVec3::Y)];
+//! let part = fuse_and_trim(&filaments, &FuseOptions::default(), &keep, 1.0e-6);
+//! assert!(part.is_watertight());
+//! let step = cadcore::step::brep_to_step(&part.brep).unwrap();
+//! ```
 
 #![warn(missing_docs)]
-#![doc(html_root_url = "https://docs.rs/cadcore/0.1.20")]
+#![doc(html_root_url = "https://docs.rs/cadcore/0.1.23")]
 
 /// Re-export of `cadcore-math`.
 pub mod math {

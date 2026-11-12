@@ -93,24 +93,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 🧩 6. Native Booleans: Fuse and Planar Cut
 `cadcore-union` fuses any number of swept filaments (straight legs, torus elbows, flat end caps) into **one watertight solid** and trims the result with planes — in pure Rust, with no external kernel.
 
-* **Universal fuse** (`union::arrange::universal::fuse_filaments`) — a true Boolean union: crossings, free ends under a row, parallel connectors, T-junctions. Every intersection curve is traced once and imprinted on both faces, so shared edges are identical by construction.
-* **Planar cut** (`union::boolean::half_space_cut`) — trims an already-fused solid with a half-space and closes it with planar section caps; it cuts through legs, elbows and junction rims alike.
-* **Robust cut** (`half_space_cut_robust`) — a trim plane taken from the part's own dimensions often grazes a junction rim or an end cap within microns. The robust cut moves the plane by 10–40 µm when the exact position has no closed result and reports the shift, so mating parts can follow.
+* **Universal fuse** (`union::fuse_filaments_with`) — a true Boolean union: crossings, free ends under a row, parallel connectors, T-junctions. Every intersection curve is traced once and imprinted on both faces, so shared edges are identical by construction.
+* **Planar cut** (`union::half_space_cut`) — trims an already-fused solid with a half-space and closes it with planar section caps; it cuts through legs, elbows and junction rims alike.
+* **Robust cut** (`union::half_space_cut_robust`, `union::trim_shell`) — a trim plane taken from the part's own dimensions often grazes a junction rim or an end cap within microns. The robust cut moves the plane by 10–40 µm when the exact position has no closed result and reports the shift, so mating parts can follow.
 * **CAD-friendly faces** — every tube face is written as two half faces bounded by real ruling-line edges (no periodic seam for the importer to invent), with exact circles and lines wherever the geometry is one.
 
 Verified on orthogonal-grid, diamond and honeycomb lattices: each fused-and-trimmed export is a single closed manifold solid in **Ansys SpaceClaim** and in OpenCASCADE-based readers (FreeCAD), its volume matches an independent point-sampling reference to 0.01 %, and it meshes and solves in Ansys Maxwell together with separately exported electrode plates.
 
 ```rust
-use cadcore::union::arrange::universal::fuse_filaments_with;
-use cadcore::union::boolean::half_space_cut_robust;
+use cadcore::geom::Plane3;
+use cadcore::math::{Point3, UnitVec3};
+use cadcore::union::{fuse_and_trim, Filament, FuseOptions};
 
-let (shell, report) = fuse_filaments_with(&mut brep, &filaments, &Default::default());
-assert_eq!(report.aborted, 0);
-let faces = brep.shells[shell].faces.clone();
-let cut = half_space_cut_robust(&brep, &faces, &keep_plane, 1.0e-6).unwrap();
-assert_eq!(cut.violations, 0); // watertight
-println!("plane moved by {} mm", cut.shift);
+// one filament per printed path: straight legs joined by constant-radius elbows
+let filaments: Vec<Filament> = paths
+    .iter()
+    .map(|pts| Filament::serpentine(pts, 0.275, 0.5))
+    .collect();
+
+// keep 1 mm <= y <= 5 mm
+let planes = [
+    Plane3::from_origin_normal(Point3::new(0.0, 1.0, 0.0), UnitVec3::Y),
+    Plane3::from_origin_normal(Point3::new(0.0, 5.0, 0.0), -UnitVec3::Y),
+];
+let part = fuse_and_trim(&filaments, &FuseOptions::default(), &planes, 1.0e-6);
+assert!(part.is_watertight());
+for t in &part.trims {
+    println!("cut plane moved by {} mm, {} caps", t.shift, t.caps);
+}
+let step = cadcore::step::brep_to_step(&part.brep)?;
 ```
+
+The stages are public too — `fuse_filaments_with`, `trim_shell`, `half_space_cut_robust`, `merge_shell_edges`, `validate_shell` — all re-exported from `cadcore::union`.
 
 ---
 
