@@ -7,44 +7,7 @@
 use cadcore_geom::CylSurf;
 use cadcore_math::{Point3, UnitVec3, Vec3};
 use cadcore_topo::BRep;
-use cadcore_union::arrange::solid::{fuse_crossing_grid, GridLeg};
 use cadcore_union::validate::step_text::manifold_check;
-
-#[test]
-fn grid_2x2_exports_manifold_step() {
-    let r = 0.275;
-    let xleg = |y: f64| GridLeg {
-        surf: CylSurf::new(Point3::new(-2.0, y, 0.0), UnitVec3::X, r),
-        length: 4.0,
-    };
-    let yleg = |x: f64| GridLeg {
-        surf: CylSurf::new(Point3::new(x, -2.0, 0.35), UnitVec3::Y, r),
-        length: 4.0,
-    };
-    let legs = [xleg(0.0), xleg(1.2), yleg(0.0), yleg(1.2)];
-    let mut brep = BRep::new();
-    let _shell = fuse_crossing_grid(&mut brep, &legs);
-
-    let step = cadcore_step::brep_to_step(&brep).expect("write step");
-    assert!(step.contains("MANIFOLD_SOLID_BREP") || step.contains("CLOSED_SHELL"));
-
-    let violations = manifold_check(&step);
-    assert!(
-        violations.is_empty(),
-        "{} manifold violations in new-engine STEP, e.g. {:?}",
-        violations.len(),
-        &violations[..violations.len().min(6)]
-    );
-
-    // stash for external OCC/SW validation
-    let out = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../repro/newengine_grid_2x2.step");
-    if let Some(parent) = out.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&out, &step);
-    println!("wrote {} bytes to {:?}", step.len(), out);
-}
 
 #[test]
 fn u_filament_exports_seamless_step() {
@@ -434,7 +397,7 @@ fn union_filament_elbow_exports_manifold_step() {
     use cadcore_geom::Circle3;
     use cadcore_topo::{Face, FaceBoundary, FaceExtent, FaceGeom, FaceId, FaceNormal, Shell, Solid};
     use cadcore_union::arrange::filament::fuse_poly_filament;
-    use cadcore_union::arrange::scaffold::Filament;
+    use cadcore_union::Filament;
     use cadcore_union::boolean::union;
 
     fn capped_cylinder(brep: &mut BRep, base: Point3, axis: UnitVec3, r: f64, len: f64) -> Vec<FaceId> {
@@ -693,7 +656,7 @@ fn union_three_cylinder_woodpile_exports_manifold_step() {
 
 #[test]
 fn scaffold_two_crossing_filaments_exports_manifold_step() {
-    use cadcore_union::arrange::scaffold::{fuse_scaffold, Filament};
+    use cadcore_union::{fuse_filaments, Filament};
 
     let r = 0.275;
     // two serpentines on stacked layers, crossing each other transversally
@@ -720,7 +683,7 @@ fn scaffold_two_crossing_filaments_exports_manifold_step() {
     );
 
     let mut brep = BRep::new();
-    let _shell = fuse_scaffold(&mut brep, &[a, b]);
+    let _shell = fuse_filaments(&mut brep, &[a, b]);
     let step = cadcore_step::brep_to_step(&brep).expect("write step");
     assert!(step.contains("CLOSED_SHELL"));
 
@@ -826,100 +789,3 @@ fn scaffold_parametric_sweep_is_manifold() {
     }
 }
 
-// KNOWN LIMITATION (over-compressed regime, 2·hl < d): when layers 0 and 2
-// (both X) overlap vertically, the engine must (a) union the COPLANAR end-cap
-// disks (each cap imprinted by the other's boundary circle, asymmetric, with the
-// lateral rims split at the two circle crossings) and (b) handle the parallel
-// lateral overlap (ruling lines) at the resulting triple points.  These are
-// degenerate-CSG cases not yet implemented; realistic scaffolds (2·hl ≥ d,
-// layer height = 0.5–0.8·d) do NOT hit them — see scaffold_parametric_sweep,
-// which is BOP-clean across diameters / pitches / layer heights.
-#[ignore = "over-compressed 2hl<d: coplanar-cap union + parallel-overlap not yet implemented"]
-#[test]
-fn scaffold_dense_triplepoints_is_manifold() {
-    use cadcore_union::boolean::union_n;
-    // DENSE: 2·hl < d, so layer 0 and layer 2 (both X) overlap vertically and a
-    // layer-1 (Y) strand crosses that overlap → genuine TRIPLE points where three
-    // strands meet.  This is the degenerate case the engine must handle for any
-    // diameter / pitch / layer height.
-    let cases = [
-        (0.6_f64, 1.0_f64, 0.25_f64), // 2hl=0.50 < 0.6
-        (0.8, 1.2, 0.30),             // 2hl=0.60 < 0.8
-        (0.5, 0.9, 0.20),             // 2hl=0.40 < 0.5
-        (0.7, 1.1, 0.28),             // 2hl=0.56 < 0.7
-    ];
-    for (d, hp, hl) in cases {
-        assert!(2.0 * hl < d, "case must overlap layers 0 and 2");
-        let solids = scaffold_solids(d, hp, hl, 1, 3);
-        let refs: Vec<(&BRep, &[cadcore_topo::FaceId])> =
-            solids.iter().map(|(b, f)| (b, f.as_slice())).collect();
-        let (out, _shell) = union_n(&refs, 1e-6)
-            .unwrap_or_else(|| panic!("dense scaffold union d={d} hp={hp} hl={hl} produced nothing"));
-        let step = cadcore_step::brep_to_step(&out)
-            .unwrap_or_else(|e| panic!("write step d={d} hp={hp} hl={hl}: {e:?}"));
-        let name = format!("newengine_scaffold_dense_d{:.0}_hl{:.0}.step", d * 100.0, hl * 100.0);
-        let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../repro").join(&name);
-        let _ = std::fs::write(&outp, &step);
-        let viol = manifold_check(&step);
-        println!("dense scaffold d={d} hp={hp} hl={hl}: {} bytes, {} manifold violations -> {name}", step.len(), viol.len());
-        assert!(
-            viol.is_empty(),
-            "dense d={d} hp={hp} hl={hl}: {} manifold violations e.g. {:?}",
-            viol.len(),
-            &viol[..viol.len().min(4)]
-        );
-    }
-}
-
-// KNOWN LIMITATION: the two coplanar end-cap disks (both at x=-1) overlap, and
-// COPLANAR overlapping plane faces are not yet unioned (plane_plane returns
-// empty for coincident planes).  All 84 unshared edges are cap arcs.  Fix =
-// coplanar-face union (imprint each cap with the other's boundary circle; split
-// the shared lateral rims at the two crossings).  Lateral ruling-line overlap is
-// fine; the caps are the blocker.
-#[ignore = "coplanar overlapping cap disks not yet unioned"]
-#[test]
-fn two_parallel_overlapping_cylinders_is_manifold() {
-    use cadcore_union::boolean::union_n;
-    // Two parallel X-cylinders (y=0) offset in Z by 0.4 < d=0.6 → they overlap
-    // in a lens; the intersection is two ruling LINES.  Must fuse watertight.
-    let (a, fa) = strand(Point3::new(-1.0, 0.0, 0.0), UnitVec3::X, 0.3, 4.0);
-    let (b, fb) = strand(Point3::new(-1.0, 0.0, 0.4), UnitVec3::X, 0.3, 4.0);
-    let refs = [(&a, fa.as_slice()), (&b, fb.as_slice())];
-    let (out, shell) = union_n(&refs, 1e-6).expect("parallel union");
-    // BRep-level diagnostic: which edges are used != 2 times, and where.
-    {
-        use std::collections::HashMap;
-        let mut uses: HashMap<cadcore_topo::EdgeId, usize> = HashMap::new();
-        for &fid in &out.shells[shell].faces {
-            let f = &out.faces[fid];
-            let mut ls = vec![f.outer_loop];
-            ls.extend(f.inner_loops.iter().copied());
-            for lid in ls {
-                if let Some(co) = out.loop_coedges(lid) {
-                    for c in co { *uses.entry(out.coedges[c].edge).or_insert(0) += 1; }
-                }
-            }
-        }
-        let mut bad: Vec<_> = uses.iter().filter(|(_, &n)| n != 2).collect();
-        bad.sort_by_key(|(e, _)| format!("{:?}", e));
-        eprintln!("DBG parallel: {} faces, {} edges, {} used!=2", out.shells[shell].faces.len(), uses.len(), bad.len());
-        for (e, n) in bad.iter().take(6) {
-            let ed = &out.edges[**e];
-            let p0 = out.vertices[ed.v_start].point;
-            let p1 = out.vertices[ed.v_end].point;
-            eprintln!("  edge used {}x: ({:.3},{:.3},{:.3})->({:.3},{:.3},{:.3}) geom={}", n,
-                p0.x,p0.y,p0.z, p1.x,p1.y,p1.z,
-                match &ed.geom { cadcore_topo::EdgeGeom::Line(_)=>"Line", cadcore_topo::EdgeGeom::Circle(_)=>"Circle",
-                    cadcore_topo::EdgeGeom::Ellipse(_)=>"Ellipse", cadcore_topo::EdgeGeom::Polyline(_)=>"Polyline" });
-        }
-    }
-    let step = cadcore_step::brep_to_step(&out).expect("step");
-    let outp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../repro/newengine_two_parallel.step");
-    let _ = std::fs::write(&outp, &step);
-    let viol = manifold_check(&step);
-    println!("two parallel: {} bytes, {} violations", step.len(), viol.len());
-    assert!(viol.is_empty(), "{} violations e.g. {:?}", viol.len(), &viol[..viol.len().min(4)]);
-}

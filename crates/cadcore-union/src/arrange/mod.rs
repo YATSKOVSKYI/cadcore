@@ -1,19 +1,15 @@
 //! The arrangement layer — from intersection curves to authoritative face
-//! loops.
-//!
-//! This replaces the legacy per-case notch/hole/strip machinery with one
-//! general algorithm:
+//! loops, and the lattice fuse built on it.
 //!
 //! ```text
-//! registry  — split every loop ONCE at all member-junction crossings of
-//!             both solids; refined joints are the single source of truth
-//!             for every consumer                                  [LIVE]
+//! filament  — the filament model (legs + elbows) and a single-filament solid
+//! universal — the universal fuse: any number of filaments → one closed shell
+//! merge     — fold per-step edges back into whole curves
 //! domain    — per-face uv parametrisations (cylinder band, torus patch,
-//!             plane), lift back to 3D                             [LIVE]
-//! cells     — per-face DCEL arrangement of boundary wires + curve pieces
-//!             (cadcore-geom DCEL), keep/drop classification by lifting
-//!             cell interior points against the other solid        [LIVE]
-//! assembly  — kept cells → topo loops/coedges with derived senses [LIVE]
+//!             plane) and the lift back to 3-D
+//! cells     — per-face DCEL arrangement of boundary wires + curve pieces,
+//!             keep/drop classification of every cell
+//! assembly  — kept cells → topology (welded vertices, shared edges, loops)
 //! ```
 
 pub mod assembly;
@@ -22,7 +18,4 @@ pub mod filament;
 pub mod fixtures;
 pub mod merge;
 pub mod domain;
-pub mod registry;
-pub mod scaffold;
-pub mod solid;
 pub mod universal;

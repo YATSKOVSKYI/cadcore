@@ -4,7 +4,7 @@
 //! topology that the STEP writer can serialise.  The watertight invariant is
 //! enforced by a **shared-edge cache** keyed on the 3-D geometry of each edge
 //! (`EdgeKey`): the first user creates the [`Edge`], the second references it
-//! with the opposite [`CoEdgeSense`].  Because the registry already split
+//! with the opposite [`CoEdgeSense`].  Because the fuse already split
 //! every curve once and refined joints to a single source of truth, the two
 //! faces meeting at an edge present byte-identical endpoints, so the cache
 //! collapses them into exactly one twice-used edge — README invariants #2,#3.
@@ -690,7 +690,7 @@ impl<'b> Assembler<'b> {
     /// the two halves never weld.  Copying keeps the source topology.
     ///
     /// Every edge still goes through the shared-edge cache, at the SAME
-    /// per-segment granularity [`Self::build_loop`] uses, so a copied face and a
+    /// per-segment granularity `build_loop` uses, so a copied face and a
     /// re-arranged one weld along the boundary between them.
     ///
     /// `joints` are extra points that must become vertices wherever they lie on

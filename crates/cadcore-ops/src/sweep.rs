@@ -2035,7 +2035,6 @@ mod tests {
                 "sharp reversal mitred into an ellipse (semi-major {:.2}) instead of a circle",
                 e.semi_major
             ),
-            other => panic!("unexpected boundary {other:?}"),
         }
     }
 

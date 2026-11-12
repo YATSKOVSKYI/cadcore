@@ -1,94 +1,47 @@
-# cadcore-union — the Boolean-union engine
+# cadcore-union
 
-Industrial-grade Boolean union for cadcore, designed as a **separate engine**
-(the way Parasolid sits under SolidWorks).  The legacy single-file implementation
-(`cadcore-ops/src/union.rs`) stays untouched and in production; this crate grows
-alongside it and takes over stage by stage.
+Booleans for the [cadcore](https://github.com/YATSKOVSKYI/cadcore) CAD kernel, in pure Rust — no OpenCASCADE.
 
-## Why this exists
+## The API
 
-The legacy union was grown case-by-case (woodpile crossings → mid-U elbows →
-corner U×U → butt-end bites).  It works — SolidWorks- and Ansys-confirmed — but
-it is one 4 000-line file, its diagnostics are env-var printfs, and every new
-geometric situation (varying layer heights, shifted filaments, oblique
-crossings, tangencies) needs hand-written passes.  This crate is the
-generalisation: one staged pipeline that handles *configurations*, not cases.
+| Call | What it does |
+|---|---|
+| `fuse_and_trim` | filaments → one fused solid → planar trims → merged edges, in one call |
+| `fuse_filaments_with` | universal fuse of swept filaments (legs, torus elbows, flat caps) into one closed shell |
+| `trim_shell` | robust planar trims of an already fused shell, then edge merge |
+| `half_space_cut`, `half_space_cut_robust` | one planar cut with section caps; the robust form moves a plane that grazes a feature by 10–40 µm and reports the shift |
+| `merge_shell_edges` | fold per-step edges back into whole lines, arcs and curves |
+| `LatticeModel` | exact point membership of the fused + trimmed solid, for volume meshers |
+| `boolean::union_n` | union of analytic solids (boxes, cylinders, swept filaments, coaxial tori) |
+| `validate_shell` | the acceptance gates: manifold, wire winding, edge-to-surface distance |
 
-## Hard-won invariants (violate these and SolidWorks breaks)
+```rust
+use cadcore_geom::Plane3;
+use cadcore_math::{Point3, UnitVec3};
+use cadcore_union::{fuse_and_trim, Filament, FuseOptions};
 
-These cost weeks to learn.  They are law:
-
-1. **Trim curves must lie on the EMITTED geometry to ≤ 1 µm.**
-   SolidWorks knits at ~1 µm.  Curves computed against sampled/marched
-   surfaces (SSI) sit 1–5 µm off the analytic surfaces the writer emits, and
-   SW silently drops the affected faces ("filaments vanish").  OpenCASCADE
-   forgives this — it is NOT an oracle for SW.  Refinement onto emitted
-   geometry is a first-class pipeline stage (`geom::refine`).
-2. **Every joint is a triple point.**  Where two trim pieces meet on a face
-   boundary, the junction point must be refined onto ALL incident surfaces and
-   then used as the *single source of truth* everywhere — runs, arcs, strips.
-   Two faces partitioning a shared circle from slightly different endpoints
-   produce unshared arcs → open shell.
-3. **Every edge is used exactly twice, opposite senses** (AP214 manifold
-   invariant, see `cadcore/CLAUDE.md`).
-4. **Wires must be physically wound** (outer CCW, holes CW in uv as seen along
-   the face normal): SW ignores `FACE_BOUND` orientation flags.
-5. **Wires must not intersect each other or themselves in uv** — SW drops the
-   face; OCC does not care.
-6. **Validate in-process, before writing STEP.**  The four gates
-   (`validate::*`) are the Rust ports of the external Python auditors that
-   exactly reproduced SolidWorks' accept/reject behaviour.
-
-## Architecture
-
-```
-lib.rs            public API: plan() / run() over cadcore-topo BReps
-config.rs         UnionConfig: tolerance ladder, pass toggles, diag level
-tolerance.rs      Tolerances: model / refine / weld / knit / sliver
-diag.rs           structured diagnostics (events + counters), no env-var printf
-geom/
-  classify.rs     surface & surface-pair taxonomy (incl. tangency margins —
-                  near-tangent crossings at HL→2r are the hardest inputs)
-  refine.rs       projection oracle: AnalyticSurface::project, cyclic point /
-                  joint / curve refinement onto emitted geometry   [LIVE]
-  intersect.rs    intersection oracle: predictor–corrector tracer, every
-                  point exact on both surfaces; tangency reported   [LIVE]
-  composite.rs    whole filament (legs+elbows) as ONE projectable;
-                  members, junctions, containment, loop discovery   [LIVE]
-arrange/
-  registry.rs     pre-split: every loop split ONCE at all junction
-                  crossings of both solids; joints refined onto
-                  circle ∩ other surface = single source of truth   [LIVE]
-  domain.rs       per-face uv (cylinder band / torus patch), lift   [LIVE]
-  cells.rs        DCEL arrangement + keep/drop classification       [LIVE]
-validate/
-  manifold.rs     gate 1: edge 2-use (BRep) + step_text (emitted)   [LIVE]
-  distance.rs     gate 4: edge-to-surface deviation < knit tol      [LIVE]
-  wires.rs        gates 2+3: uv wire closure/winding/intersection   [LIVE]
-pipeline.rs       staged orchestration: Collect → Classify → Intersect →
-                  Refine → Arrange → Stitch → Validate
+let filaments: Vec<Filament> = paths.iter().map(|p| Filament::serpentine(p, 0.275, 0.5)).collect();
+let keep = [
+    Plane3::from_origin_normal(Point3::new(0.0, 1.0, 0.0), UnitVec3::Y),
+    Plane3::from_origin_normal(Point3::new(0.0, 5.0, 0.0), -UnitVec3::Y),
+];
+let part = fuse_and_trim(&filaments, &FuseOptions::default(), &keep, 1.0e-6);
+assert!(part.is_watertight());
 ```
 
-### Migration plan
+## How it works
 
-| Phase | What moves here | Status |
-|-------|-----------------|--------|
-| P0 | skeleton, tolerances, diagnostics, refine oracle, gates 1+4 | this commit |
-| P1 | gate 2+3 (uv wire audit) in Rust; run all gates after legacy union | next |
-| P2 | analytic intersection oracle (cyl×cyl any angle, cyl×torus, torus×torus, tangency-aware) | |
-| P3 | per-face uv arrangement (DCEL from `cadcore-geom::arrangement`) + pre-split registry: every intersection curve split at ALL boundary/seam crossings once, shared by both faces | |
-| P4 | pipeline replaces legacy `union.rs` behind a config flag, case matrix in CI (HL ladder, offsets, oblique) | |
+* **Fuse** — for every pair of filaments the boundary curve ∂A ∩ ∂B is marched across members (leg / elbow / cap), with exact joints where it crosses a junction circle. Each curve piece is imprinted on both faces it lies on; every face is then arranged in its own parameter plane and the cells outside all other filaments are kept. Shared edges are identical by construction.
+* **Cut** — faces are classified against the plane, the straddling ones are imprinted with their section curve, and the section curves are chained into planar caps. Joints are solved once per edge, so every face and the cap present the same point.
+* **Faces** — a tube face that wraps its surface is written as two half faces bounded by ruling lines (cylinder) or equators (torus), which is what CAD importers read reliably.
 
-### Testing doctrine
+## Verified
 
-Small models, full feature sets (the 5.4 mm mini reproduces everything the
-15 mm part does at 1/20 the bytes).  Every gate runs on every artefact in CI.
-A configuration matrix (HL 0.35–0.50 × spacing × offsets) is the regression
-suite — single golden files are not enough.
+Orthogonal-grid, diamond and honeycomb lattices, fused and trimmed at both terminals: one closed manifold solid in Ansys SpaceClaim and in OpenCASCADE-based readers (FreeCAD); volume within 0.01 % of a point-sampling reference; solved in Ansys Maxwell with separately exported electrode plates.
 
-## License
+## Limits
 
-Licensed under the **MIT License** (see [LICENSE](LICENSE)). Free for commercial
-and non-commercial use. See the workspace [licensing history and MIT grant for
-earlier cadcore releases](https://github.com/YATSKOVSKYI/cadcore/blob/master/LICENSE-HISTORY.md).
-Third-party dependencies retain their own licenses.
+* Filament elbows need a bend radius larger than the tube radius (no spindle tori).
+* Two filaments ending flush in the same plane (coplanar overlapping caps) are not united; the trace is reported in `FuseReport::aborted`.
+* A filament that crosses itself is not fused with itself (reported in `FuseReport::notes`).
+* `union_n` does not handle two tori crossing each other transversally.

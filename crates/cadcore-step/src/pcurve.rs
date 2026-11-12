@@ -19,14 +19,8 @@
 
 use std::f64::consts::PI;
 
-use cadcore_geom::{CylSurf, Plane3};
+use cadcore_geom::CylSurf;
 use cadcore_math::Point3;
-
-/// `(u, v)` of a 3D point on a plane (`u` along `frame.x`, `v` along `frame.y`).
-pub(crate) fn plane_uv(pl: &Plane3, p: Point3) -> (f64, f64) {
-    let l = pl.frame.to_local_point(p);
-    (l.x, l.y)
-}
 
 /// `(u, v) = (θ, axial)` of a 3D point on a cylinder.  `θ ∈ (−π, π]` (raw,
 /// un-unwrapped — use [`unwrap_u`] along an edge to get a continuous pcurve).
@@ -81,7 +75,6 @@ pub(crate) fn cyl_pcurve(c: &CylSurf, pts: &[Point3], anchor_u: Option<f64>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadcore_geom::Plane3;
     use cadcore_math::{Point3, UnitVec3};
 
     /// Cylinder round-trip: param of a point, fed back to `point_at`, returns it.
@@ -99,18 +92,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Plane round-trip: `frame.origin + u·x + v·y` recovers `(u,v)`.
-    #[test]
-    fn plane_uv_roundtrip() {
-        let pl = Plane3::from_origin_normal(Point3::new(0.0, 0.0, 1.0), UnitVec3::Z);
-        let p = pl.frame.origin + pl.frame.x * 0.4 + pl.frame.y * (-0.9);
-        let (u, v) = plane_uv(&pl, p);
-        assert!(
-            (u - 0.4).abs() < 1e-12 && (v + 0.9).abs() < 1e-12,
-            "u={u} v={v}"
-        );
     }
 
     /// A near-full-circle pcurve on a cylinder must be monotonic in `u` (no 2π

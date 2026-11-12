@@ -48,7 +48,7 @@ Add `cadcore` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cadcore = "0.1.24"
+cadcore = "0.2.0"
 ```
 
 Create a watertight U-shaped filament rod and export it to a STEP file:
@@ -143,9 +143,33 @@ assert!(model.contains(some_point_inside));
 
 ---
 
+## Status
+
+What the kernel does today, and what it was checked against.
+
+| Capability | State |
+|---|---|
+| Filament sweep (cylinders, torus elbows, miter joints, caps), boxes, rounded plates | stable |
+| STEP AP214 export | stable — every edge shared by exactly two faces; read as closed solids by Ansys SpaceClaim and OpenCASCADE (FreeCAD) |
+| Lattice fuse + planar trim (`union::fuse_and_trim`) | stable on orthogonal-grid, diamond and honeycomb lattices; volume within 0.01 % of a sampling reference; solved in Ansys Maxwell |
+| Solid membership for meshers (`union::LatticeModel`) | stable — a voxel conduction solve on it agrees with Maxwell on the exported STEP to 2 % |
+| Tessellation and STEP import (`mesh::mesh_brep`, `mesh::import_step`) | stable |
+| Union of analytic solids (`union::boolean::union_n`) | boxes, cylinders, swept filaments, coaxial tori |
+
+Known limits:
+
+* an elbow needs a bend radius larger than the tube radius;
+* two filaments ending flush in one plane are not united with each other, and a filament is not fused with itself — both are reported by the fuse (`FuseReport`), never silent;
+* `union_n` does not handle two tori crossing transversally;
+* SolidWorks import has not been re-verified for the 0.2 half-face export (SpaceClaim, FreeCAD and Maxwell have).
+
+Every public operation is covered by tests; the suite has no ignored or failing tests.
+
+---
+
 ## Crate Architecture
 
-The kernel is modularly split into eight sub-crates:
+The kernel is split into eight crates:
 
 ```
 cadcore/
@@ -169,9 +193,11 @@ cadcore-geom
      ↑
 cadcore-topo
      ↑
-cadcore-ops ──────────────────┐
-     ↑                        ↓
-cadcore-step          cadcore (facade)
+cadcore-union ──→ cadcore-ops
+     ↑                 ↑
+cadcore-step ←─────────┤
+     ↑                 │
+cadcore-mesh      cadcore (facade: math, geom, topo, ops, union, step, mesh)
 ```
 
 ---
@@ -191,7 +217,7 @@ cadcore-step          cadcore (facade)
 
 ## License
 
-All seven cadcore workspace crates are available under the **MIT License**,
+All cadcore workspace crates are available under the **MIT License**,
 including earlier published releases. Commercial and non-commercial use are
 permitted under the terms of [LICENSE](LICENSE).
 

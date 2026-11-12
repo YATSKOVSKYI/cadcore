@@ -309,7 +309,7 @@ fn try_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrange::scaffold::Filament;
+    use crate::arrange::filament::Filament;
     use crate::arrange::universal::fuse_filaments;
     use crate::config::UnionConfig;
     use crate::validate::validate_shell;

@@ -170,3 +170,21 @@ Still outside the kernel in DIW Forge (do not assume otherwise): the fast tube
 preview and its STL/OBJ export (`mesh-gen`), the tetrahedral FEM mesher, the
 B-Rep voxelizer for imported STEP files, electrode placement, and the figure
 cuts in `figureCut.ts`.
+
+## 0.2.0 — the cleaned kernel
+
+Removed, do not bring back: the hole-imprint lattice fuse
+(`arrange::scaffold::fuse_scaffold*`, `arrange::solid`, `arrange::registry`,
+`filament::fuse_filament_with_crossers`), the plate weld (`boolean::weld`) and
+the `UnionPipeline` stub.  There is ONE lattice fuse — the universal fuse — and
+DIW Forge uses it in every mode (whole part, Z-bands, imported G-code).
+`Filament`, `LegSeg`, `ElbowSeg` live in `arrange::filament` and are re-exported
+at the crate root; use the root paths.
+
+The marcher's corrector is `geom::refine::refine_pair` (Newton on the two
+tangent planes).  Cyclic projection stalls where a leg grazes the elbow of the
+next layer and used to abandon 200+ traces on a 5 mm grid.
+
+The test suite has no `#[ignore]` and no known-red test.  A capability that
+does not work is either fixed or removed and listed under "Limits" in the
+README — not parked behind an ignored test.

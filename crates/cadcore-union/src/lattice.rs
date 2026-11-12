@@ -10,9 +10,9 @@
 //! * [`trim_shell`] — the trim + edge-merge half, for a shell that is already
 //!   fused (it lives in an arena the caller built);
 //! * the pieces themselves are re-exported at the crate root:
-//!   [`fuse_filaments_with`](crate::fuse_filaments_with),
-//!   [`half_space_cut_robust`](crate::half_space_cut_robust),
-//!   [`merge_shell_edges`](crate::merge_shell_edges).
+//!   [`crate::fuse_filaments_with`],
+//!   [`crate::half_space_cut_robust`],
+//!   [`crate::merge_shell_edges`].
 //!
 //! The result is a single watertight, manifold shell with planar section caps
 //! exactly on the (reported) trim planes.  Mating bodies — electrode plates —
@@ -26,7 +26,7 @@ use cadcore_topo::{BRep, ShellId};
 use crate::geom::composite::CompositeTube;
 
 use crate::arrange::merge::merge_shell_edges;
-use crate::arrange::scaffold::Filament;
+use crate::arrange::filament::Filament;
 use crate::arrange::universal::{fuse_filaments_with, FuseOptions, FuseReport};
 use crate::boolean::half_space_cut_robust;
 

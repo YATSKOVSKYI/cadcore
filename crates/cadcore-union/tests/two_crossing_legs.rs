@@ -1,5 +1,5 @@
 //! End-to-end: two perpendicular crossing legs fused into ONE watertight
-//! solid entirely through the new engine (tracer → registry → domain →
+//! solid entirely through the new engine (tracer → domain →
 //! cells → assembly), then verified by the in-process gates.
 //!
 //! This is the first artefact the cadcore-union pipeline produces without

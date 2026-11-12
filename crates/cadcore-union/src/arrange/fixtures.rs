@@ -4,7 +4,7 @@
 #![allow(clippy::excessive_precision)]
 
 use super::filament::{ElbowSeg, LegSeg};
-use super::scaffold::Filament;
+use super::filament::Filament;
 use cadcore_geom::{CylSurf, TorusSurf};
 use cadcore_math::{Point3, UnitVec3, Vec3};
 
@@ -191,7 +191,7 @@ pub(crate) fn from_dump(path: &str) -> Vec<Filament> {
     let mut legs: Vec<LegSeg> = Vec::new();
     let mut elbows: Vec<ElbowSeg> = Vec::new();
     let mut open = false;
-    let mut flush = |legs: &mut Vec<LegSeg>, elbows: &mut Vec<ElbowSeg>, out: &mut Vec<Filament>| {
+    let flush = |legs: &mut Vec<LegSeg>, elbows: &mut Vec<ElbowSeg>, out: &mut Vec<Filament>| {
         if !legs.is_empty() {
             out.push(Filament { legs: std::mem::take(legs), elbows: std::mem::take(elbows) });
         }

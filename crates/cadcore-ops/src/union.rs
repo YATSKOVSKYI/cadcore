@@ -1212,7 +1212,7 @@ pub fn union_solids_with_centerlines_and_options(
     let mut n_corner_trim = 0usize;
     let mut d_bp = 0usize;
     let mut d_loops = 0usize;
-    let mut d_not_on_elbow = 0usize;
+    let d_not_on_elbow = 0usize;
     let mut d_one_leg = 0usize;
     let mut d_pair = 0usize;
     let mut d_split_none = 0usize;
@@ -2663,7 +2663,7 @@ pub fn union_solids_with_centerlines_and_options(
                     }
                     CylPlaneCurve::Lines(lines)
                 };
-                let mut add_line_pieces =
+                let add_line_pieces =
                     |conic: CylPlaneCurve, disk_c: Point3, disk_r: f64, axf: &dyn Fn(Point3) -> f64, len: f64, fa: usize, fb: usize, pieces: &mut Vec<(Vec<Point3>, usize, usize)>| {
                         let dbg = std::env::var("CADCORE_DUMP_MUT").is_ok();
                         let CylPlaneCurve::Lines(ls) = conic else {
@@ -3410,6 +3410,7 @@ pub fn union_solids_with_centerlines_and_options(
 type GridKey = [i64; 3];
 
 struct VertexMap {
+    #[allow(dead_code)] // kept for diagnostics
     tolerance: f64,
     grid: std::collections::HashMap<GridKey, Vec<VertexId>>,
 }
@@ -3431,6 +3432,7 @@ impl VertexMap {
 }
 
 struct EdgeMap {
+    #[allow(dead_code)] // kept for diagnostics
     tolerance: f64,
     edges: std::collections::HashMap<(VertexId, VertexId), Vec<EdgeId>>,
 }
@@ -3749,23 +3751,6 @@ fn signed_area_theta_v(surf: &CylSurf, pts: &[Point3]) -> f64 {
     a * 0.5
 }
 
-/// `HoleRef::reversed` value that makes a two-edge spanning junction loop run
-/// CCW in the crossing cylinder's own `(theta, axial)` coordinates.
-///
-/// The forward loop is `edge_ee` followed by `edge_ea`.  `HoleRef::reversed`
-/// traverses the same two shared edges in the opposite order/sense, so it flips
-/// the signed area while preserving the topological edge identity.
-fn hole_ref_reversed_for_cylinder_ccw(
-    surf: &CylSurf,
-    edge_ee_pts: &[Point3],
-    edge_ea_pts: &[Point3],
-) -> bool {
-    let mut pts = Vec::with_capacity(edge_ee_pts.len() + edge_ea_pts.len());
-    pts.extend(edge_ee_pts.iter().copied());
-    pts.extend(edge_ea_pts.iter().skip(1).copied());
-    signed_area_theta_v(surf, &pts) < 0.0
-}
-
 /// If every point of `pts` lies on the elbow `tf` (within `tol` of its torus
 /// surface AND inside its `[theta_lo, theta_hi]` arc band), return `true`.  Used
 /// to route a continuous-filament bite loop to the elbow face it sits on.
@@ -4080,26 +4065,6 @@ fn log_open_curve_diag(
     );
 }
 
-/// Build the two shared polyline edges for a closed intersection loop, split at
-/// two distinct seam vertices so the two crossing faces can traverse them in
-/// opposite directions (the single-closed-edge sense trick does not work for
-/// polylines).  Returns `(e0: seam0→seam1, e1: seam1→seam0)`.
-/// Result of splitting a continuous-SSI loop that spans an elbow↔leg junction.
-struct JunctionSplit {
-    /// Elbow (torus) face index the loop partly lies on.
-    ti: usize,
-    /// Adjacent leg (cyl) face index sharing the junction circle, if found.
-    aj: Option<usize>,
-    /// `true` ⇒ junction is the elbow's start circle, else its end circle.
-    j_is_start: bool,
-    /// Junction minor circle.
-    j: Circle3,
-    /// Elbow-part curve P1→P2 (snapped endpoints on `j`).
-    e_e: Vec<Point3>,
-    /// Adjacent-leg-part curve P2→P1 (snapped endpoints on `j`).
-    e_a: Vec<Point3>,
-}
-
 fn snap_to_circle(c: &Circle3, p: Point3) -> Point3 {
     c.point_at(circle_angle(c, p))
 }
@@ -4182,6 +4147,7 @@ struct SpanPiece {
     /// Original-loop index range of the run (inclusive, circular): the run
     /// covers loop points `i0 ..= i1`.  Used to merge the cut sets of the TWO
     /// sides of a corner bite into shared atomic edges.
+    #[allow(dead_code)]
     i0: usize,
     i1: usize,
 }
@@ -4194,6 +4160,7 @@ struct ThroughPiece {
     /// Crossing-piece edges in chain order.
     edges: Vec<EdgeId>,
     /// Pieces of one bite share this id (the strip BETWEEN them is removed).
+    #[allow(dead_code)]
     bite: usize,
     /// Index into `filament_tubes` of the CROSSING filament (kept/removed
     /// sampling — works for straight-leg and elbow crossings alike).
@@ -4985,100 +4952,6 @@ fn build_single_edge(
         tolerance,
     )
 }
-/// Split a closed loop that spans an elbow↔leg junction into its elbow-part and
-/// adjacent-leg-part, with the two crossing points snapped onto the junction
-/// minor circle.  Returns `None` for loops that are not a clean single-junction
-/// span (≠ 2 elbow/leg transitions).
-fn split_spanning_loop(
-    pts: &[Point3],
-    torus_faces: &[TorusFace],
-    cyl_faces: &[CylFace],
-) -> Option<JunctionSplit> {
-    let n = pts.len();
-    if n < 6 {
-        return None;
-    }
-    let on = |tf: &TorusFace, p: Point3| loop_on_torus_face(tf, std::slice::from_ref(&p), 1e-2);
-    // Elbow with the most (but not all) points on it.
-    let mut ti = 0usize;
-    let mut best = 0usize;
-    for (i, tf) in torus_faces.iter().enumerate() {
-        let c = pts.iter().filter(|&&p| on(tf, p)).count();
-        if c > best && c < n {
-            best = c;
-            ti = i;
-        }
-    }
-    if best == 0 {
-        return None;
-    }
-    let tf = &torus_faces[ti];
-    let on_e: Vec<bool> = pts.iter().map(|&p| on(tf, p)).collect();
-    let trans: Vec<usize> = (0..n).filter(|&i| on_e[i] != on_e[(i + 1) % n]).collect();
-    if trans.len() != 2 {
-        return None;
-    }
-    let (t0, t1) = (trans[0], trans[1]);
-    let collect_run = |from: usize, to: usize| -> Vec<Point3> {
-        let mut v = Vec::new();
-        let mut i = (from + 1) % n;
-        loop {
-            v.push(pts[i]);
-            if i == to {
-                break;
-            }
-            i = (i + 1) % n;
-        }
-        v
-    };
-    let seg1 = collect_run(t0, t1);
-    let seg2 = collect_run(t1, t0);
-    let (e_arc, a_arc) = if on_e[(t0 + 1) % n] {
-        (seg1, seg2)
-    } else {
-        (seg2, seg1)
-    };
-    if e_arc.is_empty() || a_arc.is_empty() {
-        return None;
-    }
-    // Junction circle: whichever elbow end the e-arc endpoints sit near.
-    let theta_of = |p: Point3| {
-        let l = tf.surf.frame.to_local_point(p);
-        l.y.atan2(l.x)
-    };
-    let ths = theta_of(*e_arc.first().unwrap());
-    let the = theta_of(*e_arc.last().unwrap());
-    let d_lo = (ths - tf.theta_lo).abs().min((the - tf.theta_lo).abs());
-    let d_hi = (ths - tf.theta_hi).abs().min((the - tf.theta_hi).abs());
-    let j_is_start = d_lo <= d_hi;
-    let j = if j_is_start {
-        tf.start_circle
-    } else {
-        tf.end_circle
-    };
-    let p1 = snap_to_circle(&j, *e_arc.first().unwrap());
-    let p2 = snap_to_circle(&j, *e_arc.last().unwrap());
-    if (p1 - p2).length() < 1e-6 {
-        return None;
-    }
-    let aj = cyl_faces.iter().position(|cf| {
-        boundary_circle_matches(&cf.start, &j) || boundary_circle_matches(&cf.end, &j)
-    });
-    let mut e_e = vec![p1];
-    e_e.extend(e_arc.iter().copied());
-    e_e.push(p2);
-    let mut e_a = vec![p2];
-    e_a.extend(a_arc.iter().copied());
-    e_a.push(p1);
-    Some(JunctionSplit {
-        ti,
-        aj,
-        j_is_start,
-        j,
-        e_e,
-        e_a,
-    })
-}
 fn build_hole_edges(
     brep: &mut BRep,
     loop_pts: &[Point3],
@@ -5541,7 +5414,7 @@ fn arc_contains(from: f64, to: f64, mid: f64, dir: f64) -> bool {
 ///    opposite walks.
 fn boundary_multi_notch_loop(
     brep: &mut BRep,
-    geom: &FaceGeom,
+    _geom: &FaceGeom,
     b: &FaceBoundary,
     interior_pt: Point3,
     notches: &[OpenNotchRef],
@@ -5569,6 +5442,7 @@ fn boundary_multi_notch_loop(
         aa: f64,
         ab: f64,
         mid_a: f64,
+        #[allow(dead_code)]
         pts: Vec<Point3>, // stored order = va → vb
     }
     let mut raw = Vec::with_capacity(notches.len());
@@ -5994,33 +5868,4 @@ fn build_trimmed_swept(
         }
     }
     face_id
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spanning_hole_reversed_makes_crossing_cylinder_loop_ccw() {
-        let cyl = CylSurf::new(Point3::ORIGIN, UnitVec3::Z, 1.0);
-        let p00 = cyl.point_at(0.0, 0.0);
-        let p10 = cyl.point_at(0.4, 0.0);
-        let p11 = cyl.point_at(0.4, 1.0);
-        let p01 = cyl.point_at(0.0, 1.0);
-
-        let ccw_edge_ee = [p00, p10, p11];
-        let ccw_edge_ea = [p11, p01, p00];
-        assert!(!hole_ref_reversed_for_cylinder_ccw(
-            &cyl,
-            &ccw_edge_ee,
-            &ccw_edge_ea
-        ));
-
-        let cw_edge_ee = [p00, p01, p11];
-        let cw_edge_ea = [p11, p10, p00];
-        assert!(hole_ref_reversed_for_cylinder_ccw(
-            &cyl,
-            &cw_edge_ee,
-            &cw_edge_ea
-        ));
-    }
 }

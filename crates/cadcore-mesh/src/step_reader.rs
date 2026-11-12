@@ -91,7 +91,7 @@ pub fn read_step_to_brep(contents: &str) -> Result<BRep, String> {
     let mut in_comment = false;
     let mut buffer = String::new();
     for line in contents.lines() {
-        let mut line_str = line.trim();
+        let line_str = line.trim();
         if line_str.is_empty() {
             continue;
         }
@@ -462,7 +462,7 @@ pub fn read_step_to_brep(contents: &str) -> Result<BRep, String> {
         }
 
         match geom {
-            FaceGeom::Plane(p) => {
+            FaceGeom::Plane(_p) => {
                 // If the loop contains circular/elliptic bounds or polygonal vertices
                 let loop_id = loops[0];
                 if let Some(coedges) = brep.loop_coedges(loop_id) {

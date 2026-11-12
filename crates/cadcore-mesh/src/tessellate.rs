@@ -1,6 +1,6 @@
 use slotmap::Key;
 use crate::kernel::{
-    math::{Point3, Vec3, UnitVec3, Frame3},
+    math::{Point3, Vec3, UnitVec3},
     geom::{Plane3, CylSurf, SphereSurf, TorusSurf},
     topo::{BRep, Face, FaceGeom, FaceNormal, FaceExtent, EdgeGeom, PrismAxis},
 };

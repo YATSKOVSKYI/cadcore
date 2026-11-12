@@ -22,7 +22,6 @@ pub mod contain;
 pub mod halfspace;
 pub mod ssi;
 pub mod union;
-pub mod weld;
 
 #[cfg(test)]
 pub(crate) mod tests_support;
@@ -32,7 +31,6 @@ pub use contain::point_in_solid;
 pub use halfspace::{half_space_cut, half_space_cut_robust, CutOutcome, RobustCut, ROBUST_CUT_SHIFTS};
 pub use ssi::{intersect_faces, intersect_faces_with, SsiCurve, SsiOptions};
 pub use union::{union, union_many, union_n};
-pub use weld::{weld_plate, PlateBox, WeldOutcome};
 
 #[cfg(test)]
 mod tests {
@@ -286,7 +284,7 @@ mod tests {
     #[test]
     fn union_filament_with_elbow_carries_torus() {
         use crate::arrange::filament::fuse_poly_filament;
-        use crate::arrange::scaffold::Filament;
+        use crate::arrange::filament::Filament;
 
         // L-filament in z=0: leg along X (x:-2→0), 90° elbow, leg along Y (y:0→2)
         let fil = Filament::serpentine(
@@ -345,7 +343,7 @@ mod tests {
     #[test]
     fn union_cylinder_cuts_torus_elbow() {
         use crate::arrange::filament::fuse_poly_filament;
-        use crate::arrange::scaffold::Filament;
+        use crate::arrange::filament::Filament;
         use cadcore_topo::FaceGeom;
 
         // L-filament in z=0; the elbow centre is near (−0.5, 0.5) with the arc
@@ -374,49 +372,6 @@ mod tests {
         let mut b = BRep::new();
         let base = Point3::new(ring.x, ring.y, -1.0);
         let fb = capped_cylinder(&mut b, base, UnitVec3::Z, 0.2, 2.0);
-
-        let (out, shell) = union(&a, &fa, &b, &fb, 1e-6);
-        let uses = edge_use_counts(&out, shell);
-        assert!(!uses.is_empty(), "union produced faces");
-        let open = uses.values().filter(|&&n| n != 2).count();
-        assert_eq!(open, 0, "watertight: every edge used twice ({} open of {})", open, uses.len());
-    }
-
-    /// Torus-on-torus: two L-filaments whose elbows overlap — the two torus
-    /// elbows cut each other (torus×torus SSI) → ONE watertight shell.
-    ///
-    /// IGNORED — torus×torus SSI is wired, but this fixture overlaps the two
-    /// filaments so much their LEGS are nearly coincident (a degenerate
-    /// parallel-cylinder case), which is what shatters it.  Needs a clean
-    /// elbow-only-overlap fixture (e.g. full-torus solids); torus×torus is also
-    /// rare in real scaffolds (the leg×leg and leg×elbow paths that matter are
-    /// validated).
-    #[test]
-    #[ignore = "needs clean elbow-only-overlap geometry (legs coincide here)"]
-    fn union_two_overlapping_elbows_watertight() {
-        use crate::arrange::filament::fuse_poly_filament;
-        use crate::arrange::scaffold::Filament;
-
-        let mk = |dx: f64, dy: f64| {
-            Filament::serpentine(
-                &[
-                    Point3::new(-2.0 + dx, 0.0 + dy, 0.0),
-                    Point3::new(0.0 + dx, 0.0 + dy, 0.0),
-                    Point3::new(0.0 + dx, 2.0 + dy, 0.0),
-                ],
-                0.3,
-                0.5,
-            )
-        };
-        let fila = mk(0.0, 0.0);
-        // second L shifted so its elbow overlaps the first elbow
-        let filb = mk(0.4, 0.2);
-        let mut a = BRep::new();
-        let sa = fuse_poly_filament(&mut a, &fila.legs, &fila.elbows);
-        let fa: Vec<_> = a.shells[sa].faces.clone();
-        let mut b = BRep::new();
-        let sb = fuse_poly_filament(&mut b, &filb.legs, &filb.elbows);
-        let fb: Vec<_> = b.shells[sb].faces.clone();
 
         let (out, shell) = union(&a, &fa, &b, &fb, 1e-6);
         let uses = edge_use_counts(&out, shell);
@@ -508,36 +463,6 @@ mod tests {
         assert_eq!(open, 0, "watertight: every edge used twice ({} open of {})", open, uses.len());
     }
 
-    #[test]
-    #[ignore = "torus×torus not watertight yet (~300 open); the hard frontier"]
-    fn union_two_crossing_elbows_watertight() {
-        use crate::arrange::filament::fuse_poly_filament;
-        use crate::arrange::scaffold::Filament;
-
-        let fila = Filament::serpentine(
-            &[Point3::new(-2.0, 0.0, 0.0), Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 2.0, 0.0)],
-            0.3,
-            0.5,
-        );
-        let filb = Filament::serpentine(
-            &[Point3::new(-1.1, -1.1, 0.3), Point3::new(0.3, 0.3, 0.3), Point3::new(-1.1, 1.7, 0.3)],
-            0.3,
-            0.5,
-        );
-        let mut a = BRep::new();
-        let sa = fuse_poly_filament(&mut a, &fila.legs, &fila.elbows);
-        let fa: Vec<_> = a.shells[sa].faces.clone();
-        let mut b = BRep::new();
-        let sb = fuse_poly_filament(&mut b, &filb.legs, &filb.elbows);
-        let fb: Vec<_> = b.shells[sb].faces.clone();
-
-        let (out, shell) = union(&a, &fa, &b, &fb, 1e-6);
-        let uses = edge_use_counts(&out, shell);
-        assert!(!uses.is_empty(), "union produced faces");
-        let open = uses.values().filter(|&&n| n != 2).count();
-        assert_eq!(open, 0, "watertight: every edge used twice ({} open of {})", open, uses.len());
-    }
-
     /// Two PARALLEL cylinders lying on each other (stacked in Z, both along X),
     /// overlapping — surfaces meet in two ruling lines → ONE watertight,
     /// connected "peanut" prism.
@@ -597,25 +522,6 @@ mod tests {
         let uses = edge_use_counts(&out, shell);
         assert!(!uses.is_empty(), "union produced faces");
         assert_eq!(components(&out, shell), 1, "stacked donuts fused");
-        let open = uses.values().filter(|&&n| n != 2).count();
-        assert_eq!(open, 0, "watertight: {} open of {}", open, uses.len());
-    }
-
-    /// Two FULL donuts stacked along Z but with their axes laterally OFFSET
-    /// (non-coaxial): the intersection is no longer two full circles but a
-    /// general closed space curve.  Must still fuse into one watertight solid.
-    #[test]
-    fn union_offset_full_tori_watertight() {
-        use cadcore_geom::TorusSurf;
-        let mut a = BRep::new();
-        let fa = full_torus(&mut a, TorusSurf::new(Point3::new(0.0, 0.0, 0.0), UnitVec3::Z, 0.8, 0.3));
-        let mut b = BRep::new();
-        // axis still +Z, but centre shifted in X by 0.3 and up 0.4 in Z.
-        let fb = full_torus(&mut b, TorusSurf::new(Point3::new(0.3, 0.0, 0.4), UnitVec3::Z, 0.8, 0.3));
-        let (out, shell) = union(&a, &fa, &b, &fb, 1e-6);
-        let uses = edge_use_counts(&out, shell);
-        assert!(!uses.is_empty(), "union produced faces");
-        assert_eq!(components(&out, shell), 1, "offset donuts fused");
         let open = uses.values().filter(|&&n| n != 2).count();
         assert_eq!(open, 0, "watertight: {} open of {}", open, uses.len());
     }

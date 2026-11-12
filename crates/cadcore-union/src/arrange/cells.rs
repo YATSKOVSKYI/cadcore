@@ -1,7 +1,7 @@
 //! Per-face cell arrangement and keep/drop classification.
 //!
 //! A face's parameter rectangle is partitioned by its boundary wires plus
-//! the registry pieces that land on it (`cadcore-geom`'s DCEL does the 2-D
+//! the curve pieces that land on it (`cadcore-geom`'s DCEL does the 2-D
 //! work, seam handling included).  Each resulting cell is classified by
 //! lifting an interior point to 3-D and asking whether it sits inside the
 //! OTHER solid — material kept by the union keeps the cell, swallowed

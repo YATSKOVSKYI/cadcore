@@ -2836,57 +2836,6 @@ fn ellipse_param(e: &Ellipse3, p: Point3) -> f64 {
     y.atan2(x)
 }
 
-/// Append one ORIENTED_EDGE for a polyline edge `pts[0] → pts[last]`, reusing a
-/// shared POLYLINE/EDGE_CURVE from the cache when the partner face emitted it.
-fn push_shared_polyline(
-    ctx: &mut Ctx,
-    pts: &[Point3],
-    oe_ids: &mut Vec<usize>,
-) -> Result<(), StepError> {
-    if pts.len() < 2 {
-        return Ok(());
-    }
-    let p_from = pts[0];
-    let p_to = *pts.last().unwrap();
-    let v_from = emit_vertex_point(ctx, p_from)?;
-    let v_to = emit_vertex_point(ctx, p_to)?;
-    // Order-independent centroid: distinguishes two arcs with the same endpoints.
-    let centroid = {
-        let mut acc = Point3::new(0.0, 0.0, 0.0);
-        for p in pts {
-            acc = Point3::new(acc.x + p.x, acc.y + p.y, acc.z + p.z);
-        }
-        let n = pts.len() as f64;
-        Point3::new(acc.x / n, acc.y / n, acc.z / n)
-    };
-    let key = StepCurveKey::Polyline {
-        v1: v_from.min(v_to),
-        v2: v_from.max(v_to),
-        mid: point_key(centroid),
-    };
-    let (ec_id, orig_start) = if let Some(&pair) = ctx.edge_cache.get(&key) {
-        pair
-    } else {
-        let pt_ids: Vec<usize> = pts
-            .iter()
-            .map(|p| emit_point(ctx, *p, "pl"))
-            .collect::<Result<_, _>>()?;
-        let pl = emit_polyline3d(ctx, &pt_ids)?;
-        let ec = ctx.next_id();
-        writeln!(
-            ctx.out,
-            "#{ec} = EDGE_CURVE('',#{v_from},#{v_to},#{pl},.T.);"
-        )?;
-        ctx.edge_cache.insert(key, (ec, v_from));
-        (ec, v_from)
-    };
-    let sense = if orig_start == v_from { ".T." } else { ".F." };
-    let oe = ctx.next_id();
-    writeln!(ctx.out, "#{oe} = ORIENTED_EDGE('',*,*,#{ec_id},{sense});")?;
-    oe_ids.push(oe);
-    Ok(())
-}
-
 /// Append one ORIENTED_EDGE for an elliptic arc `p_from → p_to` on `ellipse`,
 /// reusing a shared ELLIPSE/EDGE_CURVE from the cache.  `same_sense` is derived
 /// from the ellipse's parametric direction (CCW in the `(x,y)` frame).

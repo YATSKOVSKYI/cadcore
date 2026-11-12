@@ -2,21 +2,19 @@
 //! swept filaments (straight legs, torus-fillet elbows, flat end caps) into
 //! ONE watertight solid, by *boundary tracing* plus per-face arrangement.
 //!
-//! [`super::scaffold::fuse_scaffold`] imprints every crossing as a closed
-//! HOLE on the two lateral faces it was traced on.  That is exact only while
-//! the crossing sits strictly inside both faces.  Real lattices break the
-//! assumption all along their outline:
+//! Imprinting each crossing as a closed HOLE on the two faces it was traced on
+//! is exact only while the crossing sits strictly inside both faces, and real
+//! lattices break that all along their outline:
 //!
 //! * the first row of one layer runs over the **free ends** of the layer
-//!   below, so the crossing window straddles a cap rim (a hole crossing the
-//!   face's own boundary — SpaceClaim drops the face);
+//!   below, so the crossing window straddles a cap rim;
 //! * the U-turn connector of one layer lies **parallel** on the outer leg of
 //!   the next, so the tubes meet in two ruling lines joined over the elbows
 //!   (no closed loop on any single member);
 //! * honeycomb bonds **end inside** the row they bridge (a T-junction: the
-//!   bond's cap and rim are swallowed whole).
+//!   cap and rim of the bond are swallowed whole).
 //!
-//! The fix is to stop imprinting holes and compute the real union boundary:
+//! So the fuse computes the real union boundary:
 //!
 //! ```text
 //! 1 trace     for every pair of filaments, march along ∂A ∩ ∂B.  The marcher
@@ -51,11 +49,11 @@ use super::assembly::Assembler;
 use super::cells::FaceChain;
 use super::domain::FaceDomain;
 use super::filament::{ElbowSeg, LegSeg};
-use super::scaffold::Filament;
+use super::filament::Filament;
 use crate::boolean::Aabb;
 use crate::geom::composite::{seeds_between, CompositeTube};
 use crate::geom::intersect::intersection_point_near;
-use crate::geom::refine::{refine_point, AnalyticSurface};
+use crate::geom::refine::AnalyticSurface;
 
 /// Tunables of the universal fuse.
 #[derive(Debug, Clone, Copy)]
@@ -903,7 +901,7 @@ fn trace_boundary(
         let mut q = None;
         let mut hh = h;
         for _ in 0..5 {
-            let (c, res) = refine_point(p + t * hh, &[s_i, s_j], 1e-12, 60);
+            let (c, res) = crate::geom::refine::refine_pair(p + t * hh, &s_i, &s_j, 1e-13, 30);
             if res < 1e-9 && (c - p).length() > hh * 0.05 && (c - p).dot(t) > 0.0 {
                 q = Some(c);
                 break;
@@ -1044,7 +1042,7 @@ fn trace_boundary(
         let t0 = cr * (1.0 / cl);
         let probe_len = 0.5 * opts.step;
         let entering = |t: Vec3| -> (bool, f64, f64, f64, f64, f64) {
-            let (c, res) = refine_point(p + t * probe_len, &[s_i, s_j], 1e-12, 40);
+            let (c, res) = crate::geom::refine::refine_pair(p + t * probe_len, &s_i, &s_j, 1e-13, 30);
             let b = if on_i { bi } else { bj };
             let m = if on_i { m_i } else { m_j };
             let (v, lo, hi) = b.span(m, c);
@@ -1491,7 +1489,7 @@ mod tests {
         (a, b)
     }
 
-    /// Plain transversal crossings: the case the hole-imprint fuse already
+    /// Plain transversal crossings: the simplest case, every window strictly
     /// handled must still come out watertight and fused.
     #[test]
     fn two_crossing_serpentines_watertight() {

@@ -55,7 +55,7 @@
 //! ```
 
 #![warn(missing_docs)]
-#![doc(html_root_url = "https://docs.rs/cadcore/0.1.24")]
+#![doc(html_root_url = "https://docs.rs/cadcore/0.2.0")]
 
 /// Re-export of `cadcore-math`.
 pub mod math {
@@ -77,8 +77,7 @@ pub mod ops {
     pub use cadcore_ops::*;
 }
 
-/// Re-export of `cadcore-step`.
-/// Boolean-union engine (validation gates, refinement oracle, pipeline).
+/// Booleans on swept-filament lattices and analytic solids (`cadcore-union`).
 pub mod union {
     pub use cadcore_union::*;
 }
@@ -88,6 +87,7 @@ pub mod mesh {
     pub use cadcore_mesh::*;
 }
 
+/// STEP AP214 writer (`cadcore-step`).
 pub mod step {
     pub use cadcore_step::*;
 }

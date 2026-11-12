@@ -8,7 +8,7 @@
 //! 1. tangent  `t = n_a × n_b` (cross of surface normals);
 //! 2. predictor `p' = p + h·t`;
 //! 3. corrector: cyclic projection of `p'` onto both surfaces
-//!    ([`refine_point`]) — every emitted point is exact to `tol`.
+//!    ([`crate::geom::refine::refine_point`]) — every emitted point is exact to `tol`.
 //!
 //! Near-tangency (`|n_a × n_b| → 0`) is where intersection curves flutter
 //! and generic stepping is unsound; the tracer *reports* it instead of

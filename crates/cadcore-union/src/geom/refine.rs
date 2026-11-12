@@ -181,6 +181,44 @@ pub fn refine_point_dyn(
     (p, residual)
 }
 
+/// Refine `p` onto the intersection CURVE of two surfaces by Newton's method.
+///
+/// Each step is the minimum-norm correction that puts the point on both
+/// tangent planes at the current feet: with signed distances `d₁, d₂` along the
+/// normals `n₁, n₂`, solve the 2×2 Gram system `G λ = d` and move by
+/// `−(λ₁ n₁ + λ₂ n₂)`.  Convergence is quadratic and does not depend on the
+/// angle between the surfaces, where cyclic projection ([`refine_point`])
+/// slows to a crawl as the surfaces approach tangency — a leg grazing the
+/// elbow of the layer above meets it at a few degrees, and 60 sweeps of
+/// alternating projection leave the marcher's corrector short of tolerance.
+///
+/// Returns the point and the larger of the two remaining distances; a
+/// degenerate pair (parallel normals) falls back to cyclic projection.
+pub fn refine_pair(p: Point3, a: &AnalyticSurface, b: &AnalyticSurface, tol: f64, max_iter: usize) -> (Point3, f64) {
+    let residual = |q: Point3| a.distance(q).max(b.distance(q));
+    let mut q = p;
+    for _ in 0..max_iter {
+        let (fa, fb) = (a.project(q), b.project(q));
+        let (Some(na), Some(nb)) = (a.normal_at(fa), b.normal_at(fb)) else {
+            return refine_point(p, &[*a, *b], tol, max_iter.max(60));
+        };
+        let (da, db) = (na.dot(q - fa), nb.dot(q - fb));
+        let g12 = na.dot(nb);
+        let det = 1.0 - g12 * g12; // |n| = 1
+        if det < 1e-10 {
+            return refine_point(p, &[*a, *b], tol, max_iter.max(60));
+        }
+        let la = (da - g12 * db) / det;
+        let lb = (db - g12 * da) / det;
+        let step = na * la + nb * lb;
+        q = q - step;
+        if step.length() < tol {
+            break;
+        }
+    }
+    (q, residual(q))
+}
+
 /// Refine `p` onto the common point of three (or more) surfaces by Newton's
 /// method on their tangent planes.
 ///

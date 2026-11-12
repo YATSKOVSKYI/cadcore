@@ -1,22 +1,21 @@
-//! Closed-shell assembly of a *swept filament* (straight legs + torus-fillet
-//! elbows) — the arrangement-engine counterpart of the analytic sweep.
+//! The filament model and the closed shell of ONE swept filament.
 //!
-//! Proves the torus-patch consumer and, crucially, the junction stitching:
-//! each leg↔elbow junction circle is sampled ONCE (a single `Vec<Point3>`)
-//! and fed as the boundary chain of BOTH the leg band and the elbow patch,
-//! so the assembler's geometric edge cache welds them with no special-casing.
+//! A [`Filament`] is a printed path as the kernel sees it: straight
+//! [`LegSeg`] cylinders joined by constant-radius [`ElbowSeg`] torus elbows,
+//! with a flat cap on each free end.  [`Filament::serpentine`] builds one from
+//! a polyline.  Lists of filaments are what the lattice Booleans consume
+//! ([`crate::fuse_filaments_with`], [`crate::fuse_and_trim`],
+//! [`crate::LatticeModel`]).
 //!
-//! A torus patch is structurally identical to a cylinder band — open axis θ
-//! (the ring arc), periodic axis φ (the minor circle) — so the same
-//! `arrange_and_classify` + `Assembler` machinery closes it.
+//! [`fuse_poly_filament`] / [`fuse_l_filament`] assemble a single filament as
+//! a closed analytic solid on its own (full cylinder and torus faces) — the
+//! input the generic solid union ([`crate::boolean::union_n`]) works on.
 
 use cadcore_geom::{Circle3, CylSurf, Plane3, TorusSurf};
 use cadcore_math::{Point3, UnitVec3};
 use cadcore_topo::{BRep, Shell, ShellId, Solid};
 
 use super::assembly::Assembler;
-use crate::geom::composite::{closed_loops_between, CompositeTube};
-use crate::geom::intersect::TraceOptions;
 
 
 
@@ -41,118 +40,74 @@ pub struct ElbowSeg {
     pub theta_hi: f64,
 }
 
-/// Build a closed shell for ONE serpentine filament (legs+elbows) whose legs
-/// are crossed by external `crossers`.  Proves the COMBINATION: junction
-/// welding + crossing imprints coexisting on the same band.  Each crosser is
-/// also emitted (its band with the mutual window + caps), so the result is
-/// the union of the filament and the crossers.
-pub fn fuse_filament_with_crossers(
-    brep: &mut BRep,
-    legs: &[LegSeg],
-    elbows: &[ElbowSeg],
-    crossers: &[LegSeg],
-) -> ShellId {
-    assert_eq!(legs.len(), elbows.len() + 1, "n legs <-> n-1 elbows");
-    let n = legs.len();
-
-    let mut fil_tube = CompositeTube::new();
-    for l in legs {
-        fil_tube = fil_tube.with_leg(l.surf, l.length);
-    }
-    for e in elbows {
-        fil_tube = fil_tube.with_elbow(e.surf, e.theta_lo, e.theta_hi);
-    }
-    let crosser_tubes: Vec<CompositeTube> = crossers
-        .iter()
-        .map(|c| CompositeTube::new().with_leg(c.surf, c.length))
-        .collect();
-
-    // Trace each (leg, crosser) crossing ONCE; both sides imprint the SAME
-    // polyline (single source of truth → the window welds).
-    let leg_tubes: Vec<CompositeTube> = legs
-        .iter()
-        .map(|l| CompositeTube::new().with_leg(l.surf, l.length))
-        .collect();
-    // shared_loops[i][c] = crossing loops of leg i with crosser c
-    let mut shared_loops: Vec<Vec<Vec<Vec<Point3>>>> =
-        vec![vec![Vec::new(); crossers.len()]; legs.len()];
-    for i in 0..legs.len() {
-        for (c, ct) in crosser_tubes.iter().enumerate() {
-            for loop_c in closed_loops_between(&leg_tubes[i], ct, &TraceOptions::default()) {
-                shared_loops[i][c].push(loop_c.points);
-            }
-        }
-    }
-
-    // SEAMLESS analytic junction / end circles, built from leg geometry and
-    // shared between leg rims, elbow junctions and caps.
-    let circ_at = |l: &LegSeg, v: f64| -> Circle3 {
-        Circle3::new(l.surf.frame.origin + l.surf.axis().as_vec() * v, l.surf.axis(), l.surf.radius)
-    };
-    let j_in: Vec<Circle3> = legs.iter().map(|l| circ_at(l, 0.0)).collect();
-    let j_out: Vec<Circle3> = legs.iter().map(|l| circ_at(l, l.length)).collect();
-
-    let mut asm = Assembler::new(brep, 1e-7);
-
-    // filament legs: seamless cylinder + their crossing windows + caps at free
-    // ends.  Each window is shared with the matching crosser window.
-    // Per-junction weld groups (see scaffold.rs): leg i owns 2·i (incoming rim)
-    // and 2·i+1 (outgoing rim); each crosser gets its own pair past the legs.
-    let gin = |i: usize| 2 * i as u32;
-    let gout = |i: usize| 2 * i as u32 + 1;
-    for i in 0..n {
-        let windows: Vec<(u32, Vec<Point3>)> = (0..crossers.len())
-            .flat_map(|c| shared_loops[i][c].iter().cloned())
-            .map(|w| (0u32, w))
-            .collect();
-        asm.emit_cylinder_face(legs[i].surf, legs[i].length, j_in[i], j_out[i], &windows, gin(i), gout(i));
-        if i == 0 {
-            let n0 = UnitVec3::try_from_vec(legs[i].surf.axis().as_vec() * -1.0).unwrap();
-            asm.emit_disk_cap(Plane3::from_origin_normal(legs[i].surf.frame.origin, n0), j_in[i], gin(i));
-        }
-        if i + 1 == n {
-            let cc = legs[i].surf.frame.origin + legs[i].surf.axis().as_vec() * legs[i].length;
-            asm.emit_disk_cap(Plane3::from_origin_normal(cc, legs[i].surf.axis()), j_out[i], gout(i));
-        }
-    }
-    for (i, e) in elbows.iter().enumerate() {
-        asm.emit_torus_fillet(e.surf, j_out[i], j_in[i + 1], gout(i), gin(i + 1));
-    }
-
-    // crossers: seamless cylinder + the mutual windows + caps at both ends.
-    for (ci, c) in crossers.iter().enumerate() {
-        let len = c.length;
-        let windows: Vec<(u32, Vec<Point3>)> = (0..legs.len())
-            .flat_map(|i| shared_loops[i][ci].iter().cloned())
-            .map(|w| (0u32, w))
-            .collect();
-        let rim_lo = Circle3::new(c.surf.frame.origin, c.surf.axis(), c.surf.radius);
-        let rim_hi = Circle3::new(
-            c.surf.frame.origin + c.surf.axis().as_vec() * len,
-            c.surf.axis(),
-            c.surf.radius,
-        );
-        let base = 2 * n as u32 + 2 * ci as u32;
-        asm.emit_cylinder_face(c.surf, len, rim_lo, rim_hi, &windows, base, base + 1);
-        let n0 = UnitVec3::try_from_vec(c.surf.axis().as_vec() * -1.0).unwrap();
-        asm.emit_disk_cap(Plane3::from_origin_normal(c.surf.frame.origin, n0), rim_lo, base);
-        let cc = c.surf.frame.origin + c.surf.axis().as_vec() * len;
-        asm.emit_disk_cap(Plane3::from_origin_normal(cc, c.surf.axis()), rim_hi, base + 1);
-    }
-
-    let faces = asm.faces().to_vec();
-    let shell = brep.add_shell(Shell {
-        faces: faces.clone(),
-        is_outer: true,
-        solid: Default::default(),
-    });
-    let solid = brep.add_solid(Solid { shells: vec![shell], name: Some("combo".into()) });
-    brep.shells[shell].solid = solid;
-    for f in &faces {
-        brep.faces[*f].shell = shell;
-    }
-    shell
+/// One serpentine filament path: `legs[i]` joined to `legs[i+1]` by
+/// `elbows[i]`.  The two free ends (first leg incoming, last leg outgoing)
+/// are capped.  Each leg is built with `surf.frame.origin` at its incoming
+/// end and `surf.axis()` pointing toward the outgoing end.
+#[derive(Debug, Clone)]
+pub struct Filament {
+    /// Straight legs in path order.
+    pub legs: Vec<LegSeg>,
+    /// Elbows (`legs.len() - 1` of them); `elbows[i]` joins legs i and i+1.
+    pub elbows: Vec<ElbowSeg>,
 }
+
+impl Filament {
+    /// Build a planar serpentine filament from a polyline path: straight legs
+    /// joined by constant-radius circular fillets (one per interior vertex).
+    /// `r` = filament radius, `fillet` = elbow bend radius.  Each leg runs
+    /// `surf.frame.origin` → `+axis`, the convention every fuse in this crate expects.
+    pub fn serpentine(verts: &[Point3], r: f64, fillet: f64) -> Filament {
+        let n = verts.len();
+        assert!(n >= 2, "a filament needs at least two path vertices");
+        let dir = |a: Point3, b: Point3| UnitVec3::try_from_vec(b - a).unwrap();
+        let mut tin = vec![Point3::new(0.0, 0.0, 0.0); n];
+        let mut tout = vec![Point3::new(0.0, 0.0, 0.0); n];
+        let mut elbows = Vec::new();
+        for k in 1..n.saturating_sub(1) {
+            let din = dir(verts[k - 1], verts[k]);
+            let dout = dir(verts[k], verts[k + 1]);
+            let turn = din.dot_vec(dout.as_vec()).clamp(-1.0, 1.0).acos();
+            // Tangent length of a fillet of radius `fillet` across a corner
+            // deflecting by `turn`: R·tan(turn/2).  (R/tan(turn/2) is only
+            // equal at 90°; on the slanted connectors a real generator emits
+            // it put the leg start 0.07 mm past the elbow's end, leaving the
+            // junction circles of leg and elbow on different circles.)
+            let t = fillet * (turn / 2.0).tan();
+            let pin = verts[k] - din.as_vec() * t;
+            let pout = verts[k] + dout.as_vec() * t;
+            let axis = UnitVec3::try_from_vec(din.as_vec().cross(dout.as_vec())).unwrap();
+            let inward = UnitVec3::try_from_vec(axis.as_vec().cross(din.as_vec())).unwrap();
+            let centre = pin + inward.as_vec() * fillet;
+            let torus = TorusSurf::new(centre, axis, fillet, r);
+            let theta = |p: Point3| {
+                let w = p - torus.frame.origin;
+                let rd = w - torus.frame.z.as_vec() * torus.frame.z.dot_vec(w);
+                torus.frame.y.dot_vec(rd).atan2(torus.frame.x.dot_vec(rd))
+            };
+            let lo = theta(pin);
+            let mut d = theta(pout) - lo;
+            while d > std::f64::consts::PI { d -= std::f64::consts::TAU; }
+            while d < -std::f64::consts::PI { d += std::f64::consts::TAU; }
+            elbows.push(ElbowSeg { surf: torus, theta_lo: lo, theta_hi: lo + d });
+            tin[k] = pin;
+            tout[k] = pout;
+        }
+        let mut legs = Vec::new();
+        for k in 0..n - 1 {
+            let start = if k == 0 { verts[0] } else { tout[k] };
+            let end = if k + 1 == n - 1 { verts[n - 1] } else { tin[k + 1] };
+            legs.push(LegSeg {
+                surf: CylSurf::new(start, dir(start, end), r),
+                length: (end - start).length(),
+            });
+        }
+        Filament { legs, elbows }
+    }
+
+}
+
+
 
 
 
@@ -369,36 +324,6 @@ mod tests {
             });
         }
         (legs, elbows)
-    }
-
-    #[test]
-    fn filament_with_crosser_watertight() {
-        // L-filament in z=0; a crosser leg in z=0.35 over leg B.
-        let verts = [
-            Point3::new(-2.0, 0.0, 0.0),
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(0.0, 3.0, 0.0),
-        ];
-        let (legs, elbows) = filament_from_path(&verts, 0.275, 0.5);
-        // crosser: +X at y=1.5, z=0.35, from x=-2..2 → crosses leg B (x=0,+Y)
-        let crosser = LegSeg {
-            surf: CylSurf::new(Point3::new(-2.0, 1.5, 0.35), UnitVec3::X, 0.275),
-            length: 4.0,
-        };
-        let mut brep = BRep::new();
-        let shell = fuse_filament_with_crossers(&mut brep, &legs, &elbows, &[crosser]);
-        let uses = edge_uses(&brep, shell);
-        let open = uses.values().filter(|&&n| n == 1).count();
-        assert_eq!(open, 0, "combo watertight, got {open} open");
-        assert!(uses.values().all(|&n| n == 2), "every edge shared twice");
-
-        let mut cfg = UnionConfig::default();
-        cfg.wires_strict = true;
-        let mut diag = Diagnostics::new();
-        let report = validate_shell(&brep, shell, &cfg, &mut diag);
-        assert!(report.manifold_violations.is_empty(), "manifold");
-        assert!(report.distance_violations.is_empty(),
-            "distance max {:.2}um", report.max_edge_deviation * 1e3);
     }
 
     #[test]

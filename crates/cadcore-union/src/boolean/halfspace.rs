@@ -508,7 +508,7 @@ pub fn half_space_cut(
     let mut out = BRep::new();
     // Weld tolerance = the knit tolerance, floored at 1 nm.  A fused input
     // built by the universal fuse presents shared points exact to ~1e-12, and
-    // a coarse weld (the 0.5 µm the hole-imprint fuse needed) would drag rim
+    // a coarse weld (half a micron, say) would drag rim
     // vertices off their circles — the arcs then no longer fit and are written
     // as B-splines.
     // Two faces present a shared point through different fitted curves
@@ -796,7 +796,7 @@ fn emit_cut_faces(
         // Apply the seam settled in pass 1.  A fused band is SEAMLESS; the
         // periodic DCEL has to put a seam somewhere, and wherever it lands it
         // splits the chains crossing it — so it is parked in the widest empty
-        // gap (the trick `arrange::solid::seam_away_from` plays) and whatever
+        // gap and whatever
         // it still crosses was published as a joint.
         let domain = match seams.get(&fid) {
             Some(&rot) => apply_seam_rotation(&domain, &mut chains, rot),
@@ -1691,7 +1691,7 @@ fn seg_cross(a0: (f64, f64), a1: (f64, f64), b0: (f64, f64), b1: (f64, f64)) -> 
 /// Split every section curve where it crosses another one, so the cap and the
 /// lateral faces are handed the SAME pieces.
 ///
-/// This is the cut's registry, the analogue of [`crate::arrange::registry`] for
+/// This is the cut's pre-split registry for
 /// the union: where two fused tubes overlap at the plane their sections overlap
 /// too, and each consumer would otherwise partition the shared curve its own
 /// way — the cap at the outline of the union, the lateral face at its crossing
@@ -2243,7 +2243,8 @@ mod tests {
     /// Two crossing serpentines FUSED into one solid (the shape the scaffold
     /// export builds), then cut.
     fn fused_scaffold() -> (BRep, ShellId) {
-        use crate::arrange::scaffold::{fuse_scaffold, Filament};
+        use crate::arrange::filament::Filament;
+        use crate::arrange::universal::fuse_filaments;
         let r = 0.275;
         // A: U in z=0 — X-legs at y=0 and y=2, connector at x=0.
         let a = Filament::serpentine(
@@ -2268,7 +2269,7 @@ mod tests {
             0.3,
         );
         let mut brep = BRep::new();
-        let shell = fuse_scaffold(&mut brep, &[a, b]);
+        let shell = fuse_filaments(&mut brep, &[a, b]);
         (brep, shell)
     }
 
@@ -2276,7 +2277,8 @@ mod tests {
     /// stacked layers, the geometry `brep::pipeline` builds for a 3 mm 2-layer
     /// part (filament ⌀0.55, spacing 1.2, layer 0.35, bend radius 0.5).
     fn fused_real_scaffold() -> (BRep, ShellId) {
-        use crate::arrange::scaffold::{fuse_scaffold, Filament};
+        use crate::arrange::filament::Filament;
+        use crate::arrange::universal::fuse_filaments;
         let r = 0.275;
         let z0 = 0.35;
         let z1 = 0.70;
@@ -2306,7 +2308,7 @@ mod tests {
             0.5,
         );
         let mut brep = BRep::new();
-        let shell = fuse_scaffold(&mut brep, &[a, b]);
+        let shell = fuse_filaments(&mut brep, &[a, b]);
         (brep, shell)
     }
 
@@ -2341,7 +2343,6 @@ mod tests {
     /// on both members — as a hole on neither, but as a shared notch across the
     /// leg↔elbow boundary.  Then it welds AND every wire stays inside its face.
     #[test]
-    #[ignore = "wire=4: crossing windows straddle leg rims — see doc comment"]
     fn fusing_a_real_scaffold_passes_the_spaceclaim_gate() {
         let (fused, shell) = fused_real_scaffold();
         assert_eq!(open_edges(&fused, shell), 0, "fused shell is manifold");
@@ -2388,7 +2389,6 @@ mod tests {
     /// exactly on the fillet tangent (`0.3 + 0.5`), so the junction circles lie
     /// IN the plane — a separate degenerate case worth its own test.
     #[test]
-    #[ignore = "47 open edges on a real scaffold — see doc comment"]
     fn cut_a_real_scaffold_is_watertight() {
         let (fused, shell) = fused_real_scaffold();
         let faces = fused.shells[shell].faces.clone();
@@ -2485,7 +2485,7 @@ mod tests {
         // Keep x <= -0.7: severs A's two X-legs clear of their U-turn fillets,
         // drops A's connector, leaves every crossing with B intact.
         let keep = Plane3::from_origin_normal(Point3::new(-0.7, 0.0, 0.0), -UnitVec3::X);
-        // The hole-imprint fuse carries ~1e-4 of seam-interpolation noise on
+        // A coarser knit than the fuse needs: this fixture is also cut with ~1e-4 of noise tolerated on
         // its shared points, so its knit is the half-micron the legacy export
         // path uses (the universal fuse is exact and cuts at 1e-6).
         let cut = half_space_cut(&fused, &faces, &keep, 5e-4).expect("cut runs");
