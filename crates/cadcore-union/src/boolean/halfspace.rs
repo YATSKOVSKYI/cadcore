@@ -153,6 +153,14 @@ pub fn half_space_cut(
     if faces.is_empty() {
         return None;
     }
+    let timing = std::env::var("CADCORE_TIME").is_ok();
+    let t_phase = std::cell::Cell::new(std::time::Instant::now());
+    let tick = |what: &str| {
+        if timing {
+            eprintln!("[cut][time] {what}: {} ms", t_phase.get().elapsed().as_millis());
+        }
+        t_phase.set(std::time::Instant::now());
+    };
     let n = keep.normal();
 
     // ── 1. Bound the cutting plane to the model ──────────────────────────────
@@ -286,6 +294,7 @@ pub fn half_space_cut(
             }
         }
     }
+    tick("classify + ssi");
     let mut edges_done: std::collections::HashSet<cadcore_topo::EdgeId> =
         std::collections::HashSet::new();
     for &fid in faces {
@@ -373,11 +382,13 @@ pub fn half_space_cut(
             eprintln!("[cut][joint] ({:.6},{:.6},{:.6})", j.x, j.y, j.z);
         }
     }
+    tick("joints");
     // Graft the in-plane vertices into every section curve that passes through
     // them, so the arranged face, the cap and the copied neighbour all split
     // there identically.
     if !plane_joints.is_empty() {
-        for curves in ssi[0].values_mut() {
+        for (fid, curves) in ssi[0].iter_mut() {
+            let planar = matches!(src.faces[*fid].geom, FaceGeom::Plane(_));
             for c in curves.iter_mut() {
                 if c.closed && c.points.len() >= 3 {
                     let first = c.points[0];
@@ -385,11 +396,38 @@ pub fn half_space_cut(
                     insert_joints(&mut c.points, &plane_joints);
                     c.points.pop();
                 } else {
+                    // An OPEN section curve ends on the face's boundary, i.e.
+                    // at a joint.  Its sampled end can be a chord sagitta off
+                    // (a planar end cap's rim is a chord polygon: the plane–
+                    // plane section line stops 6e-4 short of the exact circle
+                    // point the neighbouring cylinder uses), well outside
+                    // `JOINT_SNAP` — so the ends snap on the sagitta scale.
+                    const END_SNAP: f64 = 5.0e-3;
+                    let n = c.points.len();
+                    for k in [0, n.saturating_sub(1)] {
+                        if !planar {
+                            break; // tube sections end on exact band ends
+                        }
+                        let q = c.points[k];
+                        let best = plane_joints
+                            .iter()
+                            .map(|j| ((*j - q).length(), *j))
+                            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        if let Some((d, j)) = best {
+                            if std::env::var("CADCORE_DUMP_CUT").is_ok() && d < 0.05 {
+                                eprintln!("[cut][endsnap] {fid:?} end ({:.6},{:.6},{:.6}) nearest joint {d:.3e}", q.x, q.y, q.z);
+                            }
+                            if d < END_SNAP {
+                                c.points[k] = j;
+                            }
+                        }
+                    }
                     insert_joints(&mut c.points, &plane_joints);
                 }
             }
         }
     }
+    tick("graft");
     // Clip every section curve to its face's TRIMMED region.  The SSI knows
     // only the carrier band; on a fused shell the face may have a notch or a
     // window exactly where the plane passes (a neighbouring tube welded in), and
@@ -479,6 +517,7 @@ pub fn half_space_cut(
         *curves = clipped;
     }
     ssi[0].retain(|_, v| !v.is_empty());
+    tick("clip runs");
     // Edges of KEPT faces lying in the plane whose other face is DROPPED: the
     // plane passes exactly along a junction, and that junction circle IS the
     // section there.  The cap is built from the very same sampled points the
@@ -504,6 +543,7 @@ pub fn half_space_cut(
     // partition the shared curve identically.
     presplit_sections(&mut ssi[0], &cut_plane, knit.clamp(5e-4, 1e-2));
 
+    tick("rims + snap + presplit");
     // ── 3. Trim every face ───────────────────────────────────────────────────
     let mut out = BRep::new();
     // Weld tolerance = the knit tolerance, floored at 1 nm.  A fused input
@@ -518,11 +558,13 @@ pub fn half_space_cut(
     let mut asm = Assembler::new(&mut out, weld);
     emit_cut_faces(src, faces, &mut ssi[0], &sides, &plane_joints, keep, &mut asm);
 
+    tick("emit faces");
     // ── 4. Section caps ──────────────────────────────────────────────────────
     let lateral = asm.faces().len();
     let loops = section_loops(&ssi[0], &rim_curves, weld);
     let caps = emit_section_caps(src, faces, &cut_plane, n, half, &loops, &mut asm);
 
+    tick("caps");
     let out_faces = asm.faces().to_vec();
     let shell = out.add_shell(Shell {
         faces: out_faces.clone(),
@@ -2176,15 +2218,6 @@ mod tests {
         out
     }
 
-    fn centroid(pts: &[Point3]) -> Point3 {
-        let o = Point3::new(0.0, 0.0, 0.0);
-        let mut acc = cadcore_math::Vec3::new(0.0, 0.0, 0.0);
-        for p in pts {
-            acc = acc + (*p - o);
-        }
-        o + acc * (1.0 / pts.len() as f64)
-    }
-
     /// A capped cylinder cut across its axis: the part keeps its lateral band up
     /// to the plane, loses the far cap and gains a flat disk section.
     #[test]
@@ -2526,11 +2559,29 @@ mod tests {
             if pts.is_empty() || pts.iter().any(|p| keep.signed_distance(*p).abs() > 1e-6) {
                 continue; // not a section cap
             }
-            let c = centroid(&pts);
-            assert!(
-                point_in_solid(&fused, &faces, c + n * 1e-3),
-                "a cap was emitted over void at {c:?}"
-            );
+            // The outline is NOT convex (two disks joined by a lengthwise
+            // strip), so its vertex centroid is no interior probe.  What a
+            // cap over material means: every edge of its outline separates
+            // material from void — just behind the cap, exactly one of the
+            // two sides of the edge is inside the original solid.
+            // `loop_points` lists the two ends of every co-edge in turn
+            for pair in pts.chunks(2) {
+                let [a, b] = [pair[0], pair[pair.len() - 1]];
+                let e = b - a;
+                if e.length() < 1e-2 {
+                    continue; // too short to probe clear of its neighbours
+                }
+                let c = n.as_vec().cross(e);
+                let side = c * (1e-3 / c.length());
+                // a micron behind the cap: where the plane grazes an elbow the
+                // outline moves fast with depth
+                let m = a.lerp(b, 0.5) + n.as_vec() * 1e-6;
+                let (l, r) = (
+                    point_in_solid(&fused, &faces, m + side),
+                    point_in_solid(&fused, &faces, m - side),
+                );
+                assert!(l != r, "cap edge {a:?} -> {b:?} at {m:?} does not bound material (left {l}, right {r})");
+            }
         }
         // And the gate a receiving CAD actually applies.
         // The SpaceClaim gate: wire winding and manifold are clean.  Gate 4

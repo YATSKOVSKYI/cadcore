@@ -188,3 +188,20 @@ next layer and used to abandon 200+ traces on a 5 mm grid.
 The test suite has no `#[ignore]` and no known-red test.  A capability that
 does not work is either fixed or removed and listed under "Limits" in the
 README — not parked behind an ignored test.
+
+## 0.2.1 — lengthwise trims (plane through the axis of the outermost filament)
+
+A trim at d/2 runs ALONG the outermost filament and through its flat end cap.
+
+* **An open section curve on a PLANAR face ends at a joint** — snap its ends on
+  the sagitta scale (`END_SNAP`), not `JOINT_SNAP`.  The end cap's region is a
+  chord polygon, so the plane–plane section line stops ~6e-4 short of the exact
+  circle point the neighbouring cylinder uses → one open edge along the whole
+  leg.  Planar faces only: on tube faces the wider snap grabs a foreign joint.
+* **Plane–torus (and torus–torus) seeds on an already traced loop are skipped
+  BEFORE the trace** (`traced`, 2e-3).  Deduplicating after the trace cost
+  1.2 s per cut on a 6 mm grid (now 20 ms).  The distance is a few sagittas,
+  not a step: two loops of one section pass closer than a step.
+* The application must hand the kernel STRAIGHT legs: recover corners from the
+  run's chord, never from the direction of its first sample (see
+  `brep/tests/straight_legs.rs` in DIW Forge).

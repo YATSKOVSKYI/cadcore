@@ -13,10 +13,10 @@ keywords     = ["cad", "brep", "step", "geometry", "3d-printing"]
 categories   = ["science", "graphics"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math", version = "0.2.0" }
-cadcore-geom = { path = "../cadcore-geom", version = "0.2.0" }
-cadcore-topo = { path = "../cadcore-topo", version = "0.2.0" }
-cadcore-ops  = { path = "../cadcore-ops",  version = "0.2.0" }
-cadcore-union = { path = "../cadcore-union", version = "0.2.0" }
-cadcore-step = { path = "../cadcore-step", version = "0.2.0" }
-cadcore-mesh = { path = "../cadcore-mesh", version = "0.2.0" }
+cadcore-math = { path = "../cadcore-math", version = "0.2.1" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.2.1" }
+cadcore-topo = { path = "../cadcore-topo", version = "0.2.1" }
+cadcore-ops  = { path = "../cadcore-ops",  version = "0.2.1" }
+cadcore-union = { path = "../cadcore-union", version = "0.2.1" }
+cadcore-step = { path = "../cadcore-step", version = "0.2.1" }
+cadcore-mesh = { path = "../cadcore-mesh", version = "0.2.1" }

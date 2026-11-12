@@ -140,6 +140,7 @@ fn torus_torus(
     // sample torus A's surface over its arc × full minor circle for seeds.
     let m = 48;
     let n = 32;
+    let mut traced: Vec<Vec<Point3>> = Vec::new();
     for i in 0..=m {
         let theta = alo + (ahi - alo) * (i as f64 / m as f64);
         for j in 0..n {
@@ -149,9 +150,31 @@ fn torus_torus(
                 continue; // far from torus B — not near an intersection
             }
             let Some(seed) = intersection_point_near(&sa, &sb, p, 1e-12) else { continue };
+            // A seed ON a loop that was already traced starts the same loop
+            // again.  Tracing is the whole cost of a planar cut (hundreds of
+            // grid nodes refine onto each section), so those seeds are skipped
+            // before the trace, not deduplicated after it.
+            // "On" = within a few chord sagittas (step² / 8r ≈ 2e-4) — NOT a
+            // step: two distinct loops of one section pass closer than that.
+            let near = 2.0e-3;
+            if traced.iter().any(|c| {
+                c.windows(2).any(|w| {
+                    let seg = w[1] - w[0];
+                    let l2 = seg.dot(seg);
+                    let t = if l2 > 0.0 { (seg.dot(seed - w[0]) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                    (w[0] + seg * t - seed).length() < near
+                })
+            }) {
+                continue;
+            }
             let Some(curve) = trace_closed_loop(&sa, &sb, seed, &opts) else { continue };
             if curve.points.len() < 3 {
                 continue;
+            }
+            {
+                let mut ring = curve.points.clone();
+                ring.push(curve.points[0]);
+                traced.push(ring);
             }
             let c = curve.points.iter().fold(Point3::new(0.0, 0.0, 0.0), |a, &q| {
                 a + (q - Point3::new(0.0, 0.0, 0.0)) * (1.0 / curve.points.len() as f64)
@@ -252,6 +275,7 @@ fn plane_torus(plane: &Plane3, poly: Option<Vec<Point3>>, tor: &TorusSurf, lo: f
 
     let mut out: Vec<SsiCurve> = Vec::new();
     let mut sigs: Vec<(Point3, f64)> = Vec::new();
+    let mut traced: Vec<Vec<Point3>> = Vec::new();
     let m = 64;
     let nn = 48;
     for i in 0..=m {
@@ -263,9 +287,31 @@ fn plane_torus(plane: &Plane3, poly: Option<Vec<Point3>>, tor: &TorusSurf, lo: f
                 continue;
             }
             let Some(seed) = intersection_point_near(&sa, &sb, p, 1e-12) else { continue };
+            // A seed ON a loop that was already traced starts the same loop
+            // again.  Tracing is the whole cost of a planar cut (hundreds of
+            // grid nodes refine onto each section), so those seeds are skipped
+            // before the trace, not deduplicated after it.
+            // "On" = within a few chord sagittas (step² / 8r ≈ 2e-4) — NOT a
+            // step: two distinct loops of one section pass closer than that.
+            let near = 2.0e-3;
+            if traced.iter().any(|c| {
+                c.windows(2).any(|w| {
+                    let seg = w[1] - w[0];
+                    let l2 = seg.dot(seg);
+                    let t = if l2 > 0.0 { (seg.dot(seed - w[0]) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                    (w[0] + seg * t - seed).length() < near
+                })
+            }) {
+                continue;
+            }
             let Some(curve) = trace_closed_loop(&sa, &sb, seed, &opts) else { continue };
             if curve.points.len() < 3 {
                 continue;
+            }
+            {
+                let mut ring = curve.points.clone();
+                ring.push(curve.points[0]);
+                traced.push(ring);
             }
             let c = curve.points.iter().fold(Point3::new(0.0, 0.0, 0.0), |a, &q| a + (q - Point3::new(0.0, 0.0, 0.0)) * (1.0 / curve.points.len() as f64));
             let mr = curve.points.iter().map(|&q| (q - c).length()).sum::<f64>() / curve.points.len() as f64;
