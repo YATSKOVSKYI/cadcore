@@ -224,3 +224,16 @@ The fuse → cut → merge chain on a 15 × 15 mm, 12-layer lattice went from 6.
   window, 0.01) — and still runs the full dedup pass when no joint is near.
 * The STEP output was already order-nondeterministic run to run (~70 of 3·10⁵ points differ):
   compare outputs geometrically (entity counts, point multiset, FreeCAD volume), not by bytes.
+
+## 0.2.3 — lighter, exact STEP edges
+
+* **Sampled intersection edges are written as a least-squares cubic** (`interp::approx_cubic_shared`):
+  one clamped knot vector shared by the 3-D curve and every pcurve, control points added until every
+  sample of each is within `fit_tol()` = 1e-4 mm (`CADCORE_FIT_TOL`, `0` = interpolate all samples as
+  before).  15 × 15 × 12 lattice: 299 k → 161 k points, file −38 %, SpaceClaim import 190 → 112 s.
+  Keep pcurves: without them SpaceClaim gains little and OCC may need them on other lattices.
+* **A same-tag run that is not ONE circle is split into constant-φ / constant-θ pieces on a torus**
+  (`build_loop`).  The cut gives a face's whole boundary loop one tag, so trimmed elbow equator arcs
+  (22.5° samples) went out as chords 10.9 µm off the face (OCC edge tolerance 0.0108 mm, above
+  SolidWorks' 1 µm knit).  Now exact circles: max edge-to-face deviation 6e-5 mm.  Check any STEP
+  change with `docs/benchmarks/union_trim_2026-11-12/freecad_edge_dev.py` in 3DcadCore.

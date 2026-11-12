@@ -655,12 +655,96 @@ impl<'b> Assembler<'b> {
                 }
                 other => other,
             };
+            // A run that is not ONE circle may still be made of circles: the
+            // cut hands a face's whole boundary loop to the arrangement as one
+            // chain (one tag), so on a torus the run strings a minor circle, a
+            // piece of the equator, another minor circle...  Chording those
+            // pieces leaves the face by the chord sagitta — 11 µm for a 22.5°
+            // equator step — which SpaceClaim then spends minutes healing.
+            // Split such a run where the torus coordinate that stays constant
+            // changes, and recover each piece as its exact major / minor circle
+            // (same checks as a whole run).  Endpoints and per-step topology are
+            // untouched; only the stored geometry of those steps changes.
+            let mut step_rc: Vec<RunCurve> = vec![rc; seg_hi - seg_lo];
+            if !matches!(rc, RunCurve::Circle(_))
+                && matches!(domain, FaceDomain::TorusPatch { .. } | FaceDomain::TorusBand { .. })
+            {
+                let tau = std::f64::consts::TAU;
+                let wrap = |d: f64| {
+                    let mut d = d % tau;
+                    if d > std::f64::consts::PI {
+                        d -= tau;
+                    } else if d < -std::f64::consts::PI {
+                        d += tau;
+                    }
+                    d
+                };
+                // class of a step: 1 = constant φ (major circle), 2 = constant θ
+                // (minor circle), 0 = neither; plus the constant value.
+                let class: Vec<(u8, f64)> = (seg_lo..seg_hi)
+                    .map(|k| {
+                        let poly3 = &step_poly[order[k]];
+                        if poly3.len() < 2 {
+                            return (0, 0.0);
+                        }
+                        let (t0, f0) = domain.uv(poly3[0]);
+                        let (t1, f1) = domain.uv(*poly3.last().unwrap());
+                        let (dt, df) = (wrap(t1 - t0).abs(), wrap(f1 - f0).abs());
+                        if df < 1e-9 && dt > 1e-7 {
+                            (1, f0)
+                        } else if dt < 1e-9 && df > 1e-7 {
+                            (2, t0)
+                        } else {
+                            (0, 0.0)
+                        }
+                    })
+                    .collect();
+                let mut i = 0;
+                while i < class.len() {
+                    let (c0, v0) = class[i];
+                    let mut j = i + 1;
+                    if c0 != 0 {
+                        while j < class.len() && class[j].0 == c0 && wrap(class[j].1 - v0).abs() < 1e-9 {
+                            j += 1;
+                        }
+                        let mut pts: Vec<Point3> = Vec::new();
+                        for k in i..j {
+                            for &p in &step_poly[order[seg_lo + k]] {
+                                if pts.last().map_or(true, |&q| (q - p).length() > 1e-12) {
+                                    pts.push(p);
+                                }
+                            }
+                        }
+                        if let Some(c) = torus_run_circle(domain, &pts, ftol) {
+                            let holds = pts.windows(2).all(|w| {
+                                let (t0, mut t1) = (circle_angle(&c, w[0]), circle_angle(&c, w[1]));
+                                let pi = std::f64::consts::PI;
+                                while t1 - t0 > pi {
+                                    t1 -= 2.0 * pi;
+                                }
+                                while t1 - t0 < -pi {
+                                    t1 += 2.0 * pi;
+                                }
+                                let m = c.point_at(0.5 * (t0 + t1));
+                                let (u, v) = domain.uv(m);
+                                (domain.lift(u, v) - m).length() < ftol
+                            });
+                            if holds {
+                                for r in step_rc.iter_mut().take(j).skip(i) {
+                                    *r = RunCurve::Circle(c);
+                                }
+                            }
+                        }
+                    }
+                    i = j;
+                }
+            }
             for k in seg_lo..seg_hi {
                 let poly3 = &step_poly[order[k]];
                 if poly3.len() < 2 {
                     continue;
                 }
-                let (edge, sense) = self.emit_step_edge(poly3, rc);
+                let (edge, sense) = self.emit_step_edge(poly3, step_rc[k - seg_lo]);
                 push_coedge(self.brep, &mut coedges, edge, sense);
             }
         }

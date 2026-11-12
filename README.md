@@ -48,7 +48,7 @@ Add `cadcore` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cadcore = "0.2.2"
+cadcore = "0.2.3"
 ```
 
 Create a watertight U-shaped filament rod and export it to a STEP file:

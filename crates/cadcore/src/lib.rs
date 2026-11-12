@@ -55,7 +55,7 @@
 //! ```
 
 #![warn(missing_docs)]
-#![doc(html_root_url = "https://docs.rs/cadcore/0.2.2")]
+#![doc(html_root_url = "https://docs.rs/cadcore/0.2.3")]
 
 /// Re-export of `cadcore-math`.
 pub mod math {
