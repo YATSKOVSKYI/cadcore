@@ -58,8 +58,21 @@ impl Filament {
     /// `r` = filament radius, `fillet` = elbow bend radius.  Each leg runs
     /// `surf.frame.origin` → `+axis`, the convention every fuse in this crate expects.
     pub fn serpentine(verts: &[Point3], r: f64, fillet: f64) -> Filament {
+        let fillets = vec![fillet; verts.len().saturating_sub(2)];
+        Self::serpentine_with_fillets(verts, r, &fillets)
+    }
+
+    /// [`Filament::serpentine`] with a bend radius per interior vertex
+    /// (`fillets[k - 1]` for `verts[k]`).  Walls of different layers stacked
+    /// on one another must END at the same points along the wall: the tangent
+    /// length `R·tan(turn/2)` depends on the turn, and turns that differ by
+    /// 0.02° (corner noise of a toolpath) put the two junction planes 80 nm
+    /// apart — an edge that short in every crossing.  The caller evens that
+    /// out by nudging the radius of one elbow (by ~0.05 %).
+    pub fn serpentine_with_fillets(verts: &[Point3], r: f64, fillets: &[f64]) -> Filament {
         let n = verts.len();
         assert!(n >= 2, "a filament needs at least two path vertices");
+        assert_eq!(fillets.len(), n - 2, "one bend radius per interior vertex");
         let dir = |a: Point3, b: Point3| UnitVec3::try_from_vec(b - a).unwrap();
         let mut tin = vec![Point3::new(0.0, 0.0, 0.0); n];
         let mut tout = vec![Point3::new(0.0, 0.0, 0.0); n];
@@ -73,6 +86,7 @@ impl Filament {
             // equal at 90°; on the slanted connectors a real generator emits
             // it put the leg start 0.07 mm past the elbow's end, leaving the
             // junction circles of leg and elbow on different circles.)
+            let fillet = fillets[k - 1];
             let t = fillet * (turn / 2.0).tan();
             let pin = verts[k] - din.as_vec() * t;
             let pout = verts[k] + dout.as_vec() * t;

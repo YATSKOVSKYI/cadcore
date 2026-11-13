@@ -103,6 +103,10 @@ pub struct FuseReport {
     pub aborted: usize,
     /// Faces emitted.
     pub faces: usize,
+    /// Samples on traced pieces before refinement, and how many it added
+    /// (where the cubic through the samples missed the true curve).
+    pub samples_before: usize,
+    pub samples_added: usize,
     /// Human-readable notes about anything irregular.
     pub notes: Vec<String>,
 }
@@ -207,6 +211,15 @@ pub fn fuse_filaments_with(
         for piece in &mut lp.pieces {
             let sa = bodies[piece.a.0].surface(piece.a.1);
             let sb = bodies[piece.b.0].surface(piece.b.1);
+            if piece.on_circle.is_none() {
+                let before = piece.pts.len();
+                // tight where an elbow is involved: those are the curves that
+                // run within microns of each other on bonded walls
+                let elbow = matches!(piece.a.1, Member::Elbow(_)) || matches!(piece.b.1, Member::Elbow(_));
+                refine_samples(&mut piece.pts, &sa, &sb, if elbow { 1.0 } else { 5.0 });
+                report.samples_before += before;
+                report.samples_added += piece.pts.len() - before;
+            }
             for side in [1.0, -1.0] {
                 split_piece_at_seam(&mut piece.pts, &sa, &sb, side, &mut report);
                 split_piece_at_seam(&mut piece.pts, &sb, &sa, side, &mut report);
@@ -244,6 +257,7 @@ pub fn fuse_filaments_with(
         .collect();
 
     if timing {
+        eprintln!("[fuse] sample refinement: {} + {} added", report.samples_before, report.samples_added);
         eprintln!("[fuse][time] chains: {} ms", t_stage.elapsed().as_millis());
     }
     let t_stage = std::time::Instant::now();
@@ -1123,6 +1137,75 @@ fn trace_boundary(
             eprintln!("[trace][step] n={steps_total} ({:.4},{:.4},{:.4}) {:?}/{:?} travelled {:.3}", q.x, q.y, q.z, m_i, m_j, travelled);
         }
         let Some((on_i, frac, hi)) = first else {
+            // Both ends of the step lie on their members, yet the curve can
+            // leave one in between: it grazes a junction plane and pokes past
+            // it by less than the step's sagitta (honeycomb: a crossing tube
+            // overshoots an elbow's end by 3.5e-5 mm along 7.5 µm).  Missing
+            // it leaves the edge outside its face (SolidWorks: fault -1), so
+            // route the boundary over the neighbour for that stretch.
+            let hstep = (q - p).length();
+            let on_curve = |s: f64| crate::geom::refine::refine_pair(p.lerp(q, s), &s_i, &s_j, 1e-13, 30).0;
+            // (fraction along the step, side i?, past hi?, entering the neighbour?)
+            let mut events: Vec<(f64, bool, bool, bool)> = Vec::new();
+            for (on_i, body, m) in [(true, bi, m_i), (false, bj, m_j)] {
+                if let Some((hi, s1, s2)) = excursion(body, m, &on_curve, p, q, hstep) {
+                    events.push((s1, on_i, hi, true));
+                    events.push((s2, on_i, hi, false));
+                }
+            }
+            if !events.is_empty() {
+                events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                let (home_i, home_j) = (m_i, m_j);
+                let (mut ci, mut cj) = (m_i, m_j);
+                let mut s_prev = 0.0;
+                for (n_ev, &(s, on_i, hi, enter)) in events.iter().enumerate() {
+                    let x = on_curve(s);
+                    let (body, home) = if on_i { (bi, home_i) } else { (bj, home_j) };
+                    let Some((next_m, _, key)) = body.neighbour(home, hi) else { abort!("no neighbour at an excursion") };
+                    if dbg {
+                        let (v, lo, hv) = body.span(home, on_curve(s + if enter { 0.02 } else { -0.02 }));
+                        eprintln!("[trace][excursion] bodies {i}/{j} side {} {:?} {} {:?} at ({:.5},{:.5},{:.5}), s {s:.4}, step {:.2e}, over@±0.02 {:.2e}, pieces {}", if on_i { "i" } else { "j" }, home, if enter { "→" } else { "←" }, next_m, x.x, x.y, x.z, hstep, if hi { v - hv } else { lo - v }, pieces.len());
+                    }
+                    if n_ev == 0 {
+                        // a step point a hair before the joint would leave a sliver edge
+                        if cur.pts.len() >= 2 && (x - *cur.pts.last().unwrap()).length() < 0.25 * opts.step {
+                            cur.pts.pop();
+                        }
+                    } else if (x - *cur.pts.last().unwrap()).length() > 1e-6 {
+                        // the stretch between two events: one point of ITS face pair in the middle
+                        let (sa, sb) = (bi.surface(ci), bj.surface(cj));
+                        let mid = crate::geom::refine::refine_pair(on_curve(0.5 * (s_prev + s)), &sa, &sb, 1e-13, 30).0;
+                        cur.pts.push(mid);
+                    }
+                    if (x - *cur.pts.last().unwrap()).length() > 1e-9 {
+                        cur.pts.push(x);
+                    }
+                    let end = *cur.pts.last().unwrap();
+                    if cur.pts.len() >= 2 {
+                        pieces.push(cur);
+                    }
+                    joints.push(Joint { key: JunctionKey { body: if on_i { i } else { j }, leg: key.0, end: key.1 }, p: end });
+                    let to = if enter { next_m } else { home };
+                    if on_i {
+                        ci = to;
+                    } else {
+                        cj = to;
+                    }
+                    cur = Piece { a: (i, ci), b: (j, cj), pts: vec![end], on_circle: None };
+                    s_prev = s;
+                }
+                consecutive_switches = 0;
+                let last = *cur.pts.last().unwrap();
+                let mut np = last;
+                if (q - last).length() > 0.25 * opts.step {
+                    cur.pts.push(q);
+                    np = q;
+                }
+                travelled += (q - p).length();
+                dir = Some(q - p);
+                p = np;
+                continue;
+            }
             // plain step
             consecutive_switches = 0;
             cur.pts.push(q);
@@ -1142,6 +1225,41 @@ fn trace_boundary(
         let (body, m_cur, other_surf) = if on_i { (bi, m_i, s_j) } else { (bj, m_j, s_i) };
         let Some((next_m, circle, key)) = body.neighbour(m_cur, hi) else { abort!("no neighbour") };
         let Some(jpt) = joint_on_circle(&circle, &other_surf, approx, hh.max(opts.step)) else { abort!("joint not found") };
+        // Where the curve grazes this junction it crosses the circle twice
+        // within microns, and the circle search above — bracketed far wider —
+        // can land on the OTHER crossing; the march then turns round and
+        // walks its own curve back.  The crossing this step really makes is
+        // found along the step itself; when the two disagree, take that one.
+        let jpt = {
+            let on_curve = |s: f64| crate::geom::refine::refine_pair(p.lerp(q, s), &s_i, &s_j, 1e-13, 30).0;
+            let over = |s: f64| {
+                let (v, lo, hv) = body.span(m_cur, on_curve(s));
+                if hi { v - hv } else { lo - v }
+            };
+            let (mut inside, mut outside) = (0.0f64, 1.0f64);
+            if over(1.0) > 0.0 {
+                for _ in 0..60 {
+                    let mid = 0.5 * (inside + outside);
+                    if over(mid) > 0.0 {
+                        outside = mid;
+                    } else {
+                        inside = mid;
+                    }
+                }
+                let xs = on_curve(0.5 * (inside + outside));
+                let on_c = circle.point_at(circle_angle(&circle, xs));
+                if (xs - jpt).length() > 1e-6 && (on_c - xs).length() < 1e-7 && other_surf.distance(on_c) < 1e-7 {
+                    if dbg {
+                        eprintln!("[trace][joint] circle search picked the far crossing ({:.2e} mm off); using the step's own", (xs - jpt).length());
+                    }
+                    on_c
+                } else {
+                    jpt
+                }
+            } else {
+                jpt
+            }
+        };
         // Coincident junction planes (stacked, bonded walls, snapped to one
         // plan position upstream): this junction circle and one of the OTHER
         // body's lie in one plane and cross at two points.  Each such point is
@@ -1383,6 +1501,74 @@ fn trace_boundary(
     None
 }
 
+/// A step `p → q` with both ends on member `m` that leaves `m` in between:
+/// the curve grazes one of `m`'s junction planes and pokes past it by less
+/// than the step's sagitta.  Returns `(past hi?, enter, leave)` — the two
+/// fractions along the step (through `on_curve`, the step projected onto the
+/// intersection curve) where the curve crosses the junction plane.  Only steps within a step of a junction plane are looked
+/// at, and an overshoot must exceed the exit test's 1e-9.
+fn excursion(body: &Body, m: Member, on_curve: &dyn Fn(f64) -> Point3, p: Point3, q: Point3, h: f64) -> Option<(bool, f64, f64)> {
+    if matches!(m, Member::Cap(_)) {
+        return None;
+    }
+    for hi in [true, false] {
+        let Some((_, circle, _)) = body.neighbour(m, hi) else { continue };
+        let n = circle.frame.z.as_vec();
+        let o = circle.frame.origin;
+        // near the junction CIRCLE, not merely its (infinite) plane
+        let near = |x: Point3| {
+            let w = x - o;
+            let ax = n.dot(w);
+            let rad = (w - n * ax).length();
+            ax.abs() < h && (rad - circle.radius).abs() < h + 1e-6
+        };
+        if !near(p) && !near(q) {
+            continue;
+        }
+        let over = |s: f64| {
+            let (v, lo, hv) = body.span(m, on_curve(s));
+            if hi { v - hv } else { lo - v }
+        };
+        let (o0, om, o1) = (over(0.0), over(0.5), over(1.0));
+        if o0 > 0.0 || o1 > 0.0 {
+            continue;
+        }
+        // Cheap rejection before the search: the parabola through the two
+        // ends and the middle.  A graze brings its peak to zero or above; a
+        // step that merely passes near the plane peaks well below it (the
+        // margin, half the larger end value, covers the cubic term).
+        if om <= 0.0 {
+            let curv = o0 - 2.0 * om + o1; // < 0 when the middle bulges towards the plane
+            let peak = if curv < -1e-30 {
+                let sp = (0.5 - 0.25 * (o1 - o0) / curv).clamp(0.0, 1.0);
+                o0 + (-3.0 * o0 + 4.0 * om - o1) * sp + 2.0 * curv * sp * sp
+            } else {
+                o0.max(o1)
+            };
+            if peak < -0.5 * o0.abs().max(o1.abs()) - 1e-12 {
+                continue;
+            }
+        }
+        let sm = golden_min(0.0, 1.0, 40, |s| -over(s));
+        if over(sm) <= 1e-9 {
+            continue;
+        }
+        let root = |mut inside: f64, mut outside: f64| {
+            for _ in 0..60 {
+                let mid = 0.5 * (inside + outside);
+                if over(mid) > 0.0 {
+                    outside = mid;
+                } else {
+                    inside = mid;
+                }
+            }
+            0.5 * (inside + outside)
+        };
+        return Some((hi, root(0.0, sm), root(1.0, sm)));
+    }
+    None
+}
+
 /// The point of two coplanar circles' intersection nearest `near` (`None`
 /// when they do not cross).
 fn coplanar_circles_point(c1: &Circle3, c2: &Circle3, near: Point3) -> Option<Point3> {
@@ -1510,6 +1696,109 @@ fn decimate_loop(lp: &mut TracedLoop, spacing: f64) {
         }
         piece.pts = out;
     }
+}
+
+/// How far (mm) the cubic through a piece's samples may run from the true
+/// intersection curve between two of them before a sample is added there.
+const SAMPLE_TOL: f64 = 2e-6;
+
+/// [`SAMPLE_TOL`], or `CADCORE_SAMPLE_TOL` (mm; `0` switches the refinement off).
+fn sample_tol() -> f64 {
+    static TOL: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *TOL.get_or_init(|| std::env::var("CADCORE_SAMPLE_TOL").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(SAMPLE_TOL))
+}
+
+/// Add a sample in the middle of every interval where the cubic through the
+/// neighbouring samples misses the true curve by more than [`SAMPLE_TOL`].
+///
+/// The STEP writer fits one cubic through these points, so between sparse
+/// samples on a tight elbow–elbow curve the edge ran up to 4e-5 mm off both
+/// surfaces.  Parasolid keeps an edge exact only within 1e-5 mm; beyond that
+/// it becomes a tolerant edge, and tolerant edges that pass within microns of
+/// each other (bonded honeycomb walls) read as self-intersecting faces — 3368
+/// of 13974 in SolidWorks on a 15 × 15 × 12 honeycomb, none once the edges
+/// are exact.  Where the samples already describe the curve nothing is added.
+fn refine_samples(pts: &mut Vec<Point3>, sa: &AnalyticSurface, sb: &AnalyticSurface, loosen: f64) {
+    let tol = sample_tol() * loosen;
+    if tol <= 0.0 || on_one_circle(pts) {
+        return;
+    }
+    for _ in 0..2 {
+        let n = pts.len();
+        if n < 2 {
+            return;
+        }
+        // chord-length parameters
+        let mut t = vec![0.0f64; n];
+        for k in 1..n {
+            t[k] = t[k - 1] + (pts[k] - pts[k - 1]).length();
+        }
+        let mut out: Vec<Point3> = Vec::with_capacity(n + n / 2);
+        let mut added = false;
+        for k in 0..n - 1 {
+            out.push(pts[k]);
+            let (a, b) = (pts[k], pts[k + 1]);
+            if (b - a).length() < 1e-4 {
+                continue;
+            }
+            let (c, res) = crate::geom::refine::refine_pair(a.lerp(b, 0.5), sa, sb, 1e-13, 30);
+            if res > 1e-9 || (c - a).length() < 1e-6 || (c - b).length() < 1e-6 {
+                continue;
+            }
+            // the local polynomial through up to four neighbouring samples, at
+            // the parameter where the true midpoint sits
+            let m = n.min(4);
+            let i0 = k.saturating_sub(1).min(n - m);
+            let x = t[k] + (c - a).length() / ((c - a).length() + (b - c).length()) * (t[k + 1] - t[k]);
+            let mut est = Vec3::new(0.0, 0.0, 0.0);
+            for p in 0..m {
+                let mut w = 1.0;
+                for q in 0..m {
+                    if p != q {
+                        w *= (x - t[i0 + q]) / (t[i0 + p] - t[i0 + q]);
+                    }
+                }
+                est = est + (pts[i0 + p] - Point3::new(0.0, 0.0, 0.0)) * w;
+            }
+            if (c - (Point3::new(0.0, 0.0, 0.0) + est)).length() > tol {
+                out.push(c);
+                added = true;
+            }
+        }
+        out.push(pts[n - 1]);
+        *pts = out;
+        if !added {
+            return;
+        }
+    }
+}
+
+/// Do all of `pts` lie on one circle (to 1e-8 mm)?  Such a piece — two
+/// coaxial elbows of stacked U-turns meet in a circle — is recovered by the
+/// assembler as an exact arc; extra samples there are useless, and a sample
+/// a nanometre off its neighbours' latitude makes the assembler class the
+/// steps one by one, leaving arcs and chords that no longer merge.
+fn on_one_circle(pts: &[Point3]) -> bool {
+    let n = pts.len();
+    if n < 4 {
+        return false;
+    }
+    let (a, b, c) = (pts[0], pts[n / 2], pts[n - 1]);
+    let (ab, ac) = (b - a, c - a);
+    let nrm = ab.cross(ac);
+    let n2 = nrm.dot(nrm);
+    if n2 < 1e-24 {
+        return false;
+    }
+    let to_centre = (nrm.cross(ab) * ac.dot(ac) + ac.cross(nrm) * ab.dot(ab)) * (1.0 / (2.0 * n2));
+    let centre = a + to_centre;
+    let r = to_centre.length();
+    let axis = nrm * (1.0 / n2.sqrt());
+    pts.iter().all(|&p| {
+        let w = p - centre;
+        let h = axis.dot(w);
+        h.abs() < 1e-8 && ((w - axis * h).length() - r).abs() < 1e-8
+    })
 }
 
 /// Insert the exact point where a piece crosses the parametric seam of its

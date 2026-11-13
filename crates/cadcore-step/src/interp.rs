@@ -349,33 +349,43 @@ fn lsq_fit(vals: &[Vec<f64>], nc: usize, rows: &[(usize, [f64; 4])]) -> (Vec<Vec
 }
 
 /// The fit stays on the sampled curve BETWEEN samples too: at the middle of
-/// each interval it must lie within `tol` of the chord midpoint widened by the
-/// chord's sagitta, estimated from the second difference of the neighbouring
-/// samples (`|Q₋ − 2Q + Q₊| / 8 ≈ h²κ/8`).  A smooth curve passes easily; a
-/// fit that oscillates between sparse samples on a tight bend does not.
-fn holds_between(vals: &[Vec<f64>], ctrl: &[Vec<f64>], mid_rows: &[(usize, [f64; 4])], tol: f64) -> bool {
+/// each interval it must lie within `tol` of the local cubic through the four
+/// nearest samples (Lagrange, on the fit's own parameters `t`).  That estimate
+/// is good to O(h⁴), so a fit that swings between sparse samples on a tight
+/// bend fails here even where the chord's sagitta is larger than the swing —
+/// a chord-midpoint test widened by the sagitta let a short elbow–elbow curve
+/// leave its torus by 3e-4 mm.
+fn holds_between(vals: &[Vec<f64>], t: &[f64], ctrl: &[Vec<f64>], mid_rows: &[(usize, [f64; 4])], tol: f64) -> bool {
     let m = vals.len();
     let dim = vals[0].len();
-    let sag = |k: usize| -> f64 {
-        // second difference around sample k (clamped at the ends)
-        let k = k.clamp(1, m - 2);
-        let mut s2 = 0.0;
-        for d in 0..dim {
-            s2 += (vals[k - 1][d] - 2.0 * vals[k][d] + vals[k + 1][d]).powi(2);
-        }
-        s2.sqrt() / 8.0
-    };
     for (k, &(s, nb)) in mid_rows.iter().enumerate() {
-        let allow = tol + 2.0 * sag(k).max(sag(k + 1));
+        let x = 0.5 * (t[k] + t[k + 1]);
+        let i0 = k.saturating_sub(1).min(m - 4);
+        let mut w = [1.0f64; 4];
+        for a in 0..4 {
+            for b in 0..4 {
+                if a != b {
+                    let den = t[i0 + a] - t[i0 + b];
+                    if den.abs() < 1e-300 {
+                        return false;
+                    }
+                    w[a] *= (x - t[i0 + b]) / den;
+                }
+            }
+        }
         let mut e2 = 0.0;
         for d in 0..dim {
             let mut c = 0.0;
-            for (j, &w) in nb.iter().enumerate() {
-                c += w * ctrl[s - 3 + j][d];
+            for (j, &wj) in nb.iter().enumerate() {
+                c += wj * ctrl[s - 3 + j][d];
             }
-            e2 += (c - 0.5 * (vals[k][d] + vals[k + 1][d])).powi(2);
+            let mut r = 0.0;
+            for a in 0..4 {
+                r += w[a] * vals[i0 + a][d];
+            }
+            e2 += (c - r).powi(2);
         }
-        if e2.sqrt() > allow {
+        if e2.sqrt() > tol {
             return false;
         }
     }
@@ -429,12 +439,12 @@ pub(crate) fn approx_cubic_shared(pts: &[Point3], uvs: &[Vec<(f64, f64)>], tol: 
             })
             .collect();
         let (c3, e3) = lsq_fit(&v3, nc, &rows);
-        let mut ok = e3 <= tol && holds_between(&v3, &c3, &mid_rows, tol);
+        let mut ok = e3 <= tol && holds_between(&v3, &t, &c3, &mid_rows, tol);
         let mut c2s: Vec<Vec<(f64, f64)>> = Vec::with_capacity(uvs.len());
         if ok {
             for vals in &v2 {
                 let (c2, e2) = lsq_fit(vals, nc, &rows);
-                if e2 > tol || !holds_between(vals, &c2, &mid_rows, tol) {
+                if e2 > tol || !holds_between(vals, &t, &c2, &mid_rows, tol) {
                     ok = false;
                     break;
                 }

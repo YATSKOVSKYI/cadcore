@@ -13,10 +13,10 @@ keywords     = ["cad", "brep", "mesh", "step", "tessellation"]
 categories   = ["science", "graphics"]
 
 [dependencies]
-cadcore-math = { path = "../cadcore-math", version = "0.2.4" }
-cadcore-geom = { path = "../cadcore-geom", version = "0.2.4" }
-cadcore-topo = { path = "../cadcore-topo", version = "0.2.4" }
-cadcore-step = { path = "../cadcore-step", version = "0.2.4" }
+cadcore-math = { path = "../cadcore-math", version = "0.2.5" }
+cadcore-geom = { path = "../cadcore-geom", version = "0.2.5" }
+cadcore-topo = { path = "../cadcore-topo", version = "0.2.5" }
+cadcore-step = { path = "../cadcore-step", version = "0.2.5" }
 serde        = { version = "1", features = ["derive"] }
 slotmap      = "1"
 

@@ -262,7 +262,44 @@ with ~47 000 open edges.  What it needed, and what must stay:
 
 Validation that caught each step: SpaceClaim gate in `validate_shell`, FreeCAD
 `docs/benchmarks/union_trim_2026-11-12/freecad_edge_dev.py` (edge-to-face deviation), Monte-Carlo
-volume from `LatticeModel` (`bench_union_trim` with `BENCH_MC`), SolidWorks `Check3`.  Open: SolidWorks
-reports 3 faults of code -1 on honeycomb top-half elbows where a crossing tube grazes the elbow's end
-junction circle within ~1e-5 mm (volume and body are right; the "touch" vertex experiments broke
-manifoldness and were removed).
+volume from `LatticeModel` (`bench_union_trim` with `BENCH_MC`), SolidWorks `Check3`.
+
+## 0.2.5 — the honeycomb SolidWorks reads without a fault
+
+`IBody2::Check3` lists **only the first three** faults.  Ask every face (`IFace2::Check`): the 0.2.4
+honeycomb (15 × 15 mm, 12 layers) had 3368 faulted faces of 13 974, nearly all code 21 (face
+self-intersecting), not "3".  Now 0 of 16 422; grid and diamond 0 as before.  All of the following
+are needed (without the 1st: 210 faulted faces; without the 4th: 721; with `SAMPLE_TOL` at 5e-6 … 2e-5:
+18–36; without the 1st and 2nd: 1305):
+
+* **Stacked walls end at the same points** (DIW Forge, `build_scaffold_filaments` +
+  `Filament::serpentine_with_fillets`).  A fillet's tangent length is R·tan(turn/2); the turns of two
+  layers at one snapped corner differ by ~0.02° (corner noise of their other legs), so the two junction
+  planes sat 80 nm apart and every crossing of the two junction circles left an 8e-5 mm edge.  The first
+  layer through a corner fixes the tangent length on each leg; later layers take it (bend radius moves
+  ~0.05 %).  With the planes exactly coincident the 0.2.4 double switch handles them and no edge is
+  shorter than a micron.
+* **A graze past a junction inside one marching step** (`excursion`).  The exit test looks at the two
+  ends of a step; a curve that pokes 3–7e-5 mm past an elbow's end along 7–11 µm does it between them,
+  and the edge then left its face.  Every plain step within a step of a junction circle is checked
+  (parabola through start / middle / end first, golden search only when that comes near zero) and the
+  stretch is routed over the neighbour: events of BOTH bodies in order along the step, each one a joint
+  and a member switch.  Clamping the edge inside instead does not work — a point off either surface
+  lifts to two different vertices.
+* **The joint of a crossing is checked against the crossing the step itself makes.**  Where the curve
+  grazes, the junction circle meets the other surface twice within microns and `joint_on_circle`
+  (bracket ≥ 14 µm) may return the far one; the march then turns round and walks its own curve back,
+  never closing.  The bisected crossing along the step wins when the two differ by more than 1e-6.
+* **Samples are refined where the cubic through them misses the true curve** (`refine_samples`,
+  `SAMPLE_TOL` 2e-6 mm where an elbow is involved, 5× that elsewhere; `CADCORE_SAMPLE_TOL`, 0 = off).
+  Parasolid keeps an edge exact within 1e-5 mm; our sparse samples on tight elbow–elbow curves put the
+  fitted edge up to 4e-5 off.  Never refine a piece that lies on one circle (coaxial stacked U-turns):
+  a sample a nanometre off its latitude makes `build_loop` class the steps one by one and the arcs no
+  longer merge.  Do NOT get accuracy by shrinking `FuseOptions::step`: 0.01 breaks small honeycombs.
+* The shared cubic fit's between-sample test compares with the local cubic through four samples
+  (Lagrange), not with the chord midpoint widened by the sagitta — that let a short elbow curve swing
+  3e-4 mm off its torus.
+
+Cost on 15 × 15 × 12: honeycomb 6.5 → 7.9 s (72.7 MB, unchanged), grid 2.2 → 2.4 s, diamond unchanged.
+Check script: `C:\scwork\bench\sw_check2.ps1` (fresh SolidWorks per file — a second import in one
+session crashes it; `sw_faces.py` asks every face).
