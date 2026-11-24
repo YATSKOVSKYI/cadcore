@@ -241,7 +241,25 @@ pub fn half_space_cut(
         .iter()
         .copied()
         .zip(crate::fasthash::par_map(&straddlers, |&fid| {
-            intersect_faces_with(src, fid, &cut_brep, cut_face, SsiOptions::all())
+            let t0 = std::time::Instant::now();
+            let curves = intersect_faces_with(src, fid, &cut_brep, cut_face, SsiOptions::all());
+            if timing && t0.elapsed().as_millis() > 200 {
+                let kind = match &src.faces[fid].geom {
+                    FaceGeom::Plane(_) => "plane",
+                    FaceGeom::Cylinder(_) => "cyl",
+                    FaceGeom::Torus(_) => "torus",
+                    FaceGeom::Sphere(_) => "sphere",
+                };
+                let bb = face_aabb(src, fid);
+                eprintln!(
+                    "[cut][time] slow section: {fid:?} {kind} bb ({:.3},{:.3},{:.3})..({:.3},{:.3},{:.3}) → {} curves, {} pts, {} ms",
+                    bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z,
+                    curves.len(),
+                    curves.iter().map(|c| c.points.len()).sum::<usize>(),
+                    t0.elapsed().as_millis()
+                );
+            }
+            curves
         }))
         .collect();
     let mut ssi: Vec<HashMap<FaceId, Vec<SsiCurve>>> = vec![HashMap::new()];
@@ -1432,14 +1450,47 @@ fn section_joints(ssi: &HashMap<FaceId, Vec<SsiCurve>>) -> Vec<Point3> {
     out
 }
 
-/// Insert every joint that lies ON `poly` at its exact position.
-///
-/// A joint is accepted only when it is close to a segment relative to that
-/// segment's own length (and within an absolute cap), so a joint belonging to
-/// some other curve running nearby is never grafted on.  Inserting the joint
-/// itself — not its projection — is the point: both consumers of this curve
-/// then carry the identical vertex and their segments weld.
+/// What a polyline handed to [`insert_joints_on`] is a sampling OF — which is
+/// what decides whether a joint near it lies on it.
+#[derive(Clone, Copy)]
+pub(crate) enum JointCurve<'a> {
+    /// Chords of this circle: a joint belongs to the edge when it lies on the
+    /// circle itself.
+    Circle(&'a Circle3),
+    /// A straight edge: the chord IS the curve.
+    Line,
+    /// A free-form curve known only by its samples.  The curve leaves a chord
+    /// by its sagitta, estimated from how much the polyline turns at the
+    /// chord's ends; `before` / `after` are the samples next to the polyline's
+    /// two ends along the loop it is part of (an edge of two points has no
+    /// turn of its own to measure).
+    Sampled {
+        /// Sample preceding `poly[0]`.
+        before: Option<Point3>,
+        /// Sample following the last point.
+        after: Option<Point3>,
+    },
+}
+
+/// [`insert_joints_on`] for a free-standing sampled curve.
 pub(crate) fn insert_joints(poly: &mut Vec<Point3>, joints: &[Point3]) {
+    insert_joints_on(poly, joints, JointCurve::Sampled { before: None, after: None });
+}
+
+/// Insert every joint that lies ON the curve `poly` samples, at its exact
+/// position.
+///
+/// "On the curve" is meant literally.  A joint is the end of a section arc on
+/// some boundary curve, and near a triple point several boundary curves run
+/// within microns of it; grafting it onto a neighbour it merely passes puts a
+/// vertex 8 µm off that neighbour's circle — an edge no reader accepts (a ±30°
+/// diamond cut 8 µm past a leg's junction rim came out with 113 invalid
+/// faces).  So the distance is measured to the curve the polyline stands for:
+/// exactly for a circle or a line, to within the chord's own sagitta for a
+/// sampled curve.  Inserting the joint itself — not its projection — is the
+/// point: both consumers of the curve then carry the identical vertex and
+/// their segments weld.
+pub(crate) fn insert_joints_on(poly: &mut Vec<Point3>, joints: &[Point3], curve: JointCurve<'_>) {
     if joints.is_empty() || poly.len() < 2 {
         return;
     }
@@ -1484,6 +1535,22 @@ pub(crate) fn insert_joints(poly: &mut Vec<Point3>, joints: &[Point3]) {
             *q = *j;
         }
     }
+    // Turn of the polyline at each of its points (radians), with the loop
+    // neighbours standing in at the two ends.
+    let turn_at = |k: usize| -> Option<f64> {
+        let (before, after) = match curve {
+            JointCurve::Sampled { before, after } => (before, after),
+            _ => (None, None),
+        };
+        let prev = if k == 0 { before? } else { poly[k - 1] };
+        let next = if k + 1 == poly.len() { after? } else { poly[k + 1] };
+        let (u, v) = (poly[k] - prev, next - poly[k]);
+        let (lu, lv) = (u.length(), v.length());
+        if lu < 1e-12 || lv < 1e-12 {
+            return None;
+        }
+        Some((u.dot(v) / (lu * lv)).clamp(-1.0, 1.0).acos())
+    };
     let mut out: Vec<Point3> = Vec::with_capacity(poly.len() + joints.len());
     for w in 0..poly.len() - 1 {
         let (a, b) = (poly[w], poly[w + 1]);
@@ -1497,18 +1564,51 @@ pub(crate) fn insert_joints(poly: &mut Vec<Point3>, joints: &[Point3]) {
         if len2 < 1e-24 {
             continue;
         }
-        // The polyline is only a CHORD approximation of its curve, so a joint
-        // that genuinely belongs to it can sit up to a sagitta off — the window
-        // is the sagitta scale, not the knit tolerance.
-        let tol = (0.3 * len2.sqrt()).min(0.01);
+        // How far off this CHORD a joint of the curve can sit.
+        let tol = match curve {
+            // measured to the circle itself, below
+            JointCurve::Circle(_) => 0.0,
+            JointCurve::Line => JOINT_SNAP,
+            JointCurve::Sampled { .. } => {
+                // A chord of length c on a curve turning by θ over it stands
+                // c·θ/8 off the curve; the turn at either end bounds θ.  With
+                // no neighbour to measure against, fall back to a window on
+                // the scale of the chord.
+                let chord = len2.sqrt();
+                match (turn_at(w), turn_at(w + 1)) {
+                    (None, None) => (0.3 * chord).min(0.01),
+                    (ta, tb) => {
+                        let theta = ta.unwrap_or(0.0).max(tb.unwrap_or(0.0));
+                        (JOINT_SNAP + 0.25 * chord * theta).min(0.3 * chord).min(0.01)
+                    }
+                }
+            }
+        };
         let mut hits: Vec<(f64, Point3)> = Vec::new();
         for &j in joints {
             let t = seg.dot(j - a) / len2;
             if !(1e-6..=1.0 - 1e-6).contains(&t) {
                 continue; // at (or past) an endpoint — already a vertex
             }
-            let foot = a + seg * t;
-            if (j - foot).length() <= tol {
+            let on_curve = match curve {
+                JointCurve::Circle(c) => {
+                    // On the circle — or as far inside it as a chord of this
+                    // step stands: the face on the other side of a rim may
+                    // know it only as a chord polygon (an end cap's outline),
+                    // and its section ends ON the chord, a sagitta short of
+                    // the arc (0.6 µm for a 7.5° step).
+                    let half = 0.5 * len2.sqrt();
+                    let sagitta = c.radius - (c.radius * c.radius - half * half).max(0.0).sqrt();
+                    let w3 = j - c.frame.origin;
+                    let planar = c.frame.z.dot_vec(w3);
+                    let radial = (w3 - c.frame.z.as_vec() * planar).length() - c.radius;
+                    // ... and on THIS step of it, not on the far side of the rim
+                    planar.hypot(radial) <= JOINT_SNAP + sagitta
+                        && (j - (a + seg * t)).length() <= JOINT_SNAP + 2.0 * sagitta
+                }
+                _ => (j - (a + seg * t)).length() <= tol,
+            };
+            if on_curve {
                 hits.push((t, j));
             }
         }
@@ -1524,6 +1624,36 @@ pub(crate) fn insert_joints(poly: &mut Vec<Point3>, joints: &[Point3]) {
         out.push(last);
     }
     *poly = out;
+}
+
+/// The curve the `i`-th co-edge of a loop stands for, as [`insert_joints_on`]
+/// needs it: its analytic geometry where it has one, otherwise the samples
+/// next to its ends on the neighbouring co-edges.
+pub(crate) fn loop_joint_curve<'a>(brep: &'a BRep, ces: &[cadcore_topo::CoEdgeId], i: usize) -> JointCurve<'a> {
+    use cadcore_topo::{CoEdgeSense, EdgeGeom};
+    let n = ces.len();
+    match &brep.edges[brep.coedges[ces[i]].edge].geom {
+        EdgeGeom::Circle(c) => JointCurve::Circle(c),
+        EdgeGeom::Line(_) => JointCurve::Line,
+        _ => {
+            // the neighbour's sample next to the shared vertex, in loop order
+            let neighbour = |k: usize, last: bool| -> Option<Point3> {
+                let ce = &brep.coedges[ces[k]];
+                let mut sp = super::aabb::sample_edge(brep, ce.edge);
+                if ce.sense == CoEdgeSense::Opposite {
+                    sp.reverse();
+                }
+                if sp.len() < 2 {
+                    return None;
+                }
+                Some(if last { sp[sp.len() - 2] } else { sp[1] })
+            };
+            if n < 2 {
+                return JointCurve::Sampled { before: None, after: None };
+            }
+            JointCurve::Sampled { before: neighbour((i + n - 1) % n, true), after: neighbour((i + 1) % n, false) }
+        }
+    }
 }
 
 /// Distance below which a chain vertex is taken to BE a joint (mm).
@@ -1616,7 +1746,7 @@ fn boundary_chains_with_joints(
             if ce.sense == cadcore_topo::CoEdgeSense::Opposite {
                 sp.reverse();
             }
-            insert_joints(&mut sp, joints);
+            insert_joints_on(&mut sp, joints, loop_joint_curve(brep, &ces, (first + k) % n));
             for p in sp {
                 if pts3.last().map_or(true, |&q| (q - p).length() > 1e-12) {
                     pts3.push(p);

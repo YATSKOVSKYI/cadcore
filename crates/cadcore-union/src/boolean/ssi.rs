@@ -758,6 +758,28 @@ fn plane_cylinder(
     let (Some(poly), Some(length)) = (poly, length) else {
         return Vec::new();
     };
+    // Parallel is a statement about the BAND, not about the infinite
+    // cylinder.  An axis tilted against the plane by 1e-6 rad — the last bit
+    // of a single-precision corner coordinate — leaves the plane by a
+    // nanometre over a millimetre of leg, yet as a conic it is an ellipse
+    // 250 km long, and sampling that at the section spacing took 13 s per
+    // face.  When the axis stays within `PARALLEL_BAND_TOL` of a line parallel
+    // to the plane over the whole band, the section IS the two rulings of that
+    // line's cylinder: turn the axis about the band's mid-point into the plane.
+    const PARALLEL_BAND_TOL: f64 = 1.0e-5;
+    let rectified;
+    let cyl = {
+        let (n, d) = (plane.normal(), cyl.axis());
+        let s = n.dot_vec(d.as_vec());
+        match cadcore_math::UnitVec3::try_from_vec(d.as_vec() - n.as_vec() * s) {
+            Some(d_par) if s != 0.0 && s.abs() * length * 0.5 < PARALLEL_BAND_TOL => {
+                let mid = cyl.frame.origin + d.as_vec() * (length * 0.5);
+                rectified = CylSurf::new(mid - d_par.as_vec() * (length * 0.5), d_par, cyl.radius);
+                &rectified
+            }
+            _ => cyl,
+        }
+    };
     let conic = cadcore_geom::cyl_plane_intersection(cyl, plane);
     let to_uv = |q: Point3| {
         let w = q - plane.frame.origin;
@@ -781,6 +803,11 @@ fn plane_cylinder(
         CylPlaneCurve::Circle(c) => {
             let n = ((std::f64::consts::TAU * c.radius / SSI_SPACING).ceil() as usize).max(96);
             (0..n).map(|i| i as f64 / n as f64 * std::f64::consts::TAU).collect()
+        }
+        // A grazing plane gives an ellipse far longer than the band it is cut
+        // out of; only the two short arcs inside the band are ever used.
+        CylPlaneCurve::Ellipse(e) if e.semi_major > 16.0 * (length + cyl.radius) => {
+            ellipse_thetas_in_band(e, SSI_SPACING, cyl, length)
         }
         CylPlaneCurve::Ellipse(e) => ellipse_thetas_by_spacing(e, SSI_SPACING),
         // Plane PARALLEL to the axis: the section is one or two straight ruling
@@ -915,6 +942,61 @@ fn ellipse_thetas_by_spacing(e: &cadcore_geom::Ellipse3, spacing: f64) -> Vec<f6
     if out.len() > 1 && acc < 0.3 * spacing {
         out.pop();
     }
+    out
+}
+
+/// Parameters of the samples of a LONG ellipse that matter for a cylinder
+/// band of the given `length`: the arcs whose axial coordinate lies in
+/// `[0, length]`, spaced by `spacing` of chord, each with one sample just
+/// outside the band at either end so that the caller can close the arc off
+/// exactly on the rim.  Ascending in θ ∈ [0, 2π).
+///
+/// On the ellipse the axial coordinate is a pure sinusoid,
+/// `v(θ) = v_c + M·cos(θ − φ)`, so the arcs follow in closed form instead of
+/// by walking a perimeter that can be kilometres long.
+fn ellipse_thetas_in_band(e: &cadcore_geom::Ellipse3, spacing: f64, cyl: &CylSurf, length: f64) -> Vec<f64> {
+    use std::f64::consts::{PI, TAU};
+    let axis = cyl.axis();
+    let centre = e.point_at(0.0) + (e.point_at(PI) - e.point_at(0.0)) * 0.5;
+    let v_c = axis.dot_vec(centre - cyl.frame.origin);
+    let ca = axis.dot_vec(e.point_at(0.0) - centre);
+    let cb = axis.dot_vec(e.point_at(0.5 * PI) - centre);
+    let m = ca.hypot(cb);
+    if m < 1.0e-12 {
+        return ellipse_thetas_by_spacing(e, spacing);
+    }
+    let phi = cb.atan2(ca);
+    // v ∈ [−pad, length + pad]  ⇔  c_lo ≤ cos(θ − φ) ≤ c_hi
+    let pad = 2.0 * spacing;
+    let (c_lo, c_hi) = ((-pad - v_c) / m, (length + pad - v_c) / m);
+    if c_lo > 1.0 || c_hi < -1.0 {
+        return Vec::new(); // the band is clear of the ellipse
+    }
+    let (t_in, t_out) = (c_hi.clamp(-1.0, 1.0).acos(), c_lo.clamp(-1.0, 1.0).acos());
+    // ψ = θ − φ runs over [t_in, t_out] on one flank and [−t_out, −t_in] on the other
+    let speed = |th: f64| -> f64 {
+        let (s, c) = th.sin_cos();
+        (e.semi_major * s).hypot(e.semi_minor * c)
+    };
+    let mut out: Vec<f64> = Vec::new();
+    for (lo, hi) in [(phi + t_in, phi + t_out), (phi - t_out, phi - t_in)] {
+        if hi - lo < 1.0e-300 {
+            continue;
+        }
+        let mut th = lo;
+        let mut guard = 0usize;
+        loop {
+            out.push(th.rem_euclid(TAU));
+            if th >= hi || guard > 4_000_000 {
+                break;
+            }
+            let step = spacing / speed(th).max(1.0e-12);
+            th = (th + step).min(hi);
+            guard += 1;
+        }
+    }
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    out.dedup_by(|a, b| (*a - *b).abs() < 1.0e-15);
     out
 }
 
@@ -1290,6 +1372,76 @@ mod tests {
             for &pb in &fb {
                 assert!(intersect_faces(&a, pa, &b, pb).is_empty());
             }
+        }
+    }
+
+    /// Sections of a band by a plane that is parallel to its axis only up to
+    /// rounding: the tilt of a single-precision corner coordinate (1e-6 rad)
+    /// used to produce a 250 km ellipse and 13 s of sampling per face.
+    #[test]
+    fn plane_almost_parallel_to_the_axis_is_two_rulings() {
+        let (r, len) = (0.275_f64, 0.889);
+        let pl = Plane3::from_origin_normal(Point3::new(13.785, 0.0, 0.0), -UnitVec3::X);
+        let rect = vec![
+            Point3::new(13.785, -5.0, -5.0),
+            Point3::new(13.785, 20.0, -5.0),
+            Point3::new(13.785, 20.0, 5.0),
+            Point3::new(13.785, -5.0, 5.0),
+        ];
+        for tilt in [1.073e-6_f64, -3.0e-7, 9.0e-6] {
+            let axis = UnitVec3::try_from_vec(cadcore_math::Vec3::new(tilt, 1.0, 0.0)).unwrap();
+            let cyl = CylSurf::new(Point3::new(13.784_999_847, 0.812, 0.37), axis, r);
+            let t0 = std::time::Instant::now();
+            let curves = plane_cylinder(&pl, Some(rect.clone()), &cyl, Some(len));
+            assert!(t0.elapsed().as_millis() < 500, "tilt {tilt:e}: {} ms", t0.elapsed().as_millis());
+            assert_eq!(curves.len(), 2, "tilt {tilt:e}");
+            for c in &curves {
+                assert!(!c.closed);
+                let (a, b) = (c.points[0], *c.points.last().unwrap());
+                // a ruling: full band length, on the plane and on the tube
+                assert!(((b - a).length() - len).abs() < 1e-6, "tilt {tilt:e}: length {}", (b - a).length());
+                for &q in &c.points {
+                    assert!(pl.signed_distance(q).abs() < 2e-5);
+                    let w = q - cyl.frame.origin;
+                    let radial = (w - axis.as_vec() * axis.dot_vec(w)).length();
+                    assert!((radial - r).abs() < 2e-5, "tilt {tilt:e}: radial {radial}");
+                }
+            }
+        }
+    }
+
+    /// A grazing plane (0.02° off the axis: the ellipse is 1.6 m long) is
+    /// sampled only where the band is — two short arcs, exactly on both
+    /// surfaces, ending on the band's rims.
+    #[test]
+    fn grazing_plane_is_sampled_only_inside_the_band() {
+        let (r, len) = (0.275_f64, 1.0);
+        let tilt = 3.5e-4_f64;
+        let axis = UnitVec3::try_from_vec(cadcore_math::Vec3::new(tilt, 1.0, 0.0)).unwrap();
+        // the axis crosses the plane x = 0 in the middle of the band
+        let cyl = CylSurf::new(Point3::new(-0.5 * tilt, 0.0, 0.0), axis, r);
+        let pl = Plane3::from_origin_normal(Point3::new(0.0, 0.0, 0.0), UnitVec3::X);
+        let rect = vec![
+            Point3::new(0.0, -5.0, -5.0),
+            Point3::new(0.0, 5.0, -5.0),
+            Point3::new(0.0, 5.0, 5.0),
+            Point3::new(0.0, -5.0, 5.0),
+        ];
+        let curves = plane_cylinder(&pl, Some(rect), &cyl, Some(len));
+        assert_eq!(curves.len(), 2);
+        let total: usize = curves.iter().map(|c| c.points.len()).sum();
+        assert!(total < 400, "{total} samples for 2 mm of section");
+        for c in &curves {
+            for &q in &c.points {
+                assert!(pl.signed_distance(q).abs() < 1e-9);
+                let w = q - cyl.frame.origin;
+                let radial = (w - axis.as_vec() * axis.dot_vec(w)).length();
+                assert!((radial - r).abs() < 1e-7, "radial {radial}");
+            }
+            // from rim to rim
+            let v = |q: Point3| axis.dot_vec(q - cyl.frame.origin);
+            let (v0, v1) = (v(c.points[0]), v(*c.points.last().unwrap()));
+            assert!(v0.min(v1).abs() < 1e-6 && (v0.max(v1) - len).abs() < 1e-6, "ends at v = {v0}, {v1}");
         }
     }
 }

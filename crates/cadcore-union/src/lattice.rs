@@ -357,4 +357,39 @@ mod tests {
         let rep = crate::validate::manifold::check(&part.brep, part.shell);
         assert!(rep.violations.is_empty());
     }
+
+    /// A cut must hand its result on with the same exact edges it received.
+    /// A leg's face that the plane crosses is rebuilt from the arrangement;
+    /// its junction rim at the FAR end used to come back as a chain of chords,
+    /// 0.6 µm off the circle the elbow next to it still carried.  The second
+    /// cut of a part then found two different points where its plane crosses
+    /// that rim and left the section open.
+    #[test]
+    fn a_cut_keeps_the_rim_circles_of_the_faces_it_rebuilds() {
+        use cadcore_topo::EdgeGeom;
+        let r = 0.275;
+        // one L: a 6 mm leg along +x, an elbow, a 3 mm leg along +y
+        let f = crate::Filament::serpentine(&[Point3::new(0.0, 0.0, 0.0), Point3::new(6.0, 0.0, 0.0), Point3::new(6.0, 3.0, 0.0)], r, 0.5);
+        let rim_centre = Point3::new(5.5, 0.0, 0.0); // leg ↔ elbow junction
+        let mut b = cadcore_topo::BRep::new();
+        let (sh, _) = fuse_filaments_with(&mut b, &[f], &FuseOptions::default());
+        let faces = b.shells[sh].faces.clone();
+        // cut the long leg near its free end; the junction rim is 4.5 mm away
+        let plane = Plane3::from_origin_normal(Point3::new(1.0, 0.0, 0.0), UnitVec3::X);
+        let cut = crate::half_space_cut(&b, &faces, &plane, 1.0e-6).unwrap();
+        assert!(crate::validate::manifold::check(&cut.brep, cut.shell).violations.is_empty());
+        let (mut arcs, mut chords) = (0, 0);
+        for (_, e) in cut.brep.edges.iter() {
+            let (p0, p1) = (cut.brep.vertices[e.v_start].point, cut.brep.vertices[e.v_end].point);
+            let on_rim = |q: Point3| (q.x - rim_centre.x).abs() < 1e-9 && ((q - rim_centre).length() - r).abs() < 1e-9;
+            if on_rim(p0) && on_rim(p1) {
+                match e.geom {
+                    EdgeGeom::Circle(_) => arcs += 1,
+                    _ => chords += 1,
+                }
+            }
+        }
+        assert!(arcs > 0, "the junction rim is there");
+        assert_eq!(chords, 0, "{chords} of its {} edges lost their circle", arcs + chords);
+    }
 }

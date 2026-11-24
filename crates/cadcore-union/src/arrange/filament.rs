@@ -126,6 +126,335 @@ impl Filament {
 
 
 
+/// Smallest admissible elbow bend radius, as a multiple of the tube radius.
+///
+/// A centre line bent tighter than the tube's own radius sweeps a *spindle*
+/// torus — the inner surface folds through itself and the shell is no longer
+/// a solid.  At exactly the tube radius the torus is a *horn* (its hole closes
+/// to a point), which is just as unusable.  5 % of margin keeps a real hole.
+pub const MIN_BEND_FACTOR: f64 = 1.05;
+
+/// Fraction of a leg that its fillets may consume; the rest stays a cylinder.
+const LEG_SHARE: f64 = 0.9;
+
+/// Why a polyline cannot be swept as a filament of straight legs and torus
+/// elbows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathError {
+    /// Fewer than two distinct vertices.
+    Degenerate,
+    /// A corner that no elbow of an admissible radius fits, and that cannot be
+    /// merged with a neighbour (a reversal, or two tight turns of opposite
+    /// sense).  `vertex` indexes the resolved vertex list at the time of failure.
+    TightCorner {
+        /// Where the corner is.
+        at: Point3,
+        /// Largest bend radius the corner can host.
+        capacity: f64,
+        /// Smallest admissible bend radius.
+        required: f64,
+    },
+    /// An elbow of a hand-built filament is bent tighter than the tube allows.
+    SpindleElbow {
+        /// Index of the elbow.
+        elbow: usize,
+        /// Its bend radius.
+        bend: f64,
+        /// The tube radius.
+        tube: f64,
+    },
+    /// A leg of a hand-built filament has no length left between its fillets.
+    EmptyLeg {
+        /// Index of the leg.
+        leg: usize,
+    },
+}
+
+impl std::fmt::Display for PathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PathError::Degenerate => write!(f, "path has fewer than two distinct vertices"),
+            PathError::TightCorner { at, capacity, required } => write!(
+                f,
+                "corner at ({:.4}, {:.4}, {:.4}) can host a bend radius of {capacity:.4} at most; the tube needs {required:.4}",
+                at.x, at.y, at.z
+            ),
+            PathError::SpindleElbow { elbow, bend, tube } => {
+                write!(f, "elbow {elbow}: bend radius {bend:.4} is not larger than the tube radius {tube:.4} (spindle torus)")
+            }
+            PathError::EmptyLeg { leg } => write!(f, "leg {leg} has no length left between its elbows"),
+        }
+    }
+}
+
+impl std::error::Error for PathError {}
+
+/// A polyline made sweepable: its vertices and one bend radius per interior
+/// vertex, every one of them at least [`MIN_BEND_FACTOR`] × the tube radius.
+#[derive(Debug, Clone)]
+pub struct ResolvedPath {
+    /// Path vertices (sharp corners of the centre line).
+    pub verts: Vec<Point3>,
+    /// Bend radius at `verts[k + 1]`.
+    pub fillets: Vec<f64>,
+    /// Pairs of corners replaced by one corner because the leg between them
+    /// was too short to host both elbows.
+    pub merged: usize,
+    /// End stubs removed because they were too short for the elbow next to them.
+    pub dropped_ends: usize,
+}
+
+/// Turn of the path at an interior vertex: `tan(turn / 2)`, or `None` when the
+/// vertex is straight.
+fn tan_half_turn(a: Point3, b: Point3, c: Point3) -> Option<f64> {
+    let (din, dout) = (b - a, c - b);
+    let (li, lo) = (din.length(), dout.length());
+    if li < 1.0e-12 || lo < 1.0e-12 {
+        return None;
+    }
+    let turn = (din.dot(dout) / (li * lo)).clamp(-1.0, 1.0).acos();
+    (turn > 1.0e-7).then(|| (turn * 0.5).tan())
+}
+
+/// Make a polyline sweepable as a filament of radius `r`.
+///
+/// Every interior vertex gets a torus elbow, all of one bend radius: `fillet`,
+/// or the largest radius every corner of the path can host.  What a corner can
+/// host follows from its legs, whose tangent offsets `R·tan(turn/2)` may take
+/// 90 % of each leg.  A leg between two corners is split evenly
+/// between them; only when the tube cannot follow the path on those terms is
+/// it shared in proportion to what the two corners need (a hairpin next to a
+/// gentle turn takes most of the leg, as it must).
+///
+/// A corner whose legs cannot host even the smallest admissible radius
+/// ([`MIN_BEND_FACTOR`]·`r`) is not a corner the tube can follow, and it must
+/// not be allowed to set the radius of the path.  It arises
+/// where two turns sit closer together than a bead is wide — a boundary stub
+/// of a zig-zag next to a box corner, say.  The two turns are then one bend:
+/// the stub's end points are replaced by the intersection of the legs on
+/// either side of it, and a single elbow rolls through the compound corner.
+/// That elbow is never tighter than the circle inscribed between the stub and
+/// its neighbours, so the path stays on the inner side of the original
+/// polyline.  A stub at a free end is dropped instead: it lies inside the bead
+/// of the leg it leads into.
+///
+/// Fails with [`PathError::TightCorner`] when a tight corner cannot be merged:
+/// a reversal, or two tight turns of opposite sense (an S-jog narrower than
+/// the bead).  Such a path is not a single clean sweep.
+pub fn resolve_path(verts: &[Point3], r: f64, fillet: f64) -> Result<ResolvedPath, PathError> {
+    let r_min = r * MIN_BEND_FACTOR;
+    let fillet = fillet.max(r_min);
+
+    // distinct, non-collinear vertices
+    let mut v: Vec<Point3> = Vec::with_capacity(verts.len());
+    for &p in verts {
+        if v.last().map_or(true, |&q: &Point3| (p - q).length() > 1.0e-9) {
+            v.push(p);
+        }
+    }
+    let straighten = |v: &mut Vec<Point3>, floor: &mut Vec<f64>| {
+        let mut k = 1;
+        while k + 1 < v.len() {
+            if tan_half_turn(v[k - 1], v[k], v[k + 1]).is_none() && (v[k + 1] - v[k - 1]).length() > (v[k] - v[k - 1]).length() {
+                v.remove(k);
+                floor.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+    };
+    // lower bound of the bend radius at a merged corner (the inscribed circle)
+    let mut floor = vec![0.0f64; v.len()];
+    straighten(&mut v, &mut floor);
+    if v.len() < 2 {
+        return Err(PathError::Degenerate);
+    }
+
+    let (mut merged, mut dropped_ends) = (0usize, 0usize);
+    // Largest radius leg `j` (v[j] → v[j+1]) lets its corners reach.
+    let leg_capacity = |v: &[Point3], j: usize| -> f64 {
+        let n = v.len();
+        let t0 = if j == 0 { 0.0 } else { tan_half_turn(v[j - 1], v[j], v[j + 1]).unwrap_or(0.0) };
+        let t1 = if j + 2 >= n { 0.0 } else { tan_half_turn(v[j], v[j + 1], v[j + 2]).unwrap_or(0.0) };
+        if t0 + t1 < 1.0e-12 {
+            f64::INFINITY
+        } else {
+            (v[j + 1] - v[j]).length() * LEG_SHARE / (t0 + t1)
+        }
+    };
+
+    // ── A. End stubs ────────────────────────────────────────────────────────
+    // A lead-in too short for the elbow next to it lies inside the bead of the
+    // leg it leads into; it goes first, whatever happens to the rest.
+    loop {
+        let n = v.len();
+        if n >= 3 && leg_capacity(&v, 0) < r_min {
+            v.remove(0);
+            floor.remove(0);
+        } else if n >= 3 && leg_capacity(&v, n - 2) < r_min {
+            v.pop();
+            floor.pop();
+        } else {
+            break;
+        }
+        dropped_ends += 1;
+        straighten(&mut v, &mut floor);
+    }
+
+    // ── B. The even split ───────────────────────────────────────────────────
+    // Ordinarily every corner may use 45 % of each of its legs (90 % of an end
+    // leg).  The split is even on purpose: mirrored corners of a pattern then
+    // get mirrored elbows, and the walls that different layers stack on one
+    // another end at the same points.  If the tube can follow the path on
+    // these terms, this is the answer.
+    {
+        let n = v.len();
+        let mut even = f64::INFINITY;
+        for k in 1..n.saturating_sub(1) {
+            let (din, dout) = (v[k] - v[k - 1], v[k + 1] - v[k]);
+            let (li, lo) = (din.length(), dout.length());
+            if li < 1.0e-12 || lo < 1.0e-12 {
+                continue;
+            }
+            let dot = (din.dot(dout) / (li * lo)).clamp(-1.0, 1.0);
+            if dot > 0.999_999 {
+                continue;
+            }
+            let tan_half = (dot.acos() * 0.5).tan();
+            if tan_half <= 1.0e-9 {
+                continue;
+            }
+            let fi = if k == 1 { 0.9 } else { 0.45 };
+            let fo = if k + 2 == n { 0.9 } else { 0.45 };
+            even = even.min((li * fi).min(lo * fo) / tan_half);
+        }
+        let bend = fillet.min(even);
+        if bend >= r_min {
+            let fillets = vec![bend; n.saturating_sub(2)];
+            return Ok(ResolvedPath { verts: v, fillets, merged, dropped_ends });
+        }
+    }
+
+    // ── C. Escalation ───────────────────────────────────────────────────────
+    // Some corner cannot host the tube on an even split.  Let each leg be
+    // shared in proportion to what its two corners need (a hairpin next to a
+    // gentle turn takes most of the leg), and merge the corners of any leg
+    // that is too short even so.
+    for _ in 0..verts.len().max(4) * 2 {
+        let n = v.len();
+        if n < 3 {
+            break;
+        }
+        // the leg that starves its corners the most
+        let mut worst: Option<(f64, usize)> = None;
+        for j in 0..n - 1 {
+            let cap = leg_capacity(&v, j);
+            if cap < r_min && worst.map_or(true, |(w, _)| cap < w) {
+                worst = Some((cap, j));
+            }
+        }
+        let Some((cap, j)) = worst else { break };
+        if j == 0 {
+            v.remove(0);
+            floor.remove(0);
+            dropped_ends += 1;
+        } else if j + 2 == n {
+            v.pop();
+            floor.pop();
+            dropped_ends += 1;
+        } else {
+            // interior stub v[j] → v[j+1]: merge its two corners into one
+            let fail = PathError::TightCorner { at: v[j], capacity: cap, required: r_min };
+            let (a, b, c, d) = (v[j - 1], v[j], v[j + 1], v[j + 2]);
+            let (din, stub, dout) = (b - a, c - b, d - c);
+            let (li, ls, lo) = (din.length(), stub.length(), dout.length());
+            let (ui, us, uo) = (din * (1.0 / li), stub * (1.0 / ls), dout * (1.0 / lo));
+            let (n1, n2) = (ui.cross(us), us.cross(uo));
+            // same sense of rotation, in one plane
+            if n1.dot(n2) <= 0.0 {
+                return Err(fail);
+            }
+            let (a1, a2) = (ui.dot(us).clamp(-1.0, 1.0).acos(), us.dot(uo).clamp(-1.0, 1.0).acos());
+            let sum = a1 + a2;
+            // the outer legs must still meet ahead of the stub: a compound turn
+            // of 180° or more is a hairpin, not a corner
+            if sum > std::f64::consts::PI - 0.05 {
+                return Err(fail);
+            }
+            let x = b + ui * (ls * a2.sin() / sum.sin());
+            let x_back = c - uo * (ls * a1.sin() / sum.sin());
+            if (x - x_back).length() > 1.0e-6 * (1.0 + ls) {
+                return Err(fail); // the three segments are not coplanar
+            }
+            // circle inscribed between the stub and the two outer legs
+            let rho = ls / ((a1 * 0.5).tan() + (a2 * 0.5).tan());
+            let keep = floor[j].max(floor[j + 1]).max(rho);
+            v[j] = x;
+            floor[j] = keep;
+            v.remove(j + 1);
+            floor.remove(j + 1);
+            merged += 1;
+        }
+        straighten(&mut v, &mut floor);
+    }
+    if v.len() < 2 {
+        return Err(PathError::Degenerate);
+    }
+
+    // One bend radius for the whole path: the requested one, or the largest
+    // every corner can host.  Corners that the design stacks on one another —
+    // the walls of a honeycomb bonded to the walls below, U-turn columns —
+    // then end at the same points in every layer; with a radius of its own at
+    // each corner, two stacked walls would end a few microns apart and leave a
+    // sliver at every crossing of their junction circles.  What must NOT set
+    // this radius is a stub, and none is left: the loop above has merged or
+    // dropped every leg that could not host the smallest admissible elbow.
+    let n = v.len();
+    let caps: Vec<f64> = (1..n.saturating_sub(1)).map(|k| leg_capacity(&v, k - 1).min(leg_capacity(&v, k))).collect();
+    let mut bend = fillet;
+    for (i, &cap) in caps.iter().enumerate() {
+        if cap < r_min {
+            return Err(PathError::TightCorner { at: v[i + 1], capacity: cap, required: r_min });
+        }
+        bend = bend.min(cap);
+    }
+    // A merged corner cannot go below the circle inscribed in the compound
+    // corner it replaces, or its elbow would swing outside the original path.
+    let fillets = caps.iter().enumerate().map(|(i, &cap)| bend.max(floor[i + 1]).min(cap)).collect();
+    Ok(ResolvedPath { verts: v, fillets, merged, dropped_ends })
+}
+
+impl Filament {
+    /// Build a filament from any polyline, resolving its corners with
+    /// [`resolve_path`]: every elbow gets `fillet` where it fits and the
+    /// largest radius that fits elsewhere, and corners too close together for
+    /// the tube become one bend.  Fails when the path cannot be swept cleanly.
+    pub fn try_serpentine(verts: &[Point3], r: f64, fillet: f64) -> Result<Filament, PathError> {
+        let path = resolve_path(verts, r, fillet)?;
+        let f = Self::serpentine_with_fillets(&path.verts, r, &path.fillets);
+        f.check()?;
+        Ok(f)
+    }
+
+    /// Check that the filament is a valid sweep: every elbow bent wider than
+    /// the tube (no spindle or horn torus) and every leg of positive length.
+    /// The lattice Booleans assume both; a filament that fails here fuses into
+    /// a shell that is not a solid.
+    pub fn check(&self) -> Result<(), PathError> {
+        for (i, e) in self.elbows.iter().enumerate() {
+            if e.surf.major_radius <= e.surf.minor_radius * (1.0 + 1.0e-6) {
+                return Err(PathError::SpindleElbow { elbow: i, bend: e.surf.major_radius, tube: e.surf.minor_radius });
+            }
+        }
+        for (i, l) in self.legs.iter().enumerate() {
+            if !(l.length > 1.0e-9) {
+                return Err(PathError::EmptyLeg { leg: i });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Build a closed shell for an L-filament: `leg_a` → `elbow` → `leg_b`,
 /// capped at the two free ends.  `j0` is the leg_a↔elbow junction axial v on
 /// leg_a (its junction end); `j1` likewise on leg_b.  Returns the shell.
@@ -411,5 +740,145 @@ mod tests {
             "distance (max {:.2} µm)",
             report.max_edge_deviation * 1e3
         );
+    }
+
+    // ── resolve_path ────────────────────────────────────────────────────────
+
+    fn p(x: f64, y: f64) -> Point3 {
+        Point3::new(x, y, 0.0)
+    }
+
+    /// A path with room everywhere keeps its vertices and gets the requested
+    /// radius at every corner.
+    #[test]
+    fn resolve_path_leaves_a_roomy_path_alone() {
+        let verts = [p(0.0, 0.0), p(6.0, 0.0), p(6.0, 1.4), p(0.0, 1.4), p(0.0, 2.8), p(6.0, 2.8)];
+        let path = resolve_path(&verts, 0.275, 0.5).unwrap();
+        assert_eq!(path.verts.len(), verts.len());
+        assert_eq!((path.merged, path.dropped_ends), (0, 0));
+        assert!(path.fillets.iter().all(|&f| f == 0.5), "{:?}", path.fillets);
+    }
+
+    /// A leg that is a real feature of the design (a connector the tube can
+    /// follow) sets ONE radius for the whole path, so stacked corners of
+    /// different layers end at the same points.
+    #[test]
+    fn resolve_path_keeps_one_radius_along_the_path() {
+        // legs 6 mm, connectors 1.4 mm, one connector 0.62 mm: its corners fit
+        // 0.9·0.62/2 = 0.279, which the tube (r = 0.26) can follow
+        let verts = [p(0.0, 0.0), p(6.0, 0.0), p(6.0, 1.4), p(0.0, 1.4), p(0.0, 2.02), p(6.0, 2.02)];
+        let r = 0.26;
+        let path = resolve_path(&verts, r, 0.29).unwrap();
+        assert_eq!(path.merged, 0);
+        assert!(path.fillets.iter().all(|&f| (f - 0.279).abs() < 1e-9), "{:?}", path.fillets);
+        assert!(path.fillets.iter().all(|&f| f >= r * MIN_BEND_FACTOR));
+    }
+
+    /// A stub must NOT set that radius: its corners are merged and every other
+    /// corner keeps the requested bend (this was the whole-layer spindle bug —
+    /// one 0.37 mm stub clamped all 26 elbows of a layer to 0.167 < r).
+    #[test]
+    fn resolve_path_does_not_let_a_stub_set_the_radius() {
+        let a = 25.0_f64.to_radians();
+        let d = |len: f64| (len * a.cos(), len * a.sin());
+        let (dx, dy) = d(12.0);
+        let verts = [
+            p(6.0, 3.0),
+            p(6.0, 0.275),
+            p(2.9, 0.275),
+            p(0.275, 0.275),
+            p(0.275, 0.646),
+            p(0.275 + dx, 0.646 + dy),
+            p(0.275 + dx, 0.646 + dy + 1.5),
+        ];
+        let path = resolve_path(&verts, 0.275, 0.29).unwrap();
+        assert_eq!(path.merged, 1);
+        assert!(path.fillets.iter().all(|&f| (f - 0.29).abs() < 1e-12), "{:?}", path.fillets);
+    }
+
+    /// The ±25° diamond's box corner: a wall, a 0.37 mm stub up the next wall
+    /// and a diagonal.  The stub cannot host the two elbows, so its corners
+    /// become one bend — tangent to the wall and to the diagonal, on the inner
+    /// side of the original corner.
+    #[test]
+    fn resolve_path_merges_a_stub_between_two_turns_into_one_bend() {
+        let (r, fillet) = (0.275, 0.29);
+        let a = 25.0_f64.to_radians();
+        let stub_top = p(0.275, 0.646);
+        let far = p(0.275 + 14.0 * a.cos(), 0.646 + 14.0 * a.sin());
+        let verts = [p(2.9, 0.275), p(0.275, 0.275), stub_top, far];
+        let path = resolve_path(&verts, r, fillet).unwrap();
+        assert_eq!((path.merged, path.verts.len(), path.fillets.len()), (1, 3, 1));
+        // the new corner is where the wall and the diagonal meet
+        let x = path.verts[1];
+        assert!((x.y - 0.275).abs() < 1e-12, "on the wall line: {x:?}");
+        let on_diag = (x - stub_top).cross(far - stub_top).length() / (far - stub_top).length();
+        assert!(on_diag < 1e-9, "on the diagonal's line: off by {on_diag:e}");
+        // one elbow of the requested radius; its tangent points lie on the
+        // ORIGINAL legs, i.e. beyond the old corners as seen from the new one
+        let big = path.fillets[0];
+        assert!(big >= fillet - 1e-12 && big >= r * MIN_BEND_FACTOR);
+        let turn = std::f64::consts::PI - a;
+        let t = big * (turn * 0.5).tan();
+        assert!(t >= (x - verts[1]).length() && t >= (x - stub_top).length(), "tangent {t} inside the extensions");
+        // and the result is a valid sweep
+        let f = Filament::try_serpentine(&verts, r, fillet).unwrap();
+        assert_eq!((f.legs.len(), f.elbows.len()), (2, 1));
+        assert!(f.check().is_ok());
+        assert!(f.legs.iter().all(|l| l.length > 0.5));
+    }
+
+    /// A lead-in too short for the elbow next to it is dropped, not allowed to
+    /// clamp the elbow.
+    #[test]
+    fn resolve_path_drops_an_end_stub() {
+        let verts = [p(0.0, 0.0), p(0.08, 0.0), p(0.08, 5.0), p(1.5, 5.0), p(1.5, 0.0)];
+        let path = resolve_path(&verts, 0.275, 0.5).unwrap();
+        assert_eq!(path.dropped_ends, 1);
+        assert_eq!(path.verts.len(), 4);
+        assert!(path.fillets.iter().all(|&f| f >= 0.275 * MIN_BEND_FACTOR));
+    }
+
+    /// What no single tube can follow is refused, with the corner named.
+    #[test]
+    fn resolve_path_refuses_reversals_and_narrow_s_jogs() {
+        // S-jog: two opposite turns 0.2 mm apart
+        let jog = [p(0.0, 0.0), p(5.0, 0.0), p(5.0, 0.2), p(10.0, 0.2)];
+        assert!(matches!(resolve_path(&jog, 0.275, 0.3), Err(PathError::TightCorner { .. })));
+        // hairpin narrower than the tube: two same-sense 90° turns 0.3 mm apart
+        let pin = [p(0.0, 0.0), p(5.0, 0.0), p(5.0, 0.3), p(0.0, 0.3)];
+        assert!(matches!(resolve_path(&pin, 0.275, 0.3), Err(PathError::TightCorner { .. })));
+        assert!(Filament::try_serpentine(&pin, 0.275, 0.3).is_err());
+    }
+
+    /// `check` catches a hand-built spindle elbow.
+    #[test]
+    fn check_rejects_a_spindle_elbow() {
+        let verts = [p(0.0, 0.0), p(3.0, 0.0), p(3.0, 3.0)];
+        let ok = Filament::serpentine(&verts, 0.275, 0.5);
+        assert!(ok.check().is_ok());
+        let spindle = Filament::serpentine(&verts, 0.275, 0.167);
+        assert_eq!(spindle.check(), Err(PathError::SpindleElbow { elbow: 0, bend: 0.167, tube: 0.275 }));
+    }
+
+    /// The merged compound corner fuses into a closed solid.
+    #[test]
+    fn merged_corner_filament_passes_the_gates() {
+        let a = 25.0_f64.to_radians();
+        let verts = [
+            p(8.0, 0.275),
+            p(0.275, 0.275),
+            p(0.275, 0.646),
+            p(0.275 + 9.0 * a.cos(), 0.646 + 9.0 * a.sin()),
+        ];
+        let f = Filament::try_serpentine(&verts, 0.275, 0.29).unwrap();
+        let mut brep = BRep::new();
+        let (shell, rep) = crate::fuse_filaments_with(&mut brep, &[f], &Default::default());
+        assert_eq!(rep.aborted, 0);
+        let mut cfg = UnionConfig::default();
+        cfg.wires_strict = true;
+        let mut diag = Diagnostics::new();
+        let r = validate_shell(&brep, shell, &cfg, &mut diag);
+        assert!(r.passed(), "wire {:?} manifold {:?}", r.wire_violations, r.manifold_violations);
     }
 }

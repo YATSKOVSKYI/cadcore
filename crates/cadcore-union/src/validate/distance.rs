@@ -46,6 +46,32 @@ fn face_surface(geom: &FaceGeom) -> Option<AnalyticSurface> {
     }
 }
 
+/// Largest distance of the edge's two vertices from the curve it is drawn on.
+fn vertex_off_curve(brep: &BRep, eid: EdgeId) -> Option<f64> {
+    let e = brep.edges.get(eid)?;
+    let ends = [brep.vertices.get(e.v_start)?.point, brep.vertices.get(e.v_end)?.point];
+    let dist = |p: Point3| -> f64 {
+        match &e.geom {
+            EdgeGeom::Circle(c) => {
+                let w = p - c.frame.origin;
+                let planar = c.frame.z.dot_vec(w);
+                let radial = (w - c.frame.z.as_vec() * planar).length() - c.radius;
+                planar.hypot(radial)
+            }
+            EdgeGeom::Line(l) => {
+                let w = p - l.origin;
+                (w - l.direction.as_vec() * l.direction.dot_vec(w)).length()
+            }
+            EdgeGeom::Polyline(pts) => pts
+                .first()
+                .zip(pts.last())
+                .map_or(0.0, |(&a, &b)| (p - a).length().min((p - b).length())),
+            EdgeGeom::Ellipse(_) => 0.0,
+        }
+    };
+    Some(dist(ends[0]).max(dist(ends[1])))
+}
+
 /// Check the gate.  Returns `(violations, max_deviation_mm)`.
 pub fn check(brep: &BRep, shell: ShellId, knit_tol: f64) -> (Vec<String>, f64) {
     // edge -> faces using it
@@ -81,6 +107,22 @@ pub fn check(brep: &BRep, shell: ShellId, knit_tol: f64) -> (Vec<String>, f64) {
     let mut violations = Vec::new();
     let mut max_dev = 0.0f64;
     for (eid, faces) in &edge_faces {
+        // An edge runs between its two VERTICES along its curve, so both
+        // vertices have to lie on that curve.  A vertex grafted onto a circle
+        // it merely passes (8 µm off, in a trimmed ±30° diamond) leaves the
+        // curve and the surfaces untouched — the samples below are taken on
+        // the curve — yet no reader can build the edge, and the faces around
+        // it come out invalid.
+        if let Some(d) = vertex_off_curve(brep, *eid) {
+            max_dev = max_dev.max(d);
+            if d > knit_tol {
+                violations.push(format!(
+                    "edge {eid:?}: a vertex is {:.2} µm off the edge's curve (limit {:.2} µm)",
+                    d * 1e3,
+                    knit_tol * 1e3
+                ));
+            }
+        }
         let pts = sample_edge(brep, *eid);
         if pts.is_empty() {
             continue;
@@ -185,5 +227,54 @@ mod tests {
         let (v, dev) = check(&b, s_bad, 1e-3);
         assert_eq!(v.len(), 1);
         assert!((dev - 5e-3).abs() < 1e-9, "dev={dev}");
+    }
+
+    /// A vertex that is not on its edge's curve fails, even though the curve
+    /// itself lies exactly on the face.
+    #[test]
+    fn detects_a_vertex_off_its_edge_curve() {
+        let mut b = BRep::new();
+        let cyl = CylSurf::new(Point3::new(0.0, 0.0, 0.0), UnitVec3::Z, 0.275);
+        let circ = Circle3::new(Point3::new(0.0, 0.0, 0.0), UnitVec3::Z, 0.275);
+        let mut add = |off: f64| {
+            // an arc of the rim whose END vertex was moved `off` along the axis
+            let v0 = b.vertices.insert(Vertex { point: circ.point_at(0.0) });
+            let v1 = b.vertices.insert(Vertex { point: circ.point_at(1.0) + UnitVec3::Z * off });
+            let e = b.edges.insert(Edge {
+                geom: cadcore_topo::EdgeGeom::Circle(circ),
+                v_start: v0,
+                v_end: v1,
+                t_start: 0.0,
+                t_end: 1.0,
+                partner: None,
+            });
+            let lid = b.loops.insert(Loop { start: CoEdgeId::default(), face: Default::default() });
+            let ce = b.coedges.insert(CoEdge {
+                edge: e,
+                sense: CoEdgeSense::Same,
+                next: CoEdgeId::default(),
+                prev: CoEdgeId::default(),
+                loop_id: lid,
+            });
+            b.coedges[ce].next = ce;
+            b.coedges[ce].prev = ce;
+            b.loops[lid].start = ce;
+            let f = b.faces.insert(Face {
+                geom: cadcore_topo::FaceGeom::Cylinder(cyl),
+                normal: FaceNormal::Same,
+                outer_loop: lid,
+                inner_loops: vec![],
+                shell: Default::default(),
+                extent: FaceExtent::None,
+            });
+            b.shells.insert(Shell { faces: vec![f], is_outer: true, solid: Default::default() })
+        };
+        let good = add(0.0);
+        let bad = add(8.0e-3); // 8 µm, the trimmed ±30° diamond
+        assert!(check(&b, good, 1e-3).0.is_empty());
+        let (v, dev) = check(&b, bad, 1e-3);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("off the edge's curve"), "{v:?}");
+        assert!((dev - 8.0e-3).abs() < 1e-9, "dev={dev}");
     }
 }

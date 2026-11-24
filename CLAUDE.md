@@ -303,3 +303,58 @@ are needed (without the 1st: 210 faulted faces; without the 4th: 721; with `SAMP
 Cost on 15 × 15 × 12: honeycomb 6.5 → 7.9 s (72.7 MB, unchanged), grid 2.2 → 2.4 s, diamond unchanged.
 Check script: `C:\scwork\bench\sw_check2.ps1` (fresh SolidWorks per file — a second import in one
 session crashes it; `sw_faces.py` asks every face).
+
+## 0.2.6 — any filament angle: paths the tube can follow, cuts that keep their circles
+
+A ±25° diamond (14.06 × 13.94 mm, 12 layers) fused into 100 000 open edges; ±40° lost faces at the
+second terminal cut; ±30° passed every gate here and came out of FreeCAD with 113 invalid faces.
+Now 5° … 85° in 5° steps fuse and trim clean (gates 0/0/0, FreeCAD: closed valid solids, the face
+count of the file), 1.4–2.3 s each.  Grid, diamond and both honeycombs keep their leg and face counts.
+
+* **`resolve_path` / `Filament::try_serpentine` / `Filament::check`** (`arrange/filament.rs`).  The
+  bend radius used to be one number per path, the minimum over its corners — so ONE stub clamped every
+  elbow.  At ±25° a diagonal leaves 0.37 mm between a 90° and a 65° turn next to the box corner: all 26
+  elbows of the layer went to 0.167 < r, spindle tori.  Now, in this order: (A) end stubs that cannot
+  host `MIN_BEND_FACTOR`·r are dropped; (B) the even split (45 % of a leg per corner, 90 % of an end
+  leg) — if the tube can follow the path on it, that is the answer, bit for bit what 0.2.5 produced;
+  (C) otherwise a leg is shared in proportion to `tan(turn/2)` of its two corners, and the corners of a
+  leg too short even so are MERGED: both replaced by the intersection of the outer legs, one elbow
+  through the compound corner, never tighter than the circle inscribed between stub and neighbours (so
+  the elbow stays on the inner side of the original path).  Reversals and S-jogs narrower than the bead
+  return `PathError::TightCorner`.
+  Do NOT make the radius per corner: a honeycomb's bonded walls then end 3 µm apart in neighbouring
+  layers (ℓ 1.0 / pitch 1.5 went from clean to 3419 open edges).  Do NOT use the proportional split by
+  default either — it moves the radius of lattices that were fine.
+* **A cut hands its result on with exact rims** (`assembly.rs::build_loop`).  A cut face's boundary
+  arrives as one run (rim + rulings + window curves), which is not one circle, so the whole run stayed
+  chords — including the junction rim at the FAR end of a leg, 0.6 µm off the circle its elbow kept.
+  The next cut then crossed that rim at two points 0.2 µm apart (±40°, 36 open edges at every offset).
+  Steps of constant axial coordinate on a `CylinderBand` are arcs of the carrier's circle, steps of
+  constant angle are lines — as the torus branch already did for its major / minor circles.
+* **A joint lies on an edge only if it lies on the edge's CURVE** (`halfspace.rs::insert_joints_on`,
+  `JointCurve`, `loop_joint_curve`).  The window was 0.3·chord, up to 10 µm: at ±30° the trim plane
+  passes 8 µm from a junction rim, and the section's end on the torus equator was grafted into the
+  LEG's rim as a vertex 8 µm off its circle.  Circle edges: distance to the circle ≤ `JOINT_SNAP` + one
+  chord sagitta (a cap's outline is a chord polygon), and near this step; lines: `JOINT_SNAP`; sampled
+  curves: `JOINT_SNAP` + chord·turn/4, the turn taken from the neighbouring samples along the loop.
+* **Plane ∥ axis is a statement about the band** (`ssi.rs::plane_cylinder`).  An axis 1e-6 rad off the
+  plane (one ulp of an f32 corner) gave an ellipse 250 km long and 13 s of sampling per face (±15°: 54 s
+  per export).  If the axis stays within 1e-5 mm of the plane over the band, it is turned into the
+  plane about the band's mid-point and the section is two rulings; a longer ellipse than 16 bands is
+  sampled only where `v(θ) = v_c + M·cos(θ − φ)` is inside the band (`ellipse_thetas_in_band`).
+* **Gates.**  `wires.rs` pins each edge's samples to its vertices — a circle evaluated at `t_end` is
+  1e-9 rad off the trace point its vertex came from, and two edges leaving the vertex at an angle
+  "crossed" by 2e-10 mm (13 false wire violations at ±30°, ±60°).  `distance.rs` now checks that both
+  vertices of an edge lie on its curve (`vertex_off_curve`): the ±30° defect left curves and surfaces
+  exact and was invisible to all four gates.
+
+DIW Forge side (same release): the generator calls `resolve_path` when its own rounding leaves a
+corner sharp and uses the result only if corners were merged, so G-code and solid share the bend;
+`reference_box` / `trim_plane_positions` are the ONE definition of the part's box for cut planes,
+plates and diagnostics, with `BrepParams::structure_origin` carrying the placement.
+
+Checks: `gcode-viewer-rs/crates/brep/tests/diamond_angles.rs` (all four fail on 0.2.5),
+`examples/repro_angle.rs` (angle sweep), `examples/cut_debug.rs` (every plane × every robust shift,
+`SEQ=1` for the pipeline's order, `NEAR=x,y,z,r` to list edges around a point), FreeCAD
+`C:/FEM/fuse_angle/fc_check.py` (tight boxes via `optimalBoundingBox`).  When FreeCAD shows MORE
+faces than the STEP has `ADVANCED_FACE`s, OCC is healing — look for a vertex off its curve.

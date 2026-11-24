@@ -38,6 +38,34 @@ fn edge_points(brep: &BRep, eid: cadcore_topo::EdgeId) -> Vec<Point3> {
     let Some(e) = brep.edges.get(eid) else {
         return Vec::new();
     };
+    let mut pts = edge_samples(brep, e);
+    // A wire runs from vertex to vertex: consecutive edges of a loop meet AT
+    // their shared vertex, which is how every reader of the file builds the
+    // wire.  A curve evaluated at its end parameter lands a rounding error
+    // away from that vertex (a circle's `point_at(t_end)` against the trace
+    // point the vertex was created from: ~1e-9 rad), and two edges leaving the
+    // vertex at an angle then seem to cross each other by that much — a
+    // "self-intersection" 2e-10 mm long.  Pin each end to its vertex.  An end
+    // that is genuinely off its vertex is left where it is, so it still shows
+    // up as a gap or a crossing.
+    const PIN: f64 = 1.0e-6;
+    if pts.len() >= 2 {
+        if let Some(v) = brep.vertices.get(e.v_start) {
+            if (pts[0] - v.point).length() < PIN {
+                pts[0] = v.point;
+            }
+        }
+        if let Some(v) = brep.vertices.get(e.v_end) {
+            let n = pts.len() - 1;
+            if (pts[n] - v.point).length() < PIN {
+                pts[n] = v.point;
+            }
+        }
+    }
+    pts
+}
+
+fn edge_samples(brep: &BRep, e: &cadcore_topo::Edge) -> Vec<Point3> {
     match &e.geom {
         EdgeGeom::Line(_) => {
             let a = brep.vertices.get(e.v_start).map(|v| v.point);
@@ -375,7 +403,7 @@ pub fn check_face(brep: &BRep, fid: FaceId, issues: &mut Vec<String>) {
                         );
                         let lo = ai.saturating_sub(2);
                         let hi = (bi + 3).min(n);
-                        let around: Vec<String> = (lo..hi).map(|k| format!("{k}:({:.7},{:.7})", a[k].0, a[k].1)).collect();
+                        let around: Vec<String> = (lo..hi).map(|k| format!("{k}:({:.11},{:.11})", a[k].0, a[k].1)).collect();
                         eprintln!("[wires]   {}", around.join(" "));
                     }
                     issues.push(format!(

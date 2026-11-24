@@ -739,6 +739,51 @@ impl<'b> Assembler<'b> {
                     i = j;
                 }
             }
+            // The same on a cylinder.  A cut face's boundary arrives as one
+            // run stringing a rim circle (constant axial coordinate), rulings
+            // (constant angle) and the transcendental curves of its windows,
+            // which is not ONE circle — so the whole run, rim included, used to
+            // stay a chain of chords.  A rim chorded at 7.5° leaves its circle
+            // by 0.6 µm, and the NEXT cut then finds the point where its plane
+            // crosses that rim on the chord for this face and on the circle for
+            // the elbow sharing it: two vertices 0.2 µm apart, and a section
+            // loop that no longer closes (a ±40° diamond trimmed on both
+            // sides).  The steps of a rim lie on the circle {v = const} of the
+            // carrier and a ruling is a straight line, both exact by
+            // construction, whatever the sampling.
+            if !matches!(rc, RunCurve::Circle(_)) {
+                if let FaceDomain::CylinderBand { surf, .. } = domain {
+                    for k in seg_lo..seg_hi {
+                        let poly3 = &step_poly[order[k]];
+                        if poly3.len() != 2 || !matches!(step_rc[k - seg_lo], RunCurve::Free) {
+                            continue;
+                        }
+                        let (u0, v0) = domain.uv(poly3[0]);
+                        let (u1, v1) = domain.uv(poly3[1]);
+                        let mut du = (u1 - u0) % std::f64::consts::TAU;
+                        if du > std::f64::consts::PI {
+                            du -= std::f64::consts::TAU;
+                        } else if du < -std::f64::consts::PI {
+                            du += std::f64::consts::TAU;
+                        }
+                        let (du, dv) = (du.abs(), (v1 - v0).abs());
+                        let on_surface = |p: Point3| {
+                            let w = p - surf.frame.origin;
+                            let a = surf.axis().as_vec();
+                            ((w - a * dot3(a, w)).length() - surf.radius).abs() < ftol
+                        };
+                        if !(on_surface(poly3[0]) && on_surface(poly3[1])) {
+                            continue;
+                        }
+                        if dv < 1e-9 && du > 1e-7 {
+                            let centre = surf.frame.origin + surf.axis().as_vec() * (0.5 * (v0 + v1));
+                            step_rc[k - seg_lo] = RunCurve::Circle(Circle3::new(centre, surf.axis(), surf.radius));
+                        } else if du * surf.radius < 1e-9 && dv > 1e-7 {
+                            step_rc[k - seg_lo] = RunCurve::Line;
+                        }
+                    }
+                }
+            }
             for k in seg_lo..seg_hi {
                 let poly3 = &step_poly[order[k]];
                 if poly3.len() < 2 {
@@ -824,6 +869,19 @@ impl<'b> Assembler<'b> {
             face,
         });
         let mut coedges: Vec<CoEdgeId> = Vec::new();
+        // the source loop's co-edges in order: each edge needs its neighbours
+        // to judge which joints lie on it
+        let mut ring: Vec<CoEdgeId> = Vec::new();
+        {
+            let mut c = start;
+            loop {
+                ring.push(c);
+                c = src.coedges[c].next;
+                if c == start || ring.len() > 100_000 {
+                    break;
+                }
+            }
+        }
         let mut c = start;
         let mut guard = 0usize;
         loop {
@@ -838,7 +896,11 @@ impl<'b> Assembler<'b> {
             if sense_src == CoEdgeSense::Opposite {
                 pts.reverse();
             }
-            crate::boolean::halfspace::insert_joints(&mut pts, joints);
+            crate::boolean::halfspace::insert_joints_on(
+                &mut pts,
+                joints,
+                crate::boolean::halfspace::loop_joint_curve(src, &ring, guard),
+            );
             let mut poly: Vec<Point3> = Vec::with_capacity(pts.len());
             for p in pts {
                 let q = self.snap(p);

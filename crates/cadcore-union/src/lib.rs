@@ -34,7 +34,7 @@ pub mod lattice;
 pub mod tolerance;
 pub mod validate;
 
-pub use arrange::filament::{ElbowSeg, Filament, LegSeg};
+pub use arrange::filament::{resolve_path, ElbowSeg, Filament, LegSeg, PathError, ResolvedPath, MIN_BEND_FACTOR};
 pub use arrange::merge::merge_shell_edges;
 pub use arrange::universal::{fuse_filaments, fuse_filaments_with, FuseOptions, FuseReport};
 pub use boolean::{half_space_cut, half_space_cut_robust, CutOutcome, RobustCut, ROBUST_CUT_SHIFTS};
