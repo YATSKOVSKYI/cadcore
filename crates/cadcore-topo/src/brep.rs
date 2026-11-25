@@ -33,6 +33,16 @@ pub struct BRep {
     pub shells: SlotMap<ShellId, Shell>,
     /// Solid arena.
     pub solids: SlotMap<SolidId, Solid>,
+    /// Edges that are geometric copies of an edge of ANOTHER solid: `copy → source`.
+    ///
+    /// Two solids in contact (an imprinted electrode plate and the lattice it
+    /// is pressed on) present the same curves at the contact, but as separate
+    /// topology.  A writer that approximates curves (the STEP writer fits
+    /// sampled edges to its neighbours' pcurves) would write the two copies a
+    /// fit tolerance apart; a CAD kernel then sees two different curves where
+    /// it expects one.  A writer that knows the source writes the copy with the
+    /// source's very curve.
+    pub edge_twins: std::collections::HashMap<EdgeId, EdgeId>,
 }
 
 impl BRep {

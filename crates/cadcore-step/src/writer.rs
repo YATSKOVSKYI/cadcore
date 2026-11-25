@@ -911,6 +911,36 @@ impl<'a> StepWriter<'a> {
                 (Some(a), Some(b)) => (a, b),
                 _ => continue,
             };
+            // A copy of an edge of an earlier solid is written with that
+            // edge's own curve (see `BRep::edge_twins`).
+            if let Some(src) = self.brep.edge_twins.get(&ce.edge) {
+                if std::env::var("CADCORE_DUMP_TWIN").is_ok() {
+                    eprintln!("[twin] {:?} -> {:?} recorded {}", ce.edge, src, ctx.curve_of_edge.contains_key(src));
+                }
+                if let Some(&(curve, start, src_same)) = ctx.curve_of_edge.get(src) {
+                    let v_from = emit_vertex_point(ctx, p_from)?;
+                    let v_to = emit_vertex_point(ctx, p_to)?;
+                    let key = StepCurveKey::TopoEdge { edge: edge_ffi(ce.edge) };
+                    let (ec_id, orig_start) = if let Some(&pair) = ctx.edge_cache.get(&key) {
+                        pair
+                    } else {
+                        let same = if (p_from - start).length() < 1e-9 { src_same } else { !src_same };
+                        let ec = ctx.next_id();
+                        writeln!(
+                            ctx.out,
+                            "#{ec} = EDGE_CURVE('',#{v_from},#{v_to},#{curve},{});",
+                            if same { ".T." } else { ".F." }
+                        )?;
+                        ctx.edge_cache.insert(key, (ec, v_from));
+                        (ec, v_from)
+                    };
+                    let sense = if orig_start == v_from { ".T." } else { ".F." };
+                    let oe = ctx.next_id();
+                    writeln!(ctx.out, "#{oe} = ORIENTED_EDGE('',*,*,#{ec_id},{sense});")?;
+                    oes.push(oe);
+                    continue;
+                }
+            }
             match &edge.geom {
                 EdgeGeom::Line(_) => {
                     self.push_shared_line_pc(ctx, p_from, p_to, ce.edge, pc, &mut oes)?
@@ -1255,6 +1285,7 @@ impl<'a> StepWriter<'a> {
                 }
                 pl
             };
+            ctx.curve_of_edge.insert(edge_id, (pl, pts[0], true));
             let geom_ref = if pcurves.is_empty() {
                 pl
             } else {
@@ -1570,6 +1601,7 @@ impl<'a> StepWriter<'a> {
                     pcurves.push(emit_pcurve(ctx, surf_id, c2d)?);
                 }
             }
+            ctx.curve_of_edge.insert(edge_id, (ci, p_from, same_sense == ".T."));
             let geom_ref = if pcurves.is_empty() {
                 ci
             } else {

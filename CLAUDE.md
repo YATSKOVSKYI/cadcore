@@ -358,3 +358,35 @@ Checks: `gcode-viewer-rs/crates/brep/tests/diamond_angles.rs` (all four fail on 
 `SEQ=1` for the pipeline's order, `NEAR=x,y,z,r` to list edges around a point), FreeCAD
 `C:/FEM/fuse_angle/fc_check.py` (tight boxes via `optimalBoundingBox`).  When FreeCAD shows MORE
 faces than the STEP has `ADVANCED_FACE`s, OCC is healing — look for a vertex off its curve.
+
+## 0.2.7 — contact imprint (plates carry the lattice's cut faces)
+
+`cadcore_union::imprint` (`imprint_coplanar`, `coplanar_contact_faces`, `faces_on_plane`,
+`faces_bounds`, `build_box_solid`).  A plate pressed flush on a trimmed lattice used to touch it
+face-to-face only; Maxwell needs a conformal interface and the user had to run `Imprint` in AEDT.
+Now the plate's contact face is split by the coplanar cut faces of the lattice: one patch face per
+cut face (+ one face per hole of a cut face), the rest of the plate face keeps them as inner loops.
+
+* **The plate must have real topology** (`build_box_solid`: 8 vertices, 12 lines, 6 `Trimmed`
+  planes, CCW about the outward normal).  The old template plates (`RoundedRectCap`, `Polygon`) have
+  no edges to share.
+* **Validate first, then mutate**: every tool face coplanar (antiparallel normal, tol 1e-6 —
+  1e-7 missed the back plate), and inside the target with clearance > tol.  A contact reaching the
+  plate's outline is refused (`ImprintError::NotInside`), never clipped.
+* **Loop orientation from the signed area about the target's outward normal**, never copied from
+  the tool (its normal is opposite).
+* **Copied edges must be written with the SOURCE's curve entity.**  The lattice's sampled edges are
+  least-squares cubics fitted together with their tube pcurves; the same edge fitted alone (or as a
+  LINE/CIRCLE) differs by ~1e-4 mm and Parasolid then threw one `PK_BODY_boolean_2` error per patch
+  (AEDT validation 3 min instead of 19 s).  `BRep::edge_twins` (copy → source root) +
+  `Ctx::curve_of_edge` (NOT cleared per shell; filled by the polyline and arc paths) let the writer
+  emit `EDGE_CURVE(.., #source_curve, same)` — the curves are bit-identical across solids.  The
+  source solid must be written BEFORE the plates.  `CADCORE_DUMP_TWIN=1` lists the twin edges.
+* **Application rule (DIW Forge `build_imprinted_plate`)**: a W×H plate is tangent to the outer
+  filaments, so the contact touches its outline (clearance −3e-8).  The plate grows by CLEAR = 1 µm
+  on the touching sides; an overhang > 10 µm is refused.  Sharp plate corners only.
+
+Checks: `imprint.rs` tests (box manifold, plate on `gen::pair_3mm` with equal areas and shared curve
+ids, refusal at the edge), DIW Forge `brep/tests/diamond_angles.rs::imprinted_plates_*`, FreeCAD
+`C:/FEM/fuse_angle/fc_check.py` (closed valid solids, face count = file), AEDT import with
+`NO_IMPRINT=1` in `C:\FEM\imprint_maxwell` (0 Parasolid errors, conduction path valid).

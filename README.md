@@ -48,7 +48,7 @@ Add `cadcore` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cadcore = "0.2.6"
+cadcore = "0.2.7"
 ```
 
 Create a watertight U-shaped filament rod and export it to a STEP file:
@@ -96,6 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 * **Universal fuse** (`union::fuse_filaments_with`) — a true Boolean union: crossings, free ends under a row, parallel connectors, T-junctions. Every intersection curve is traced once and imprinted on both faces, so shared edges are identical by construction.
 * **Planar cut** (`union::half_space_cut`) — trims an already-fused solid with a half-space and closes it with planar section caps; it cuts through legs, elbows and junction rims alike.
 * **Robust cut** (`union::half_space_cut_robust`, `union::trim_shell`) — a trim plane taken from the part's own dimensions often grazes a junction rim or an end cap within microns. The robust cut moves the plane by 10–40 µm when the exact position has no closed result and reports the shift, so mating parts can follow.
+* **Contact imprint** (`union::imprint_coplanar`, `union::build_box_solid`) — splits a planar face of one solid by the coplanar faces of another, so an electrode plate pressed flush on the cut faces of a lattice carries one face per contact patch. The new edges reuse the very curve entities of the other solid in the STEP file (`BRep::edge_twins`), so a solver mesher sees one conformal interface and needs no imprint step of its own.
 * **CAD-friendly faces** — every tube face is written as two half faces bounded by real ruling-line edges (no periodic seam for the importer to invent), with exact circles and lines wherever the geometry is one.
 
 Verified on orthogonal-grid, diamond and honeycomb lattices: each fused-and-trimmed export is a single closed manifold solid in **Ansys SpaceClaim** and in OpenCASCADE-based readers (FreeCAD), its volume matches an independent point-sampling reference to 0.01 %, and it meshes and solves in Ansys Maxwell together with separately exported electrode plates.
@@ -153,6 +154,7 @@ What the kernel does today, and what it was checked against.
 | STEP AP214 export | stable — every edge shared by exactly two faces; read as closed solids by Ansys SpaceClaim and OpenCASCADE (FreeCAD) |
 | Lattice fuse + planar trim (`union::fuse_and_trim`) | stable on orthogonal-grid, diamond and honeycomb lattices; volume within 0.01 % of a sampling reference; solved in Ansys Maxwell |
 | Solid membership for meshers (`union::LatticeModel`) | stable — a voxel conduction solve on it agrees with Maxwell on the exported STEP to 2 % |
+| Contact imprint of coplanar faces (`union::imprint_coplanar`) | stable — plates on a trimmed lattice; FreeCAD reads closed solids, Ansys Maxwell validates the conduction path with no imprint of its own |
 | Tessellation and STEP import (`mesh::mesh_brep`, `mesh::import_step`) | stable |
 | Union of analytic solids (`union::boolean::union_n`) | boxes, cylinders, swept filaments, coaxial tori |
 

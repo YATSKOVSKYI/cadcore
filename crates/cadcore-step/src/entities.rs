@@ -165,6 +165,11 @@ pub(crate) struct Ctx {
     pub edge_cache: HashMap<StepCurveKey, (usize, usize)>, // (ec_id, orig_start_vtx_id)
     /// Lazily-emitted shared 2D parametric representation context (for pcurves).
     pub param_ctx_2d: Option<usize>,
+    /// 3-D curve entity written for a B-Rep edge, with the point its parameter
+    /// starts from and the EDGE_CURVE's same_sense — NOT cleared per shell, so
+    /// an edge of a later solid that `BRep::edge_twins` names as a copy can be
+    /// written with the same curve entity.
+    pub curve_of_edge: HashMap<cadcore_topo::EdgeId, (usize, cadcore_math::Point3, bool)>,
 }
 
 impl Ctx {
@@ -176,6 +181,7 @@ impl Ctx {
             vertex_cache: HashMap::new(),
             edge_cache: HashMap::new(),
             param_ctx_2d: None,
+            curve_of_edge: HashMap::new(),
         }
     }
 
